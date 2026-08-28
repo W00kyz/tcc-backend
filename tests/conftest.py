@@ -9,6 +9,7 @@ import pytest_asyncio
 from alembic import command
 from alembic.config import Config
 from app.core.config import Settings
+from app.core.mail import RecordingMailer
 from app.db.base import Base
 from app.db.session import build_engine, build_session_factory
 from fastapi.testclient import TestClient
@@ -69,8 +70,13 @@ async def db_session(test_settings: Settings) -> AsyncIterator[object]:
 
 
 @pytest.fixture
-def client(test_settings: Settings) -> Iterator[TestClient]:
-    app = create_app(settings=test_settings)
+def recording_mailer() -> RecordingMailer:
+    return RecordingMailer()
+
+
+@pytest.fixture
+def client(test_settings: Settings, recording_mailer: RecordingMailer) -> Iterator[TestClient]:
+    app = create_app(settings=test_settings, mailer=recording_mailer)
     # TestClient's default fake client address ("testclient", 50000) is not a valid IP, and
     # auth_logs.ip_address is a strict Postgres INET column (RF04) — a real loopback address
     # keeps every route that records the caller's IP (login, refresh, logout, ...) working.

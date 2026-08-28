@@ -32,6 +32,12 @@ def create_refresh_token(*, user_id: uuid.UUID, secret: str, days: int) -> str:
     return _encode({"sub": str(user_id), "type": "refresh"}, secret, timedelta(days=days))
 
 
+def create_password_reset_token(*, user_id: uuid.UUID, secret: str, minutes: int = 30) -> str:
+    return _encode(
+        {"sub": str(user_id), "type": "password_reset"}, secret, timedelta(minutes=minutes)
+    )
+
+
 def decode_token(token: str, secret: str) -> dict[str, Any]:
     """Raises jwt.InvalidTokenError (or a subclass) on any bad, expired or forged token."""
     return jwt.decode(token, secret, algorithms=[_ALGORITHM])

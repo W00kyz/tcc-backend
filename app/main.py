@@ -3,10 +3,11 @@ from fastapi import FastAPI
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.core.config import Settings, get_settings
+from app.core.mail import Mailer, SmtpMailer
 from app.db.session import build_engine, build_session_factory
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -> FastAPI:
     """Build the application.
 
     A factory, not a module-level singleton: tests build a fresh app per case, pointing
@@ -23,6 +24,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     engine = build_engine(settings.database_url)
     app.state.session_factory = build_session_factory(engine)
+    app.state.mailer = mailer or SmtpMailer(
+        host=settings.mail_smtp_host,
+        port=settings.mail_smtp_port,
+        from_address=settings.mail_from_address,
+    )
 
     app.include_router(health_router)
     app.include_router(auth_router)
