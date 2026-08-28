@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.core.config import Settings, get_settings
 from app.db.session import build_engine, build_session_factory
@@ -24,6 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = build_session_factory(engine)
 
     app.include_router(health_router)
+    app.include_router(auth_router)
 
     return app
 

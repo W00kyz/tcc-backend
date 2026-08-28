@@ -71,5 +71,8 @@ async def db_session(test_settings: Settings) -> AsyncIterator[object]:
 @pytest.fixture
 def client(test_settings: Settings) -> Iterator[TestClient]:
     app = create_app(settings=test_settings)
-    with TestClient(app) as test_client:
+    # TestClient's default fake client address ("testclient", 50000) is not a valid IP, and
+    # auth_logs.ip_address is a strict Postgres INET column (RF04) — a real loopback address
+    # keeps every route that records the caller's IP (login, refresh, logout, ...) working.
+    with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
         yield test_client

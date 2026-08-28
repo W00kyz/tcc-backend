@@ -13,6 +13,7 @@ dependencies = [
     "asyncpg==0.31.0",
     "argon2-cffi==25.1.0",
     "email-validator==2.3.0",
+    "pyjwt==2.13.0",
 ]
 
 [dependency-groups]
