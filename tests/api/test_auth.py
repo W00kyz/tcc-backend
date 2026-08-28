@@ -1,6 +1,5 @@
 import uuid
 
-import pytest
 from app.core.config import Settings
 from app.core.jwt import create_access_token, create_refresh_token
 from app.core.security import hash_password
@@ -100,14 +99,12 @@ async def test_a_protected_route_rejects_a_refresh_token_used_as_bearer_credenti
     assert response.status_code == 401
 
 
-@pytest.mark.xfail(reason="GET /routes route arrives in Task 8", strict=True)
 async def test_a_protected_route_rejects_a_request_without_a_token(client: TestClient) -> None:
     response = client.get("/routes")
 
     assert response.status_code in (401, 403)
 
 
-@pytest.mark.xfail(reason="GET /routes route arrives in Task 8", strict=True)
 async def test_a_manager_only_route_rejects_a_field_worker_token(
     client: TestClient, db_session: AsyncSession
 ) -> None:

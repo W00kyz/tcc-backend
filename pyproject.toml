@@ -49,6 +49,10 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "PT", "
 [tool.ruff.lint.per-file-ignores]
 # Testes não precisam de anotação de retorno em cada caso.
 "tests/**" = ["ANN201"]
+# These domain exceptions are named for the condition they signal (StopAlreadyDone,
+# RouteNotStarted, ...), not suffixed with "Error" — the exact names the spec, the routers,
+# and Etapa 5's future layers 2-5 all import and catch by name (Task 8 brief).
+"app/domain/execution/service.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.13"

@@ -1,7 +1,9 @@
 from fastapi import FastAPI
 
 from app.api.auth import router as auth_router
+from app.api.checkins import router as checkins_router
 from app.api.health import router as health_router
+from app.api.routes import router as routes_router
 from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
 from app.db.session import build_engine, build_session_factory
@@ -32,6 +34,8 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
 
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(routes_router)
+    app.include_router(checkins_router)
 
     return app
 
