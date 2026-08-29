@@ -58,3 +58,15 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy app tests && 
 
 Os quatro precisam passar. O `pre-commit` já roda isto no commit; este comando é a
 conferência manual quando você quer olhar a saída inteira.
+
+## Contrato OpenAPI (AD-04)
+
+Toda mudança de request/response de rota exige reexportar o schema:
+
+```bash
+uv run python -m app.scripts.export_openapi
+```
+
+Isto escreve `../docs/api/openapi.json`, no repositório principal — commitar lá (não aqui),
+depois rodar `npm run generate:api` no `tcc-dashboard` (ver `dashboard/CONTRIBUTING.md`) para
+atualizar o cliente TypeScript gerado.
