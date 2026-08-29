@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.checkins import router as checkins_router
@@ -7,6 +8,26 @@ from app.api.routes import router as routes_router
 from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
 from app.db.session import build_engine, build_session_factory
+
+
+def _add_cors_middleware(app: FastAPI, settings: Settings) -> None:
+    """Allow the dashboard's origin to call this API from a real browser.
+
+    Browsers block cross-origin fetch() unless the server opts in explicitly; the
+    dashboard (localhost:5173) calls this API (localhost:8000) with a Bearer token in
+    the Authorization header, which triggers a CORS preflight (OPTIONS) that FastAPI
+    rejects with no middleware at all. allow_credentials=True is needed for the
+    Authorization header to survive fetch's CORS mode, which forces allow_origins to
+    be an explicit origin (never "*" — the two together are both insecure and rejected
+    outright by browsers).
+    """
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.dashboard_base_url],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 
 def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -> FastAPI:
@@ -24,6 +45,7 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
         version="0.2.0",
     )
     app.state.settings = settings
+    _add_cors_middleware(app, settings)
     engine = build_engine(settings.database_url)
     app.state.session_factory = build_session_factory(engine)
     app.state.mailer = mailer or SmtpMailer(
