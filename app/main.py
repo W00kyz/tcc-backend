@@ -3,8 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.checkins import router as checkins_router
+from app.api.contractor_companies import router as contractor_companies_router
 from app.api.health import router as health_router
 from app.api.routes import router as routes_router
+from app.api.service_types import router as service_types_router
 from app.api.users import router as users_router
 from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
@@ -60,6 +62,8 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
     app.include_router(routes_router)
     app.include_router(checkins_router)
     app.include_router(users_router)
+    app.include_router(service_types_router)
+    app.include_router(contractor_companies_router)
 
     return app
 
