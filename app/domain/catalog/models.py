@@ -5,7 +5,7 @@ import uuid
 
 from sqlalchemy import Float, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
@@ -38,6 +38,9 @@ class FieldWorker(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
+    # Task 3 (RF08): the join rows this FieldWorker qualifies for, eager-loaded via
+    # selectinload so FieldWorkerOut.service_type_ids never triggers a lazy-load.
+    service_type_links: Mapped[list["FieldWorkerServiceType"]] = relationship()
 
 
 class FieldWorkerServiceType(Base):
