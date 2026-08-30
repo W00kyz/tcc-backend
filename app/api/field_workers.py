@@ -46,10 +46,20 @@ class FieldWorkerUpdateRequest(BaseModel):
 async def _load(db: AsyncSession, worker_id: UUID) -> FieldWorker | None:
     # Assigned before returning, not `return await db.scalar(...)` — mypy loses the generic
     # through a direct-return await chained onto .options() and reports it as Any.
+    #
+    # BUG FIX: populate_existing=True is required here. The session has expire_on_commit=False
+    # (app/db/session.py), and _sync_service_types() mutates FieldWorkerServiceType rows through
+    # a separately queried set — FieldWorker.service_type_links has no back_populates, so those
+    # writes never touch the collection already cached on a `worker` instance sitting in this
+    # session's identity map. Without populate_existing, a second _load() for the same worker_id
+    # returns that instance with its stale, pre-update collection instead of re-reading it from
+    # this query's result — the update handler's response would echo the old service types even
+    # though the database write is correct (a follow-up GET in a fresh request shows the truth).
     worker = await db.scalar(
         select(FieldWorker)
         .where(FieldWorker.id == worker_id)
         .options(selectinload(FieldWorker.service_type_links))
+        .execution_options(populate_existing=True)
     )
     return worker
 

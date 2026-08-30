@@ -158,3 +158,49 @@ async def test_a_patch_cannot_steal_a_user_already_linked_to_another_worker(
     unchanged = client.get("/field-workers", headers={"Authorization": f"Bearer {token}"}).json()
     still_linked = next(item for item in unchanged if item["id"] == linked["id"])
     assert still_linked["user_id"] == str(worker_login.id)
+
+
+async def test_patch_response_reflects_a_disjoint_service_type_set(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for a stale-collection bug: the session has expire_on_commit=False, and
+    _sync_service_types() mutates FieldWorkerServiceType rows through a separately queried set,
+    which never touches a `worker` instance's already-cached `service_type_links` collection
+    sitting in the session's identity map. The PATCH response used to echo the pre-update set
+    even though the database write itself was correct — only surfaced by moving to a fully
+    disjoint set, since every other test here reuses the same single service type across create
+    and update."""
+    manager, company, service_type_a, _ = await _seed(db_session)
+    service_type_b = ServiceType(name="Jardinagem", average_duration_minutes=45)
+    service_type_c = ServiceType(name="Manutenção", average_duration_minutes=60)
+    db_session.add_all([service_type_b, service_type_c])
+    await db_session.commit()
+    token = _login(client, manager.email)
+
+    created = client.post(
+        "/field-workers",
+        json={
+            "full_name": "João da Silva",
+            "contractor_company_id": str(company.id),
+            "service_type_ids": [str(service_type_a.id), str(service_type_b.id)],
+            "user_id": None,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    assert sorted(created["service_type_ids"]) == sorted(
+        [str(service_type_a.id), str(service_type_b.id)]
+    )
+
+    response = client.patch(
+        f"/field-workers/{created['id']}",
+        json={
+            "full_name": "João da Silva",
+            "contractor_company_id": str(company.id),
+            "service_type_ids": [str(service_type_c.id)],
+            "user_id": None,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["service_type_ids"] == [str(service_type_c.id)]
