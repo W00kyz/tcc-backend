@@ -2,9 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
+from app.api.buildings import router as buildings_router
 from app.api.checkins import router as checkins_router
 from app.api.contractor_companies import router as contractor_companies_router
 from app.api.field_workers import router as field_workers_router
+from app.api.floors import router as floors_router
 from app.api.health import router as health_router
 from app.api.routes import router as routes_router
 from app.api.service_types import router as service_types_router
@@ -66,6 +68,8 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
     app.include_router(service_types_router)
     app.include_router(contractor_companies_router)
     app.include_router(field_workers_router)
+    app.include_router(buildings_router)
+    app.include_router(floors_router)
 
     return app
 
