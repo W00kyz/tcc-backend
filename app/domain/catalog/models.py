@@ -1,14 +1,20 @@
 """Minimal catalog tables (spec §4.1). No CRUD yet — RF05-RF10 build the write paths and
 endpoints in Etapa 3. This module exists so Tasks 7-8 have a real foreign key to point at."""
 
+import enum
 import uuid
 from datetime import date
 
-from sqlalchemy import Float, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Enum, Float, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+
+class PointType(enum.StrEnum):
+    REGULAR = "REGULAR"
+    OCCASIONAL = "OCCASIONAL"
 
 
 class ContractorCompany(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -84,6 +90,16 @@ class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(String(500))
     latitude: Mapped[float] = mapped_column(Float)
     longitude: Mapped[float] = mapped_column(Float)
+    point_type: Mapped[PointType] = mapped_column(
+        Enum(PointType, name="point_type"), default=PointType.REGULAR
+    )
+    # Nullable: only an OCCASIONAL point references an event. Left in place after
+    # promote_service_point_to_regular (RF26) as the point's historical origin — see that
+    # function's docstring for the provenance rationale.
+    event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("events.id"), nullable=True
+    )
+    event: Mapped["Event | None"] = relationship()
 
 
 class Event(UUIDPrimaryKeyMixin, TimestampMixin, Base):

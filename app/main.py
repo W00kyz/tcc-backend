@@ -10,6 +10,7 @@ from app.api.field_workers import router as field_workers_router
 from app.api.floors import router as floors_router
 from app.api.health import router as health_router
 from app.api.routes import router as routes_router
+from app.api.service_points import router as service_points_router
 from app.api.service_types import router as service_types_router
 from app.api.users import router as users_router
 from app.core.config import Settings, get_settings
@@ -72,6 +73,7 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
     app.include_router(buildings_router)
     app.include_router(floors_router)
     app.include_router(events_router)
+    app.include_router(service_points_router)
 
     return app
 
