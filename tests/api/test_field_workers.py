@@ -1,3 +1,5 @@
+import uuid
+
 from app.core.security import hash_password
 from app.domain.catalog.models import ContractorCompany, ServiceType
 from app.domain.identity.models import User, UserRole
@@ -158,6 +160,113 @@ async def test_a_patch_cannot_steal_a_user_already_linked_to_another_worker(
     unchanged = client.get("/field-workers", headers={"Authorization": f"Bearer {token}"}).json()
     still_linked = next(item for item in unchanged if item["id"] == linked["id"])
     assert still_linked["user_id"] == str(worker_login.id)
+
+
+async def test_linking_a_non_field_worker_role_user_is_rejected(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for Finding I1: _assert_user_available used to check only that a
+    user_id wasn't already claimed by another field worker, never that the User actually has
+    role FIELD_WORKER — linking an ADMIN's or MANAGER's user_id used to succeed (201)."""
+    manager, company, service_type, _ = await _seed(db_session)
+    other_manager = User(
+        name="Outro Gestor",
+        email="outro-gestor@pu.ufcg.edu.br",
+        password_hash=hash_password("senha-forte-o-suficiente"),
+        role=UserRole.MANAGER,
+    )
+    db_session.add(other_manager)
+    await db_session.commit()
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/field-workers",
+        json={
+            "full_name": "João da Silva",
+            "contractor_company_id": str(company.id),
+            "service_type_ids": [str(service_type.id)],
+            "user_id": str(other_manager.id),
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 409
+
+
+async def test_linking_an_unknown_user_id_returns_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, company, service_type, _ = await _seed(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/field-workers",
+        json={
+            "full_name": "João da Silva",
+            "contractor_company_id": str(company.id),
+            "service_type_ids": [str(service_type.id)],
+            "user_id": str(uuid.uuid4()),
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 404
+
+
+async def test_creating_a_field_worker_for_an_unknown_contractor_company_returns_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for Finding I2.3."""
+    manager, _company, service_type, _ = await _seed(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/field-workers",
+        json={
+            "full_name": "João da Silva",
+            "contractor_company_id": str(uuid.uuid4()),
+            "service_type_ids": [str(service_type.id)],
+            "user_id": None,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 404
+
+
+async def test_manager_lists_linkable_users(client: TestClient, db_session: AsyncSession) -> None:
+    """Finding C2: GET /field-workers/linkable-users returns only FIELD_WORKER-role users not
+    yet linked to a FieldWorker, and a Manager (not just an Admin) can call it."""
+    manager, company, service_type, unlinked_worker = await _seed(db_session)
+    linked_worker = User(
+        name="Maria",
+        email="maria@empresa.com",
+        password_hash=hash_password("senha-forte-o-suficiente"),
+        role=UserRole.FIELD_WORKER,
+    )
+    db_session.add(linked_worker)
+    await db_session.commit()
+    token = _login(client, manager.email)
+    client.post(
+        "/field-workers",
+        json={
+            "full_name": "Maria Souza",
+            "contractor_company_id": str(company.id),
+            "service_type_ids": [str(service_type.id)],
+            "user_id": str(linked_worker.id),
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    response = client.get(
+        "/field-workers/linkable-users", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 200
+    ids = [item["id"] for item in response.json()]
+    assert str(unlinked_worker.id) in ids
+    assert str(linked_worker.id) not in ids
+    assert str(manager.id) not in ids
 
 
 async def test_patch_response_reflects_a_disjoint_service_type_set(

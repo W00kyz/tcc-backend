@@ -15,7 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
-from app.domain.catalog.models import FieldWorker, FieldWorkerServiceType
+from app.domain.catalog.models import ContractorCompany, FieldWorker, FieldWorkerServiceType
 from app.domain.identity.models import User, UserRole
 
 router = APIRouter(prefix="/field-workers", tags=["field-workers"])
@@ -27,6 +27,16 @@ class FieldWorkerOut(BaseModel):
     contractor_company_id: UUID
     service_type_ids: list[UUID]
     user_id: UUID | None
+
+
+class LinkableUserOut(BaseModel):
+    """Minimal projection for the dashboard /profissionais link-dropdown (Finding C2) — a
+    dedicated model instead of importing UserOut from app/api/users.py, so this router stays
+    self-contained per this repo's "no cross-router imports" convention."""
+
+    id: UUID
+    name: str
+    email: str
 
 
 class FieldWorkerCreateRequest(BaseModel):
@@ -79,9 +89,24 @@ async def _assert_user_available(
 ) -> None:
     """RF08 links an existing FIELD_WORKER-role User to a FieldWorker — spec Ruling 6. A User
     links to at most one FieldWorker, so both create and update must reject a `user_id` already
-    claimed by a different field worker."""
+    claimed by a different field worker.
+
+    BUG FIX (Finding I1): the uniqueness check alone never verified that `user_id` actually
+    points at a FIELD_WORKER-role User — linking an ADMIN's or MANAGER's user_id used to
+    succeed silently. This fetches the User (also turning an unknown user_id into a clean 404
+    instead of a later FK-violation 500 on insert) and rejects any role other than
+    FIELD_WORKER."""
     if user_id is None:
         return
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'User "{user_id}" not found.')
+    if user.role != UserRole.FIELD_WORKER:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f'User "{user_id}" has role {user.role.value}; only a FIELD_WORKER-role user can be'
+            " linked to a field worker.",
+        )
     conflict = await db.scalar(
         select(FieldWorker).where(FieldWorker.user_id == user_id, FieldWorker.id != worker_id)
     )
@@ -89,6 +114,18 @@ async def _assert_user_available(
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             f'User "{user_id}" is already linked to another field worker.',
+        )
+
+
+async def _assert_contractor_company_exists(db: AsyncSession, company_id: UUID) -> None:
+    # BUG FIX (Finding I2.3): without this check, an unknown contractor_company_id only fails
+    # later at the FieldWorker insert/update's FK constraint, surfacing as an unhandled
+    # IntegrityError (500) instead of a clean 404 — same existence-check-before-write pattern
+    # as update_floor in app/api/floors.py.
+    company = await db.get(ContractorCompany, company_id)
+    if company is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f'Contractor company "{company_id}" not found.'
         )
 
 
@@ -129,12 +166,33 @@ async def list_field_workers(
     return [_to_out(worker) for worker in workers]
 
 
+@router.get("/linkable-users", response_model=list[LinkableUserOut])
+async def list_linkable_users(
+    _actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[LinkableUserOut]:
+    """Finding C2: the dashboard's /profissionais screen needs FIELD_WORKER-role Users not yet
+    linked to a FieldWorker, for its link dropdown. GET /users is Admin-only (RF05), so a
+    Manager gets 403 there — this router serves its own minimal projection instead. Registered
+    before any `/{worker_id}`-shaped route so "linkable-users" is never captured as a path
+    parameter (this router currently has no GET "/{worker_id}", so no collision exists today
+    either way, but the ordering is kept safe against one being added later)."""
+    linked_user_ids = select(FieldWorker.user_id).where(FieldWorker.user_id.is_not(None))
+    users = (
+        await db.scalars(
+            select(User).where(User.role == UserRole.FIELD_WORKER, User.id.not_in(linked_user_ids))
+        )
+    ).all()
+    return [LinkableUserOut(id=user.id, name=user.name, email=user.email) for user in users]
+
+
 @router.post("", response_model=FieldWorkerOut, status_code=status.HTTP_201_CREATED)
 async def create_field_worker(
     body: FieldWorkerCreateRequest,
     actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> FieldWorkerOut:
+    await _assert_contractor_company_exists(db, body.contractor_company_id)
     await _assert_user_available(db, body.user_id, worker_id=None)
     worker = FieldWorker(
         full_name=body.full_name,
@@ -172,6 +230,7 @@ async def update_field_worker(
     worker = await _load(db, worker_id)
     if worker is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Field worker "{worker_id}" not found.')
+    await _assert_contractor_company_exists(db, body.contractor_company_id)
     await _assert_user_available(db, body.user_id, worker_id=worker.id)
 
     before = {
