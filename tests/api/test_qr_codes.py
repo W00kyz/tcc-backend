@@ -109,6 +109,42 @@ async def test_revoking_without_replacement_leaves_the_floor_without_an_active_c
     assert active is None
 
 
+async def test_reissuing_after_a_pure_revoke_succeeds_with_a_fresh_version(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for Finding C1: issue -> revoke (no replacement) -> issue again used to
+    reset next_version to 1 because it was derived only from the current ACTIVE row (none, post
+    revoke) — sign_qr_payload is deterministic, so that reproduced the already-revoked v1 row's
+    exact public_code and hit its unique constraint (500), permanently bricking reissue for the
+    floor. This is exactly the "reforma" (renovation) flow: revoke while out of service, then
+    issue a fresh code once work is done."""
+    manager, floor = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+    first = client.post(
+        f"/floors/{floor.id}/qr-codes",
+        json={"reason": "Emissão inicial"},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    revoke = client.post(
+        f"/qr-codes/{first['id']}/revoke",
+        json={"reason": "Reforma do andar"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert revoke.status_code == 200
+
+    response = client.post(
+        f"/floors/{floor.id}/qr-codes",
+        json={"reason": "Reforma concluída"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["version"] == 2
+    assert body["status"] == "ACTIVE"
+    assert body["public_code"] != first["public_code"]
+
+
 async def test_issuing_for_an_unknown_floor_returns_404(
     client: TestClient, db_session: AsyncSession
 ) -> None:

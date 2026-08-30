@@ -1,7 +1,7 @@
 import base64
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.qr.crypto import sign_qr_payload
@@ -32,7 +32,17 @@ async def issue_qr_code(
     previous = await db.scalar(
         select(QrCode).where(QrCode.floor_id == floor_id, QrCode.status == QrCodeStatus.ACTIVE)
     )
-    next_version = (previous.version + 1) if previous else 1
+    # BUG FIX (Finding C1): next_version must come from every QrCode row this floor has ever
+    # had, not just the current ACTIVE one. After a pure revoke (no replacement), the floor has
+    # zero ACTIVE rows — deriving next_version from `previous` alone would reset to 1 here, and
+    # since sign_qr_payload is deterministic (no randomness), that reissues the exact
+    # byte-identical public_code of the already-revoked v1 row, colliding with its unique
+    # public_code constraint on insert (IntegrityError -> unhandled 500, permanently bricking
+    # reissue for that floor).
+    max_version = await db.scalar(
+        select(func.max(QrCode.version)).where(QrCode.floor_id == floor_id)
+    )
+    next_version = (max_version or 0) + 1
 
     signed = sign_qr_payload(
         floor_id=floor_id, version=next_version, private_key_hex=private_key_hex
