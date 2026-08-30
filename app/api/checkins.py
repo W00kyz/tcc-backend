@@ -1,4 +1,4 @@
-"""RF29 (check-in via QR real cruzado com GPS)."""
+"""RF29 (check-in via real QR cross-checked with GPS)."""
 
 from datetime import datetime
 from typing import Annotated

@@ -1,4 +1,4 @@
-"""RF27 (mínimo — lista de pontos do dia), RF34 (start)."""
+"""RF27 (minimum — list of the day's points), RF34 (start)."""
 
 from datetime import datetime
 from typing import Annotated
@@ -47,15 +47,18 @@ async def _load_route(db: AsyncSession, route_id: UUID) -> Route | None:
     route = await db.scalar(
         select(Route)
         .where(Route.id == route_id)
-        .options(selectinload(Route.stops).selectinload(RouteStop.service_point))
+        .options(
+            selectinload(Route.stops).selectinload(RouteStop.service_point),
+            selectinload(Route.field_worker),
+        )
     )
     return route
 
 
-def _to_route_out(route: Route, worker_name: str) -> RouteOut:
+def _to_route_out(route: Route) -> RouteOut:
     return RouteOut(
         id=route.id,
-        field_worker_name=worker_name,
+        field_worker_name=route.field_worker.full_name,
         scheduled_start_at=route.scheduled_start_at,
         started_at=route.started_at,
         stops=[
@@ -83,10 +86,13 @@ async def list_my_routes(
         await db.scalars(
             select(Route)
             .where(Route.field_worker_id == worker.id)
-            .options(selectinload(Route.stops).selectinload(RouteStop.service_point))
+            .options(
+                selectinload(Route.stops).selectinload(RouteStop.service_point),
+                selectinload(Route.field_worker),
+            )
         )
     ).all()
-    return [_to_route_out(route, user.name) for route in routes]
+    return [_to_route_out(route) for route in routes]
 
 
 @router.get("", response_model=list[RouteOut])
@@ -96,15 +102,13 @@ async def list_all_routes(
 ) -> list[RouteOut]:
     routes = (
         await db.scalars(
-            select(Route).options(selectinload(Route.stops).selectinload(RouteStop.service_point))
+            select(Route).options(
+                selectinload(Route.stops).selectinload(RouteStop.service_point),
+                selectinload(Route.field_worker),
+            )
         )
     ).all()
-
-    result = []
-    for route in routes:
-        worker = await db.get(FieldWorker, route.field_worker_id)
-        result.append(_to_route_out(route, worker.full_name if worker else "—"))
-    return result
+    return [_to_route_out(route) for route in routes]
 
 
 @router.post("/{route_id}/start", response_model=RouteOut)
@@ -133,4 +137,4 @@ async def start_route_endpoint(
     except RouteAlreadyStarted as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
-    return _to_route_out(route, user.name)
+    return _to_route_out(route)

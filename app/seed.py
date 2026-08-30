@@ -1,4 +1,4 @@
-"""Seeds the one-point walking skeleton (spec entregável da Etapa 2). Run once per fresh
+"""Seeds the one-point walking skeleton (spec deliverable for Etapa 2). Run once per fresh
 database: uv run python -m app.seed
 
 Not idempotent by design — this is a development fixture, not a migration. Running it twice

@@ -16,7 +16,7 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 if TYPE_CHECKING:
     # Avoids a real circular import at runtime — catalog does not import routing, but
     # mypy strict still wants the annotation resolvable without executing the import eagerly.
-    from app.domain.catalog.models import ServicePoint
+    from app.domain.catalog.models import FieldWorker, ServicePoint
 
 
 class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -36,6 +36,9 @@ class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     start_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     stops: Mapped[list["RouteStop"]] = relationship(back_populates="route")
+    # No back_populates: FieldWorker has no `routes` collection yet, and none of today's
+    # call sites need one — this is a read-only lookup for RouteOut.field_worker_name.
+    field_worker: Mapped["FieldWorker"] = relationship()
 
 
 class RouteStopStatus(enum.StrEnum):
