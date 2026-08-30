@@ -2,6 +2,7 @@
 endpoints in Etapa 3. This module exists so Tasks 7-8 have a real foreign key to point at."""
 
 import uuid
+from datetime import date
 
 from sqlalchemy import Float, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
@@ -83,3 +84,15 @@ class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(String(500))
     latitude: Mapped[float] = mapped_column(Float)
     longitude: Mapped[float] = mapped_column(Float)
+
+
+class Event(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """RF22 — pontos eventuais se vinculam a um evento com janela de validade. Referenciado em
+    docs/specs/2026-08-24-arquitetura-design.md §4.1 desde a Etapa 2, criado só agora (Etapa 3,
+    Task 5) porque nenhuma tabela dependia dela até o ponto eventual existir."""
+
+    __tablename__ = "events"
+
+    name: Mapped[str] = mapped_column(String(200))
+    valid_from: Mapped[date] = mapped_column()
+    valid_until: Mapped[date] = mapped_column()

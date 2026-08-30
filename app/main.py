@@ -5,6 +5,7 @@ from app.api.auth import router as auth_router
 from app.api.buildings import router as buildings_router
 from app.api.checkins import router as checkins_router
 from app.api.contractor_companies import router as contractor_companies_router
+from app.api.events import router as events_router
 from app.api.field_workers import router as field_workers_router
 from app.api.floors import router as floors_router
 from app.api.health import router as health_router
@@ -70,6 +71,7 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
     app.include_router(field_workers_router)
     app.include_router(buildings_router)
     app.include_router(floors_router)
+    app.include_router(events_router)
 
     return app
 
