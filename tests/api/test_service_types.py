@@ -61,6 +61,27 @@ async def test_manager_edits_a_service_type(client: TestClient, db_session: Asyn
     assert response.json()["average_duration_minutes"] == 45
 
 
+async def test_duplicate_service_type_name_returns_409(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for Finding I2.4."""
+    manager = await _seed_manager(db_session)
+    token = _login(client, manager.email)
+    client.post(
+        "/service-types",
+        json={"name": "Limpeza", "average_duration_minutes": 30},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    response = client.post(
+        "/service-types",
+        json={"name": "Limpeza", "average_duration_minutes": 45},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 409
+
+
 async def test_a_field_worker_cannot_create_a_service_type(
     client: TestClient, db_session: AsyncSession
 ) -> None:

@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_role
@@ -61,15 +62,23 @@ async def create_user(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> UserOut:
     settings = request.app.state.settings
-    user = await create_invited_user(
-        db,
-        request.app.state.mailer,
-        name=body.name,
-        email=body.email,
-        role=body.role,
-        dashboard_base_url=settings.dashboard_base_url,
-        jwt_secret_key=settings.jwt_secret_key,
-    )
+    try:
+        user = await create_invited_user(
+            db,
+            request.app.state.mailer,
+            name=body.name,
+            email=body.email,
+            role=body.role,
+            dashboard_base_url=settings.dashboard_base_url,
+            jwt_secret_key=settings.jwt_secret_key,
+        )
+    except IntegrityError as exc:
+        # BUG FIX (Finding I2.6): User.email is unique — without this, a duplicate email hits
+        # an unhandled IntegrityError (500) instead of a clean 409. create_invited_user flushes
+        # (but does not commit) before sending the invite mail, so no email is sent either way.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f'User with email "{body.email}" already exists.'
+        ) from exc
     await record_audit_trail(
         db,
         actor_id=actor.id,
@@ -98,16 +107,23 @@ async def update_user(
     user.name = body.name
     user.email = body.email
     user.role = body.role
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="user",
-        entity_id=user.id,
-        action="update",
-        before=before,
-        after={"name": user.name, "email": user.email, "role": user.role.value},
-    )
-    await db.commit()
+    try:
+        await record_audit_trail(
+            db,
+            actor_id=actor.id,
+            entity_type="user",
+            entity_id=user.id,
+            action="update",
+            before=before,
+            after={"name": user.name, "email": user.email, "role": user.role.value},
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        # Same duplicate-email protection as create_user — email is settable here too.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f'User with email "{body.email}" already exists.'
+        ) from exc
     return _to_user_out(user)
 
 

@@ -1,3 +1,5 @@
+import uuid
+
 from app.core.security import hash_password
 from app.domain.catalog.models import Building
 from app.domain.identity.models import User, UserRole
@@ -74,3 +76,28 @@ async def test_duplicate_floor_label_in_the_same_building_is_rejected(
     )
 
     assert response.status_code == 409
+
+
+async def test_creating_a_floor_for_an_unknown_building_returns_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for Finding I2.1: an unknown building_id used to be misreported as a
+    409 "Floor already exists" (the IntegrityError handler assumed the only possible violation
+    was the duplicate-label unique constraint)."""
+    manager = User(
+        name="Larissa",
+        email="larissa@pu.ufcg.edu.br",
+        password_hash=hash_password("senha-forte-o-suficiente"),
+        role=UserRole.MANAGER,
+    )
+    db_session.add(manager)
+    await db_session.commit()
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/floors",
+        json={"building_id": str(uuid.uuid4()), "label": "Térreo"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 404

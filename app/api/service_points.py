@@ -15,7 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
-from app.domain.catalog.models import Event, PointType, ServicePoint
+from app.domain.catalog.models import Event, Floor, PointType, ServicePoint
 from app.domain.catalog.service import promote_service_point_to_regular
 from app.domain.identity.models import User, UserRole
 
@@ -99,6 +99,18 @@ async def create_service_point(
     actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ServicePointOut:
+    # BUG FIX (Finding I2.2): without these checks, an unknown floor_id or event_id only fails
+    # later at the ServicePoint insert's FK constraints, surfacing as an unhandled
+    # IntegrityError (500) instead of a clean 404 — same existence-check-before-write pattern
+    # as update_floor in app/api/floors.py.
+    floor = await db.get(Floor, body.floor_id)
+    if floor is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Floor "{body.floor_id}" not found.')
+    if body.event_id is not None:
+        event = await db.get(Event, body.event_id)
+        if event is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f'Event "{body.event_id}" not found.')
+
     point = ServicePoint(
         floor_id=body.floor_id,
         name=body.name,

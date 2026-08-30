@@ -43,3 +43,29 @@ async def test_manager_creates_edits_and_lists_a_contractor_company(
     listing = client.get("/contractor-companies", headers={"Authorization": f"Bearer {token}"})
     assert listing.status_code == 200
     assert any(item["id"] == company_id for item in listing.json())
+
+
+async def test_duplicate_cnpj_returns_409(client: TestClient, db_session: AsyncSession) -> None:
+    """Regression test for Finding I2.5."""
+    manager = User(
+        name="Larissa",
+        email="larissa@pu.ufcg.edu.br",
+        password_hash=hash_password("senha-forte-o-suficiente"),
+        role=UserRole.MANAGER,
+    )
+    db_session.add(manager)
+    await db_session.commit()
+    token = _login(client, manager.email)
+    client.post(
+        "/contractor-companies",
+        json={"name": "Limpa Tudo Terceirizados Ltda", "cnpj": "12345678000199"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    response = client.post(
+        "/contractor-companies",
+        json={"name": "Outra Empresa Ltda", "cnpj": "12345678000199"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 409

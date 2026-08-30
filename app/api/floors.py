@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
-from app.domain.catalog.models import Floor
+from app.domain.catalog.models import Building, Floor
 from app.domain.identity.models import User, UserRole
 
 router = APIRouter(prefix="/floors", tags=["floors"])
@@ -58,6 +58,15 @@ async def create_floor(
     actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> FloorOut:
+    # BUG FIX (Finding I2.1): without this check, an unknown building_id used to hit the
+    # IntegrityError handler below, which only ever expected the (building_id, label) unique
+    # violation and always reported it as a duplicate-label 409 — factually wrong for an FK
+    # violation. This existence check turns that case into a clean 404 before the insert is
+    # even attempted; the genuine duplicate-label case still falls through to the 409 below.
+    building = await db.get(Building, body.building_id)
+    if building is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Building "{body.building_id}" not found.')
+
     floor = Floor(building_id=body.building_id, label=body.label)
     db.add(floor)
     try:

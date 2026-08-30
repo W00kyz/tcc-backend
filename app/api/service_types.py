@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_role
@@ -62,7 +63,15 @@ async def create_service_type(
         name=body.name, average_duration_minutes=body.average_duration_minutes
     )
     db.add(service_type)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # BUG FIX (Finding I2.4): ServiceType.name is unique (RNF19's load-bearing table) —
+        # without this, a duplicate name hits an unhandled IntegrityError (500) instead of a
+        # clean 409.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f'Service type "{body.name}" already exists.'
+        ) from exc
     await record_audit_trail(
         db,
         actor_id=actor.id,
@@ -98,17 +107,24 @@ async def update_service_type(
     }
     service_type.name = body.name
     service_type.average_duration_minutes = body.average_duration_minutes
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="service_type",
-        entity_id=service_type.id,
-        action="update",
-        before=before,
-        after={
-            "name": service_type.name,
-            "average_duration_minutes": service_type.average_duration_minutes,
-        },
-    )
-    await db.commit()
+    try:
+        await record_audit_trail(
+            db,
+            actor_id=actor.id,
+            entity_type="service_type",
+            entity_id=service_type.id,
+            action="update",
+            before=before,
+            after={
+                "name": service_type.name,
+                "average_duration_minutes": service_type.average_duration_minutes,
+            },
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        # Same duplicate-name protection as create_service_type — the name is settable here too.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f'Service type "{body.name}" already exists.'
+        ) from exc
     return _to_out(service_type)

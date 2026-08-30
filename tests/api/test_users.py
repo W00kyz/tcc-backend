@@ -51,6 +51,28 @@ async def test_admin_creates_a_user_and_an_invite_email_is_sent(
     assert "redefinir-senha?token=" in recording_mailer.sent[0]["body"]
 
 
+async def test_duplicate_email_returns_409(
+    client: TestClient, db_session: AsyncSession, recording_mailer: RecordingMailer
+) -> None:
+    """Regression test for Finding I2.6."""
+    await _seed_admin(db_session)
+    token = _login(client, "admin@pu.ufcg.edu.br")
+    client.post(
+        "/users",
+        json={"name": "Larissa Almeida", "email": "larissa@pu.ufcg.edu.br", "role": "MANAGER"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    response = client.post(
+        "/users",
+        json={"name": "Outra Larissa", "email": "larissa@pu.ufcg.edu.br", "role": "MANAGER"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 409
+    assert len(recording_mailer.sent) == 1
+
+
 async def test_a_field_worker_cannot_create_a_user(
     client: TestClient, db_session: AsyncSession
 ) -> None:

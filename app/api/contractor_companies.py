@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_role
@@ -56,7 +57,14 @@ async def create_contractor_company(
 ) -> ContractorCompanyOut:
     company = ContractorCompany(name=body.name, cnpj=body.cnpj)
     db.add(company)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # BUG FIX (Finding I2.5): ContractorCompany.cnpj is unique — without this, a duplicate
+        # cnpj hits an unhandled IntegrityError (500) instead of a clean 409.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f'Contractor company with CNPJ "{body.cnpj}" already exists.'
+        ) from exc
     await record_audit_trail(
         db,
         actor_id=actor.id,
@@ -86,14 +94,21 @@ async def update_contractor_company(
     before = {"name": company.name, "cnpj": company.cnpj}
     company.name = body.name
     company.cnpj = body.cnpj
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="contractor_company",
-        entity_id=company.id,
-        action="update",
-        before=before,
-        after={"name": company.name, "cnpj": company.cnpj},
-    )
-    await db.commit()
+    try:
+        await record_audit_trail(
+            db,
+            actor_id=actor.id,
+            entity_type="contractor_company",
+            entity_id=company.id,
+            action="update",
+            before=before,
+            after={"name": company.name, "cnpj": company.cnpj},
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        # Same duplicate-cnpj protection as create_contractor_company — cnpj is settable here too.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f'Contractor company with CNPJ "{body.cnpj}" already exists.'
+        ) from exc
     return _to_out(company)

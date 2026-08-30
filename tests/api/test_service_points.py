@@ -1,3 +1,4 @@
+import uuid
 from datetime import date, timedelta
 
 from app.core.security import hash_password
@@ -52,6 +53,54 @@ async def test_manager_creates_a_regular_service_point(
 
     assert response.status_code == 201
     assert response.json()["point_type"] == "REGULAR"
+
+
+async def test_creating_a_service_point_for_an_unknown_floor_returns_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for Finding I2.2."""
+    manager, _floor = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/service-points",
+        json={
+            "floor_id": str(uuid.uuid4()),
+            "name": "Sala 101",
+            "description": "Sala de aula",
+            "latitude": -7.2,
+            "longitude": -35.9,
+            "point_type": "REGULAR",
+            "event_id": None,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 404
+
+
+async def test_creating_an_occasional_point_for_an_unknown_event_returns_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for Finding I2.2."""
+    manager, floor = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/service-points",
+        json={
+            "floor_id": str(floor.id),
+            "name": "Tenda de Inscrição",
+            "description": "Tenda temporária",
+            "latitude": -7.2,
+            "longitude": -35.9,
+            "point_type": "OCCASIONAL",
+            "event_id": str(uuid.uuid4()),
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 404
 
 
 async def test_an_occasional_point_past_its_window_is_hidden_by_default_but_reportable(
