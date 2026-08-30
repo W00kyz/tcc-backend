@@ -1,4 +1,4 @@
-"""QR code issuance, substituição and revocation (RF09, RF10). No hard-delete endpoint —
+"""QR code issuance, replacement and revocation (RF09, RF10). No hard-delete endpoint —
 replaced/revoked codes stay in the table as history; `status` tracks the lifecycle."""
 
 from typing import Annotated

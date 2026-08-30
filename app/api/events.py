@@ -7,7 +7,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,11 +32,26 @@ class EventCreateRequest(BaseModel):
     valid_from: date
     valid_until: date
 
+    @model_validator(mode="after")
+    def _valid_from_before_valid_until(self) -> "EventCreateRequest":
+        # BUG FIX (minor): an inverted window (valid_from > valid_until) would silently mean
+        # "instantly archived" once fed into the RF25 archival filter in
+        # app/api/service_points.py (Event.valid_until >= date.today()) — reject it up front.
+        if self.valid_from > self.valid_until:
+            raise ValueError("valid_from must not be after valid_until.")
+        return self
+
 
 class EventUpdateRequest(BaseModel):
     name: str
     valid_from: date
     valid_until: date
+
+    @model_validator(mode="after")
+    def _valid_from_before_valid_until(self) -> "EventUpdateRequest":
+        if self.valid_from > self.valid_until:
+            raise ValueError("valid_from must not be after valid_until.")
+        return self
 
 
 def _to_out(event: Event) -> EventOut:

@@ -1,5 +1,5 @@
-"""Minimal catalog tables (spec §4.1). No CRUD yet — RF05-RF10 build the write paths and
-endpoints in Etapa 3. This module exists so Tasks 7-8 have a real foreign key to point at."""
+"""Minimal catalog tables (spec §4.1). RF05-RF10's write paths and endpoints (Etapa 3) live in
+app/api/*.py, one router per table here — this module stays models-only."""
 
 import enum
 import uuid

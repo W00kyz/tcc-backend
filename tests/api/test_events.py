@@ -45,3 +45,27 @@ async def test_manager_creates_edits_and_lists_an_event(
 
     listing = client.get("/events", headers={"Authorization": f"Bearer {token}"})
     assert any(item["id"] == event_id for item in listing.json())
+
+
+async def test_creating_an_event_with_an_inverted_window_is_rejected(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for the events minor: valid_from > valid_until used to be accepted
+    silently, which would then read as "instantly archived" by the RF25 archival filter."""
+    manager = User(
+        name="Larissa",
+        email="larissa@pu.ufcg.edu.br",
+        password_hash=hash_password("senha-forte-o-suficiente"),
+        role=UserRole.MANAGER,
+    )
+    db_session.add(manager)
+    await db_session.commit()
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/events",
+        json={"name": "Vestibular 2027", "valid_from": "2027-01-15", "valid_until": "2027-01-10"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 422
