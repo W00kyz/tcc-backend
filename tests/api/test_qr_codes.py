@@ -178,3 +178,36 @@ async def test_issued_secret_is_the_signature_not_the_private_signing_key(
         public_key.verify(stored.secret, signable_string.encode("utf-8"))
     except InvalidSignature:
         raise AssertionError("stored secret does not verify as the payload's signature") from None
+
+
+async def test_downloading_the_pdf_for_a_floor_without_an_active_code_is_a_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+
+    response = client.get(
+        f"/floors/{floor.id}/qr-codes/active/pdf", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 404
+
+
+async def test_downloading_the_pdf_for_an_active_code(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+    client.post(
+        f"/floors/{floor.id}/qr-codes",
+        json={"reason": "Emissão inicial"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    response = client.get(
+        f"/floors/{floor.id}/qr-codes/active/pdf", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.content.startswith(b"%PDF-")

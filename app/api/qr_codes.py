@@ -5,15 +5,19 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import Response
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
 from app.domain.catalog.models import Floor
 from app.domain.identity.models import User, UserRole
-from app.domain.qr.models import QrCode
+from app.domain.qr.models import QrCode, QrCodeStatus
+from app.domain.qr.pdf import generate_qr_sheet_pdf
 from app.domain.qr.service import issue_qr_code, revoke_qr_code
 
 router = APIRouter(tags=["qr-codes"])
@@ -80,6 +84,30 @@ async def issue_qr_code_endpoint(
     )
     await db.commit()
     return _to_out(qr_code)
+
+
+@router.get("/floors/{floor_id}/qr-codes/active/pdf")
+async def download_active_qr_code_pdf(
+    floor_id: UUID,
+    _actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    floor = await db.scalar(
+        select(Floor).where(Floor.id == floor_id).options(selectinload(Floor.building))
+    )
+    if floor is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Floor "{floor_id}" not found.')
+
+    qr_code = await db.scalar(
+        select(QrCode).where(QrCode.floor_id == floor_id, QrCode.status == QrCodeStatus.ACTIVE)
+    )
+    if qr_code is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Floor "{floor_id}" has no active QR code.')
+
+    pdf_bytes = generate_qr_sheet_pdf(
+        building_name=floor.building.name, floor_label=floor.label, qr_code=qr_code
+    )
+    return Response(content=pdf_bytes, media_type="application/pdf")
 
 
 @router.post("/qr-codes/{qr_code_id}/revoke", response_model=QrCodeOut)

@@ -77,6 +77,9 @@ class Floor(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     building_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("buildings.id"))
     label: Mapped[str] = mapped_column(String(100))
+    # Task 8: lets the QR sheet PDF endpoint read floor.building.name via selectinload,
+    # without a second query.
+    building: Mapped["Building"] = relationship()
 
 
 class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
