@@ -231,12 +231,15 @@ async def test_routes_me_defaults_to_today_and_includes_geometry(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
-    await _add_route(
+    today_route = await _add_route(
         db_session,
         workers[0],
         [points[0], points[1]],
         route_date=date.today(),
         with_geometry=True,
+    )
+    await _add_route(
+        db_session, workers[0], [points[2]], route_date=date.today() - timedelta(days=1)
     )
     token = _login(client, worker_user.email)
 
@@ -244,7 +247,7 @@ async def test_routes_me_defaults_to_today_and_includes_geometry(
 
     assert response.status_code == 200
     body = response.json()
-    assert len(body) == 1
+    assert [route["id"] for route in body] == [str(today_route.id)]  # yesterday's is excluded
     assert body[0]["route_type"] == "REGULAR"
     assert body[0]["stops"][0]["point_type"] == "OCCASIONAL"
     assert isinstance(body[0]["stops"][1]["leg_geometry"], list)
@@ -313,6 +316,9 @@ async def test_start_cancelled_route_409(client: TestClient, db_session: AsyncSe
     )
 
     assert response.status_code == 409
+    # Pin it to the RouteNotStartable path, not the started_at guard (which never ran here).
+    assert "CANCELLED" in response.json()["detail"]
+    assert "PLANNED" in response.json()["detail"]
 
 
 async def test_worker_can_start_their_own_route(

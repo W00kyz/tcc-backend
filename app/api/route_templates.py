@@ -139,8 +139,18 @@ def _template_snapshot(template: RouteTemplate) -> dict[str, object]:
         "weekdays": template.weekdays,
         "route_type": template.route_type.value,
         "is_active": template.is_active,
+        # The arrival window is part of a stop and a PATCH replaces the whole list, so a
+        # windows-only edit (same points, same order) must still show up in the RF21 diff.
         "stops": [
-            str(stop.service_point_id)
+            {
+                "service_point_id": str(stop.service_point_id),
+                "expected_arrival_from": stop.expected_arrival_from.isoformat()
+                if stop.expected_arrival_from is not None
+                else None,
+                "expected_arrival_to": stop.expected_arrival_to.isoformat()
+                if stop.expected_arrival_to is not None
+                else None,
+            }
             for stop in sorted(template.stops, key=lambda stop: stop.order_index)
         ],
     }

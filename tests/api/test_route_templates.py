@@ -253,6 +253,41 @@ async def test_patch_template_name_and_deactivates(
     assert count == 1
 
 
+async def test_patch_template_arrival_windows_only_is_audited(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, _workers, points = await _seed(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/route-templates", json=_template_payload(points), headers=_auth(token)
+    ).json()
+
+    response = client.patch(
+        f"/route-templates/{created['id']}",
+        json={
+            "stops": [
+                {"service_point_id": str(points[1].id), "expected_arrival_from": "09:30:00"},
+                {"service_point_id": str(points[0].id)},
+            ]
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200
+    audit = await db_session.scalar(
+        select(AuditTrail).where(
+            AuditTrail.entity_type == "route_template", AuditTrail.action == "update"
+        )
+    )
+    assert audit is not None
+    before, after = audit.before_data, audit.after_data
+    assert before is not None
+    assert after is not None
+    assert before != after  # a windows-only edit still leaves a trail
+    assert before["stops"][0]["expected_arrival_from"] == "08:00:00"
+    assert after["stops"][0]["expected_arrival_from"] == "09:30:00"
+
+
 async def test_patch_template_replaces_stop_list(
     client: TestClient, db_session: AsyncSession
 ) -> None:
