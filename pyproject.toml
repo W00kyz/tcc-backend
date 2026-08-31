@@ -60,6 +60,9 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "PT", "
 # OsrmUnavailable is the exact name spec §4 (Ruling 6) and Etapa 4's Tasks 3/5/6 import and
 # catch by name — a signal condition, not an "...Error"-suffixed generic failure (Task 1 brief).
 "app/domain/routing/osrm.py" = ["N818"]
+# RouteNotEditable / DoneStopRemoved / UnknownServicePoint name the condition the routers and
+# Etapa 4's Task 4 catch by name, same convention as execution/service.py (Task 3 brief).
+"app/domain/routing/service.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.13"

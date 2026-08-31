@@ -36,6 +36,13 @@ class RouteStatus(enum.StrEnum):
     DONE = "DONE"
 
 
+# create_type=False: the Postgres enums are hand-created by the Etapa 4 migration
+# (602731d8a203). One shared column type instead of a fresh Enum() per mapped_column keeps
+# the `route_type` type — used by both Route and RouteTemplate — declared in exactly one place.
+ROUTE_TYPE_ENUM = Enum(RouteType, name="route_type", create_type=False)
+ROUTE_STATUS_ENUM = Enum(RouteStatus, name="route_status", create_type=False)
+
+
 class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "routes"
 
@@ -46,12 +53,8 @@ class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # app's "rota do dia" (RF27) and the panel board filter by. NOT NULL, no server default:
     # the migration backfills existing rows before applying the constraint.
     route_date: Mapped[date] = mapped_column(Date)
-    route_type: Mapped[RouteType] = mapped_column(
-        Enum(RouteType, name="route_type"), default=RouteType.REGULAR
-    )
-    status: Mapped[RouteStatus] = mapped_column(
-        Enum(RouteStatus, name="route_status"), default=RouteStatus.PLANNED
-    )
+    route_type: Mapped[RouteType] = mapped_column(ROUTE_TYPE_ENUM, default=RouteType.REGULAR)
+    status: Mapped[RouteStatus] = mapped_column(ROUTE_STATUS_ENUM, default=RouteStatus.PLANNED)
     cancellation_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
     # Provenance: which template materialised this route (RF15). NULL for a hand-built route.
     template_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -106,6 +109,10 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     route: Mapped["Route"] = relationship(back_populates="stops")
     service_point: Mapped["ServicePoint"] = relationship()
+    # Ordered by sequence so `assignments[-1]` is always the current designation (spec §3.4):
+    # reassignment appends sequence + 1, never edits an existing row. One-directional — no
+    # StopAssignment.route_stop back-reference is needed by any call site today.
+    assignments: Mapped[list["StopAssignment"]] = relationship(order_by="StopAssignment.sequence")
 
 
 class StopAssignmentOutcome(enum.StrEnum):

@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
-from app.domain.routing.models import RouteType
+from app.domain.routing.models import ROUTE_TYPE_ENUM, RouteType
 
 if TYPE_CHECKING:
     from app.domain.catalog.models import ServicePoint
@@ -37,7 +37,7 @@ class RouteTemplate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     # ISO weekday ints (1=Mon .. 7=Sun). Used only when recurrence == WEEKLY (spec §3.3).
     weekdays: Mapped[list[int] | None] = mapped_column(JSONB, nullable=True)
-    route_type: Mapped[RouteType] = mapped_column(Enum(RouteType, name="route_type"))
+    route_type: Mapped[RouteType] = mapped_column(ROUTE_TYPE_ENUM)
     # Templates are deactivated, never hard-deleted (consistent with Etapa 3 Ruling 3).
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
