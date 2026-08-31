@@ -99,6 +99,13 @@ class RouteCreateBody(BaseModel):
     stops: list[StopBody]
 
 
+class OccasionalRouteBody(BaseModel):
+    field_worker_ids: list[UUID] = Field(min_length=1)
+    route_date: date
+    scheduled_start_at: datetime | None = None
+    stops: list[StopBody]
+
+
 class RouteUpdateBody(BaseModel):
     field_worker_id: UUID | None = None
     route_date: date | None = None
@@ -210,6 +217,51 @@ async def create_route_endpoint(
     )
     await db.commit()
     return _to_route_out(await _reload(db, route.id))
+
+
+@router.post("/occasional", response_model=list[RouteOut], status_code=status.HTTP_201_CREATED)
+async def create_occasional_routes(
+    body: OccasionalRouteBody, request: Request, actor: _Manager, db: _Db
+) -> list[RouteOut]:
+    """RF23 / spec §3.5 Ruling 2 — an occasional route assigned to N workers is N independent
+    routes, one per worker, each a copy of the same stops. One transaction: if any worker id
+    is unknown, nothing is committed."""
+    created: list[Route] = []
+    try:
+        for field_worker_id in body.field_worker_ids:
+            route = await create_route(
+                db,
+                field_worker_id=field_worker_id,
+                route_date=body.route_date,
+                route_type=RouteType.OCCASIONAL,
+                scheduled_start_at=body.scheduled_start_at,
+                stops=[_to_stop_input(stop) for stop in body.stops],
+                actor_id=actor.id,
+                osrm=request.app.state.osrm_client,
+            )
+            created.append(route)
+    except UnknownFieldWorker as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except UnknownServicePoint as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    for route in created:
+        await record_audit_trail(
+            db,
+            actor_id=actor.id,
+            entity_type="route",
+            entity_id=route.id,
+            action="create",
+            before=None,
+            after={
+                "field_worker_id": str(route.field_worker_id),
+                "route_date": body.route_date.isoformat(),
+                "route_type": route.route_type.value,
+                "stop_count": len(route.stops),
+            },
+        )
+    await db.commit()
+    return [_to_route_out(await _reload(db, route.id)) for route in created]
 
 
 def _parse_enum[FilterEnum: Enum](enum_cls: type[FilterEnum], value: str, param: str) -> FilterEnum:

@@ -18,7 +18,7 @@ Example:
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,7 @@ from app.domain.routing.models import (
     StopAssignmentOutcome,
 )
 from app.domain.routing.osrm import OsrmClient, OsrmUnavailable
+from app.domain.routing.templates import RouteTemplate
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,12 @@ class UnknownFieldWorker(Exception):
     FK IntegrityError at commit — the API layer maps this to 404 instead)."""
 
 
+class TemplateHasNoWorker(Exception):
+    """`materialize_template` got neither a body `field_worker_id` nor a template default —
+    there is no worker to assign the materialised route to (spec §5.1; the API maps this to
+    422)."""
+
+
 async def ensure_field_worker_exists(db: AsyncSession, field_worker_id: uuid.UUID) -> None:
     if await db.get(FieldWorker, field_worker_id) is None:
         raise UnknownFieldWorker(
@@ -83,7 +90,7 @@ async def create_route(
     OSRM legs. The array position is the `order_index`. Raises `UnknownFieldWorker`,
     `UnknownServicePoint`."""
     await ensure_field_worker_exists(db, field_worker_id)
-    await _ensure_service_points_exist(db, [item.service_point_id for item in stops])
+    await ensure_service_points_exist(db, [item.service_point_id for item in stops])
 
     route = Route(
         field_worker_id=field_worker_id,
@@ -121,6 +128,64 @@ async def create_route(
     return route
 
 
+async def materialize_template(
+    db: AsyncSession,
+    *,
+    template: RouteTemplate,
+    route_date: date,
+    field_worker_id: uuid.UUID | None,
+    actor_id: uuid.UUID,
+    osrm: OsrmClient,
+) -> Route:
+    """Turn a `RouteTemplate` into a concrete `Route` for `route_date` (spec §3.3, §5.2
+    Ruling 8 — this is the manual step; no scheduler calls it yet). Each template stop's
+    time-of-day is combined with `route_date` into a UTC timestamp for the route stop. The
+    worker is the body's `field_worker_id` if given, else the template's default; if both are
+    None, raises `TemplateHasNoWorker`. Also raises `UnknownFieldWorker`, `UnknownServicePoint`.
+
+        route = await materialize_template(
+            db, template=tmpl, route_date=date(2026, 9, 7),
+            field_worker_id=None, actor_id=manager.id, osrm=osrm_client,
+        )
+    """
+    worker_id = field_worker_id or template.field_worker_id
+    if worker_id is None:
+        raise TemplateHasNoWorker(
+            f'Template "{template.id}" fixes no field worker and the request supplied none; '
+            f"a materialised route must be assigned to a field worker."
+        )
+    stops = [
+        StopInput(
+            service_point_id=stop.service_point_id,
+            expected_arrival_from=_combine_date_time(route_date, stop.expected_arrival_from),
+            expected_arrival_to=_combine_date_time(route_date, stop.expected_arrival_to),
+        )
+        for stop in template.stops
+    ]
+    route = await create_route(
+        db,
+        field_worker_id=worker_id,
+        route_date=route_date,
+        route_type=template.route_type,
+        scheduled_start_at=None,
+        stops=stops,
+        actor_id=actor_id,
+        osrm=osrm,
+    )
+    route.template_id = template.id
+    await db.flush()
+    await db.refresh(route, attribute_names=["stops"])
+    return route
+
+
+def _combine_date_time(route_date: date, value: time | None) -> datetime | None:
+    """A template stop stores a bare time-of-day (it has no date); materialising fixes it to
+    `route_date` in UTC (spec §3.3)."""
+    if value is None:
+        return None
+    return datetime.combine(route_date, value, tzinfo=UTC)
+
+
 async def replace_route_stops(
     db: AsyncSession,
     *,
@@ -149,7 +214,7 @@ async def replace_route_stops(
             f"Route stop(s) for service point(s) {sorted(str(m) for m in missing_done)} are "
             f'already done and cannot be removed from route "{route.id}".'
         )
-    await _ensure_service_points_exist(db, new_point_ids)
+    await ensure_service_points_exist(db, new_point_ids)
 
     for point_id, stop in pending_by_point.items():
         if point_id not in new_point_ids:
@@ -339,9 +404,7 @@ def _ensure_editable(route: Route) -> None:
         raise RouteNotEditable(f'Route "{route.id}" is {route.status.value} and cannot be edited.')
 
 
-async def _ensure_service_points_exist(
-    db: AsyncSession, service_point_ids: list[uuid.UUID]
-) -> None:
+async def ensure_service_points_exist(db: AsyncSession, service_point_ids: list[uuid.UUID]) -> None:
     unique_ids = set(service_point_ids)
     if not unique_ids:
         return

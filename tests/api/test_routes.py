@@ -325,6 +325,84 @@ async def test_create_route_unknown_worker_404(
     assert response.status_code == 404
 
 
+# --- POST /routes/occasional (Ruling 2) ----------------------------------------------
+
+
+async def test_occasional_creates_one_route_per_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes/occasional",
+        json={
+            "field_worker_ids": [str(workers[0].id), str(workers[1].id)],
+            "route_date": "2026-09-01",
+            "stops": [
+                {"service_point_id": str(points[0].id)},
+                {"service_point_id": str(points[1].id)},
+            ],
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert len(body) == 2
+    assert {route["field_worker_id"] for route in body} == {str(workers[0].id), str(workers[1].id)}
+    assert all(route["route_type"] == "OCCASIONAL" for route in body)
+    assert [stop["service_point_id"] for stop in body[0]["stops"]] == [
+        stop["service_point_id"] for stop in body[1]["stops"]
+    ]
+    count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(AuditTrail.entity_type == "route", AuditTrail.action == "create")
+    )
+    assert count == 2
+
+
+async def test_occasional_unknown_worker_404_commits_nothing(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes/occasional",
+        json={
+            "field_worker_ids": [str(workers[0].id), str(uuid4())],
+            "route_date": "2026-09-01",
+            "stops": [{"service_point_id": str(points[0].id)}],
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 404
+    count = await db_session.scalar(select(func.count()).select_from(Route))
+    assert count == 0
+
+
+async def test_occasional_forbidden_for_field_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, worker_user.email)
+
+    response = client.post(
+        "/routes/occasional",
+        json={
+            "field_worker_ids": [str(workers[0].id)],
+            "route_date": "2026-09-01",
+            "stops": [{"service_point_id": str(points[0].id)}],
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 403
+
+
 # --- GET /routes (filters) ------------------------------------------------------------
 
 
