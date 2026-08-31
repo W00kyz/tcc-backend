@@ -71,7 +71,11 @@ async def seed() -> None:
             floor_id=floor.id, version=1, private_key_hex=settings.qr_signing_private_key_hex
         )
         qr_code = QrCode(floor_id=floor.id, public_code=qr_payload, secret=b"seeded", version=1)
-        route = Route(field_worker_id=worker.id, scheduled_start_at=datetime.now(UTC))
+        route = Route(
+            field_worker_id=worker.id,
+            route_date=datetime.now(UTC).date(),
+            scheduled_start_at=datetime.now(UTC),
+        )
         db.add_all([qr_code, route])
         await db.flush()
 

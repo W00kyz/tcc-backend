@@ -41,7 +41,11 @@ async def _seed_started_route(
         floor_id=floor.id, version=1, private_key_hex=settings.qr_signing_private_key_hex
     )
     qr_code = QrCode(floor_id=floor.id, public_code=qr_payload, secret=b"sig", version=1)
-    route = Route(field_worker_id=worker.id, started_at=datetime.now(UTC))
+    route = Route(
+        field_worker_id=worker.id,
+        route_date=datetime.now(UTC).date(),
+        started_at=datetime.now(UTC),
+    )
     db_session.add_all([qr_code, route])
     await db_session.flush()
 

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from app.core.security import hash_password
 from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
@@ -44,7 +44,7 @@ async def _seed_manager_and_worker_route(
     db_session.add_all([point, worker])
     await db_session.flush()
 
-    route = Route(field_worker_id=worker.id)
+    route = Route(field_worker_id=worker.id, route_date=date.today())
     db_session.add(route)
     await db_session.flush()
     db_session.add(RouteStop(route_id=route.id, service_point_id=point.id, order_index=1))

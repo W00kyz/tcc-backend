@@ -4,11 +4,11 @@ makes RF21's audit chain a structural guarantee instead of a trigger."""
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -19,11 +19,43 @@ if TYPE_CHECKING:
     from app.domain.catalog.models import FieldWorker, ServicePoint
 
 
+class RouteType(enum.StrEnum):
+    # Same value pair as catalog.PointType, but a SEPARATE Postgres enum (name="route_type"):
+    # a route's regular/occasional flag (RF23/RF24) is not the same domain as a point's.
+    REGULAR = "REGULAR"
+    OCCASIONAL = "OCCASIONAL"
+
+
+class RouteStatus(enum.StrEnum):
+    # Explicit state machine (spec §3 Ruling 4): PLANNED -> IN_PROGRESS -> DONE, and
+    # -> CANCELLED from PLANNED or IN_PROGRESS. `started_at` alone cannot tell a route
+    # cancelled-before-start apart from one merely planned.
+    PLANNED = "PLANNED"
+    IN_PROGRESS = "IN_PROGRESS"
+    CANCELLED = "CANCELLED"
+    DONE = "DONE"
+
+
 class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "routes"
 
     field_worker_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("field_workers.id")
+    )
+    # The operational date of the route (RF11 "para uma data específica") — the key the
+    # app's "rota do dia" (RF27) and the panel board filter by. NOT NULL, no server default:
+    # the migration backfills existing rows before applying the constraint.
+    route_date: Mapped[date] = mapped_column(Date)
+    route_type: Mapped[RouteType] = mapped_column(
+        Enum(RouteType, name="route_type"), default=RouteType.REGULAR
+    )
+    status: Mapped[RouteStatus] = mapped_column(
+        Enum(RouteStatus, name="route_status"), default=RouteStatus.PLANNED
+    )
+    cancellation_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # Provenance: which template materialised this route (RF15). NULL for a hand-built route.
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("route_templates.id"), nullable=True
     )
     # timezone=True (not the plan's bare mapped_column): the caller always passes a
     # timezone-aware datetime (datetime.now(UTC)) — asyncpg rejects binding that into a
@@ -35,7 +67,9 @@ class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     start_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
     start_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    stops: Mapped[list["RouteStop"]] = relationship(back_populates="route")
+    stops: Mapped[list["RouteStop"]] = relationship(
+        back_populates="route", order_by="RouteStop.order_index"
+    )
     # No back_populates: FieldWorker has no `routes` collection yet, and none of today's
     # call sites need one — this is a read-only lookup for RouteOut.field_worker_name.
     field_worker: Mapped["FieldWorker"] = relationship()
@@ -63,6 +97,12 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[RouteStopStatus] = mapped_column(
         Enum(RouteStopStatus, name="route_stop_status"), default=RouteStopStatus.PENDING
     )
+    # The "leg" is always from the previous stop to this one in the current order (spec §3.2):
+    # no separate route_legs table. NULL on the first stop and in OSRM-degraded mode (Ruling 6).
+    distance_from_prev_m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    duration_from_prev_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # [[lng, lat], ...] GeoJSON coordinate order — the polyline the app draws (RF28).
+    leg_geometry: Mapped[list[list[float]] | None] = mapped_column(JSONB, nullable=True)
 
     route: Mapped["Route"] = relationship(back_populates="stops")
     service_point: Mapped["ServicePoint"] = relationship()

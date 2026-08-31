@@ -7,4 +7,5 @@ from app.domain.execution import models as execution_models  # noqa: F401
 from app.domain.identity import models as identity_models  # noqa: F401
 from app.domain.qr import models as qr_models  # noqa: F401
 from app.domain.routing import models as routing_models  # noqa: F401
+from app.domain.routing import templates as routing_templates  # noqa: F401
 from app.domain.settings import models as settings_models  # noqa: F401
