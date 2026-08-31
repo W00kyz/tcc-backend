@@ -14,7 +14,7 @@ from app.domain.execution.service import (
 from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import derive_public_key_hex, sign_qr_payload
 from app.domain.qr.models import QrCode
-from app.domain.routing.models import Route, RouteStop
+from app.domain.routing.models import Route, RouteStatus, RouteStop
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _PRIVATE_KEY_HEX = "11" * 32
@@ -53,6 +53,17 @@ async def _seed_route_with_one_stop(
     db_session.add(stop)
     await db_session.commit()
     return route, stop, worker, qr_code
+
+
+async def test_start_route_sets_status(db_session: AsyncSession) -> None:
+    route, _stop, _worker, _qr_code = await _seed_route_with_one_stop(db_session)
+
+    await start_route(
+        db_session, route=route, latitude=-7.2, longitude=-35.9, started_at=datetime.now(UTC)
+    )
+
+    await db_session.refresh(route)
+    assert route.status is RouteStatus.IN_PROGRESS
 
 
 async def test_check_in_succeeds_after_the_route_has_started(db_session: AsyncSession) -> None:

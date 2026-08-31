@@ -14,6 +14,7 @@ from app.domain.qr.crypto import decode_qr_payload
 from app.domain.qr.models import QrCode
 from app.domain.routing.models import (
     Route,
+    RouteStatus,
     RouteStop,
     RouteStopStatus,
     StopAssignment,
@@ -23,6 +24,10 @@ from app.domain.routing.models import (
 
 class RouteAlreadyStarted(Exception):
     pass
+
+
+class RouteNotStartable(Exception):
+    """The route is CANCELLED (or DONE) — a worker cannot start it (spec §3 Ruling 4)."""
 
 
 class QrSignatureInvalid(Exception):
@@ -54,10 +59,17 @@ async def start_route(
 ) -> Route:
     if route.started_at is not None:
         raise RouteAlreadyStarted(f'Route "{route.id}" was already started at {route.started_at}.')
+    if route.status != RouteStatus.PLANNED:
+        # PLANNED is the only startable state — CANCELLED/DONE routes never move to IN_PROGRESS
+        # (spec §3 Ruling 4). IN_PROGRESS is already ruled out by the started_at guard above.
+        raise RouteNotStartable(
+            f'Route "{route.id}" is {route.status.value} and cannot be started; expected PLANNED.'
+        )
 
     route.started_at = started_at
     route.start_latitude = latitude
     route.start_longitude = longitude
+    route.status = RouteStatus.IN_PROGRESS
     await db.commit()
     return route
 

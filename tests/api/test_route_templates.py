@@ -290,6 +290,24 @@ async def test_patch_template_to_weekly_without_weekdays_is_422(
     assert response.status_code == 422
 
 
+async def test_patch_route_template_unknown_worker_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, _workers, points = await _seed(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/route-templates", json=_template_payload(points), headers=_auth(token)
+    ).json()
+
+    response = client.patch(
+        f"/route-templates/{created['id']}",
+        json={"field_worker_id": str(uuid4())},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 404
+
+
 async def test_patch_unknown_template_is_404(client: TestClient, db_session: AsyncSession) -> None:
     manager, _worker_user, _workers, _points = await _seed(db_session)
     token = _login(client, manager.email)
@@ -332,6 +350,26 @@ async def test_materialize_builds_a_route_from_the_template(
     assert route is not None
     assert route.template_id is not None
     assert str(route.template_id) == created["id"]
+
+
+async def test_materialize_occasional_template_sets_route_type(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed(db_session)
+    token = _login(client, manager.email)
+    payload = _template_payload(points, worker=workers[0])
+    payload["route_type"] = "OCCASIONAL"
+    created = client.post("/route-templates", json=payload, headers=_auth(token)).json()
+    assert created["route_type"] == "OCCASIONAL"
+
+    response = client.post(
+        f"/route-templates/{created['id']}/materialize",
+        json={"route_date": "2026-09-07"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201
+    assert response.json()["route_type"] == "OCCASIONAL"
 
 
 async def test_materialize_body_worker_overrides_template(

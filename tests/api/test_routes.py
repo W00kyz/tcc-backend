@@ -1,6 +1,6 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -173,6 +173,38 @@ def _create_route_payload(
     }
 
 
+async def _add_route(
+    db_session: AsyncSession,
+    worker: FieldWorker,
+    points: list[ServicePoint],
+    *,
+    route_date: date,
+    status: RouteStatus = RouteStatus.PLANNED,
+    with_geometry: bool = False,
+) -> Route:
+    """Insert a route with one stop per point directly, so the field-worker feed tests can pin
+    a date, a status and a pre-drawn leg without going through the manager create endpoint."""
+    route = Route(field_worker_id=worker.id, route_date=route_date, status=status)
+    db_session.add(route)
+    await db_session.flush()
+    for index, point in enumerate(points, start=1):
+        leg_geometry = (
+            [[point.longitude, point.latitude], [point.longitude + 0.001, point.latitude]]
+            if with_geometry and index > 1
+            else None
+        )
+        db_session.add(
+            RouteStop(
+                route_id=route.id,
+                service_point_id=point.id,
+                order_index=index,
+                leg_geometry=leg_geometry,
+            )
+        )
+    await db_session.commit()
+    return route
+
+
 # --- existing endpoints (kept working through the new RouteOut shape) --------------------
 
 
@@ -190,6 +222,97 @@ async def test_field_worker_sees_only_their_own_route(
     assert body[0]["id"] == str(route.id)
     assert len(body[0]["stops"]) == 1
     assert body[0]["field_worker_name"] == worker.full_name
+
+
+# --- GET /routes/me (RF27 "rota do dia", enriched shared RouteOut) --------------------
+
+
+async def test_routes_me_defaults_to_today_and_includes_geometry(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    await _add_route(
+        db_session,
+        workers[0],
+        [points[0], points[1]],
+        route_date=date.today(),
+        with_geometry=True,
+    )
+    token = _login(client, worker_user.email)
+
+    response = client.get("/routes/me", headers=_auth(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["route_type"] == "REGULAR"
+    assert body[0]["stops"][0]["point_type"] == "OCCASIONAL"
+    assert isinstance(body[0]["stops"][1]["leg_geometry"], list)
+
+
+async def test_routes_me_filters_by_date(client: TestClient, db_session: AsyncSession) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    tomorrow = date.today() + timedelta(days=1)
+    await _add_route(db_session, workers[0], [points[0]], route_date=date.today())
+    await _add_route(db_session, workers[0], [points[1]], route_date=tomorrow)
+    token = _login(client, worker_user.email)
+
+    response = client.get(f"/routes/me?date={tomorrow.isoformat()}", headers=_auth(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["route_date"] == tomorrow.isoformat()
+
+
+async def test_routes_me_hides_cancelled(client: TestClient, db_session: AsyncSession) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    await _add_route(
+        db_session,
+        workers[0],
+        [points[0]],
+        route_date=date.today(),
+        status=RouteStatus.CANCELLED,
+    )
+    await _add_route(db_session, workers[0], [points[1]], route_date=date.today())
+    token = _login(client, worker_user.email)
+
+    response = client.get("/routes/me", headers=_auth(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["status"] == "PLANNED"
+
+
+async def test_start_sets_status_in_progress(client: TestClient, db_session: AsyncSession) -> None:
+    _manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    token = _login(client, "joao@empresa.com")
+    body = {"latitude": -7.2, "longitude": -35.9, "started_at": datetime.now(UTC).isoformat()}
+
+    start = client.post(f"/routes/{route.id}/start", json=body, headers=_auth(token))
+
+    assert start.status_code == 200
+    assert start.json()["status"] == "IN_PROGRESS"
+    feed = client.get("/routes/me", headers=_auth(token))
+    assert feed.json()[0]["status"] == "IN_PROGRESS"
+
+
+async def test_start_cancelled_route_409(client: TestClient, db_session: AsyncSession) -> None:
+    _manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    db_route = await db_session.get(Route, route.id)
+    assert db_route is not None
+    db_route.status = RouteStatus.CANCELLED
+    await db_session.commit()
+    token = _login(client, "joao@empresa.com")
+
+    response = client.post(
+        f"/routes/{route.id}/start",
+        json={"latitude": -7.2, "longitude": -35.9, "started_at": datetime.now(UTC).isoformat()},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 409
 
 
 async def test_worker_can_start_their_own_route(

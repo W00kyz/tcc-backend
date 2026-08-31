@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_role
-from app.api.routes import RouteOut, _reload, _to_route_out
+from app.api.route_view import RouteOut, _reload, _to_route_out
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
 from app.domain.identity.models import User, UserRole
@@ -127,6 +127,25 @@ def _to_template_out(template: RouteTemplate) -> TemplateOut:
     )
 
 
+def _template_snapshot(template: RouteTemplate) -> dict[str, object]:
+    """Every field a PATCH can touch (RF21 audit) — not just name + is_active. `template.stops`
+    must be loaded; `_load_template` eager-loads it."""
+    return {
+        "name": template.name,
+        "field_worker_id": str(template.field_worker_id)
+        if template.field_worker_id is not None
+        else None,
+        "recurrence": template.recurrence.value,
+        "weekdays": template.weekdays,
+        "route_type": template.route_type.value,
+        "is_active": template.is_active,
+        "stops": [
+            str(stop.service_point_id)
+            for stop in sorted(template.stops, key=lambda stop: stop.order_index)
+        ],
+    }
+
+
 def _build_stops(stops: list[TemplateStopBody]) -> list[RouteTemplateStop]:
     return [
         RouteTemplateStop(
@@ -224,7 +243,7 @@ async def update_route_template(
                 f"weekday ints (1..7).",
             )
 
-    before = {"name": template.name, "is_active": template.is_active}
+    before = _template_snapshot(template)
     if body.name is not None:
         template.name = body.name
     if body.field_worker_id is not None:
@@ -249,6 +268,8 @@ async def update_route_template(
         template.stops = _build_stops(body.stops)
 
     await db.flush()
+    refreshed = await _load_template(db, template_id)
+    assert refreshed is not None
     await record_audit_trail(
         db,
         actor_id=actor.id,
@@ -256,7 +277,7 @@ async def update_route_template(
         entity_id=template.id,
         action="update",
         before=before,
-        after={"name": template.name, "is_active": template.is_active},
+        after=_template_snapshot(refreshed),
     )
     await db.commit()
     reloaded = await _load_template(db, template_id)
