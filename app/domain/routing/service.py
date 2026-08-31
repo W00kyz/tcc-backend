@@ -23,7 +23,7 @@ from datetime import date, datetime
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.catalog.models import ServicePoint
+from app.domain.catalog.models import FieldWorker, ServicePoint
 from app.domain.routing.models import (
     Route,
     RouteStatus,
@@ -55,6 +55,19 @@ class UnknownServicePoint(Exception):
     """A StopInput references a service_point_id that does not exist."""
 
 
+class UnknownFieldWorker(Exception):
+    """A route write references a field_worker_id with no field_workers row (would surface as a
+    FK IntegrityError at commit — the API layer maps this to 404 instead)."""
+
+
+async def ensure_field_worker_exists(db: AsyncSession, field_worker_id: uuid.UUID) -> None:
+    if await db.get(FieldWorker, field_worker_id) is None:
+        raise UnknownFieldWorker(
+            f'Unknown field worker "{field_worker_id}"; a route must be assigned to an '
+            f"existing field_workers row."
+        )
+
+
 async def create_route(
     db: AsyncSession,
     *,
@@ -67,7 +80,9 @@ async def create_route(
     osrm: OsrmClient,
 ) -> Route:
     """Create a PLANNED route, its ordered stops, a sequence-1 assignment per stop, and the
-    OSRM legs. The array position is the `order_index`. Raises `UnknownServicePoint`."""
+    OSRM legs. The array position is the `order_index`. Raises `UnknownFieldWorker`,
+    `UnknownServicePoint`."""
+    await ensure_field_worker_exists(db, field_worker_id)
     await _ensure_service_points_exist(db, [item.service_point_id for item in stops])
 
     route = Route(
@@ -222,8 +237,9 @@ async def reassign_route(
 ) -> Route:
     """Append-only reassignment (spec §3.4). For each PENDING stop: mark the current top-of-
     chain assignment `REASSIGNED` and insert `sequence + 1` for the new worker. DONE stops are
-    left untouched. Raises `RouteNotEditable`."""
+    left untouched. Raises `RouteNotEditable`, `UnknownFieldWorker`."""
     _ensure_editable(route)
+    await ensure_field_worker_exists(db, new_field_worker_id)
     for stop in await _ordered_stops(db, route):
         if stop.status != RouteStopStatus.PENDING:
             continue

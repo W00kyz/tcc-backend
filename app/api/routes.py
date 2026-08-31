@@ -4,11 +4,12 @@ rewrites them. Business rules live in `app.domain.routing.service`; this router 
 input, owns the transaction, and records the audit trail."""
 
 from datetime import date, datetime
+from enum import Enum
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -20,12 +21,18 @@ from app.domain.catalog.models import FieldWorker, Floor, ServicePoint
 from app.domain.execution.service import RouteAlreadyStarted, start_route
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteType
+from app.domain.routing.osrm import OsrmUnavailable
 from app.domain.routing.service import (
     DoneStopRemoved,
     RouteNotEditable,
     StopInput,
+    UnknownFieldWorker,
     UnknownServicePoint,
+    cancel_route,
     create_route,
+    ensure_field_worker_exists,
+    optimize_route,
+    reassign_route,
     replace_route_stops,
     routing_degraded,
 )
@@ -99,6 +106,15 @@ class RouteUpdateBody(BaseModel):
     stops: list[StopBody] | None = None
 
 
+class ReassignBody(BaseModel):
+    field_worker_id: UUID
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class CancelBody(BaseModel):
+    reason: str = Field(min_length=1, max_length=300)
+
+
 class StartRouteRequest(BaseModel):
     latitude: float
     longitude: float
@@ -145,7 +161,9 @@ def _to_route_out(route: Route) -> RouteOut:
         scheduled_start_at=route.scheduled_start_at,
         started_at=route.started_at,
         routing_degraded=routing_degraded(route),
-        stops=[_to_stop_out(stop) for stop in sorted(route.stops, key=lambda s: s.order_index)],
+        # Route.stops is order_by="RouteStop.order_index" and every service function reloads it
+        # in that order — no re-sort needed here.
+        stops=[_to_stop_out(stop) for stop in route.stops],
     )
 
 
@@ -171,6 +189,8 @@ async def create_route_endpoint(
             actor_id=actor.id,
             osrm=request.app.state.osrm_client,
         )
+    except UnknownFieldWorker as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except UnknownServicePoint as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
@@ -192,6 +212,20 @@ async def create_route_endpoint(
     return _to_route_out(await _reload(db, route.id))
 
 
+def _parse_enum[FilterEnum: Enum](enum_cls: type[FilterEnum], value: str, param: str) -> FilterEnum:
+    """Turn a raw `?route_type=` / `?status=` string into its enum member, or answer 422 naming
+    the offending value and the allowed set — an unknown filter is a client error, not an
+    excuse to silently return an empty list (Task-4 review)."""
+    try:
+        return enum_cls(value)
+    except ValueError as exc:
+        allowed = ", ".join(str(member.value) for member in enum_cls.__members__.values())
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f'Invalid {param} "{value}"; expected one of [{allowed}].',
+        ) from exc
+
+
 @router.get("", response_model=list[RouteOut])
 async def list_routes(
     _actor: _Manager,
@@ -207,15 +241,9 @@ async def list_routes(
     if field_worker_id is not None:
         stmt = stmt.where(Route.field_worker_id == field_worker_id)
     if route_type is not None:
-        try:
-            stmt = stmt.where(Route.route_type == RouteType(route_type))
-        except ValueError:
-            return []
+        stmt = stmt.where(Route.route_type == _parse_enum(RouteType, route_type, "route_type"))
     if route_status is not None:
-        try:
-            stmt = stmt.where(Route.status == RouteStatus(route_status))
-        except ValueError:
-            return []
+        stmt = stmt.where(Route.status == _parse_enum(RouteStatus, route_status, "status"))
     routes = (await db.scalars(stmt)).all()
     return [_to_route_out(route) for route in routes]
 
@@ -257,6 +285,10 @@ async def patch_route(
 
     before = _route_snapshot(route)
     if body.field_worker_id is not None:
+        try:
+            await ensure_field_worker_exists(db, body.field_worker_id)
+        except UnknownFieldWorker as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         route.field_worker_id = body.field_worker_id
     if body.route_date is not None:
         route.route_date = body.route_date
@@ -286,6 +318,105 @@ async def patch_route(
         action="update",
         before=before,
         after=_route_snapshot(reloaded),
+    )
+    await db.commit()
+    return _to_route_out(reloaded)
+
+
+@router.post("/{route_id}/optimize", response_model=RouteOut)
+async def optimize_route_endpoint(
+    route_id: UUID, request: Request, actor: _Manager, db: _Db
+) -> RouteOut:
+    route = await _load_route(db, route_id)
+    if route is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
+
+    before = {"stop_order": _stop_order(route)}
+    try:
+        await optimize_route(db, route=route, osrm=request.app.state.osrm_client)
+    except OsrmUnavailable as exc:
+        # Unlike a plain save, the optimise endpoint has nothing to show without OSRM — the
+        # visiting order IS the OSRM answer (spec §4.2, Ruling 6).
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Route optimization is unavailable: the OSRM service did not respond.",
+        ) from exc
+    except RouteNotEditable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+    reloaded = await _reload(db, route_id)
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="route",
+        entity_id=route_id,
+        action="optimize",
+        before=before,
+        after={"stop_order": _stop_order(reloaded)},
+    )
+    await db.commit()
+    return _to_route_out(reloaded)
+
+
+@router.post("/{route_id}/reassign", response_model=RouteOut)
+async def reassign_route_endpoint(
+    route_id: UUID, body: ReassignBody, actor: _Manager, db: _Db
+) -> RouteOut:
+    route = await _load_route(db, route_id)
+    if route is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
+
+    before = {"field_worker_id": str(route.field_worker_id)}
+    try:
+        await reassign_route(
+            db,
+            route=route,
+            new_field_worker_id=body.field_worker_id,
+            reason=body.reason,
+            actor_id=actor.id,
+        )
+    except RouteNotEditable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except UnknownFieldWorker as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    reloaded = await _reload(db, route_id)
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="route",
+        entity_id=route_id,
+        action="reassign",
+        before=before,
+        after={"field_worker_id": str(body.field_worker_id), "reason": body.reason},
+    )
+    await db.commit()
+    return _to_route_out(reloaded)
+
+
+@router.post("/{route_id}/cancel", response_model=RouteOut)
+async def cancel_route_endpoint(
+    route_id: UUID, body: CancelBody, actor: _Manager, db: _Db
+) -> RouteOut:
+    route = await _load_route(db, route_id)
+    if route is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
+
+    before = {"status": route.status.value}
+    try:
+        await cancel_route(db, route=route, reason=body.reason)
+    except RouteNotEditable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+    reloaded = await _reload(db, route_id)
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="route",
+        entity_id=route_id,
+        action="cancel",
+        before=before,
+        after={"status": reloaded.status.value, "reason": body.reason},
     )
     await db.commit()
     return _to_route_out(reloaded)
@@ -325,6 +456,12 @@ def _route_snapshot(route: Route) -> dict[str, object]:
         "status": route.status.value,
         "stop_count": len(route.stops),
     }
+
+
+def _stop_order(route: Route) -> list[str]:
+    """The visiting order as service-point ids — the audit `before`/`after` for optimise, whose
+    only effect is a reordering."""
+    return [str(stop.service_point_id) for stop in route.stops]
 
 
 async def _reload(db: AsyncSession, route_id: UUID) -> Route:
