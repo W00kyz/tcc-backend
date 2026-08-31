@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     mail_from_address: str = "no-reply@pu.ufcg.edu.br"
     dashboard_base_url: str = "http://localhost:5173"
     qr_signing_private_key_hex: str
+    osrm_base_url: str = "http://osrm:5000"
 
 
 @lru_cache

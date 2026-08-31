@@ -1,3 +1,4 @@
+import httpx2
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -17,6 +18,7 @@ from app.api.users import router as users_router
 from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
 from app.db.session import build_engine, build_session_factory
+from app.domain.routing.osrm import HttpxOsrmClient, OsrmClient
 
 
 def _add_cors_middleware(app: FastAPI, settings: Settings) -> None:
@@ -39,7 +41,11 @@ def _add_cors_middleware(app: FastAPI, settings: Settings) -> None:
     )
 
 
-def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    mailer: Mailer | None = None,
+    osrm_client: OsrmClient | None = None,
+) -> FastAPI:
     """Build the application.
 
     A factory, not a module-level singleton: tests build a fresh app per case, pointing
@@ -61,6 +67,9 @@ def create_app(settings: Settings | None = None, mailer: Mailer | None = None) -
         host=settings.mail_smtp_host,
         port=settings.mail_smtp_port,
         from_address=settings.mail_from_address,
+    )
+    app.state.osrm_client = osrm_client or HttpxOsrmClient(
+        settings.osrm_base_url, httpx2.AsyncClient(timeout=10.0)
     )
 
     app.include_router(health_router)

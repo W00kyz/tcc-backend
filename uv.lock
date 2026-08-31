@@ -990,6 +990,7 @@ dependencies = [
     { name = "email-validator" },
     { name = "fastapi" },
     { name = "fpdf2" },
+    { name = "httpx2" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -1001,7 +1002,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx2" },
     { name = "mypy" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -1022,6 +1022,7 @@ requires-dist = [
     { name = "email-validator", specifier = "==2.3.0" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "fpdf2", specifier = "==2.8.8" },
+    { name = "httpx2", specifier = "==2.12.0" },
     { name = "pillow", specifier = "==12.3.0" },
     { name = "pydantic", specifier = "==2.13.4" },
     { name = "pydantic-settings", specifier = "==2.15.0" },
@@ -1033,7 +1034,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx2", specifier = "==2.12.0" },
     { name = "mypy", specifier = "==2.3.1" },
     { name = "pre-commit", specifier = "==4.6.2" },
     { name = "pytest", specifier = "==9.1.1" },
