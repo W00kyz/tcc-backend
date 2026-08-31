@@ -89,6 +89,9 @@ class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "service_points"
 
     floor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("floors.id"))
+    # Read-only lookup for RouteStopOut (Etapa 4): floor label + building name via one
+    # selectinload chain, no back_populates — no call site needs Floor.service_points.
+    floor: Mapped["Floor"] = relationship()
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(String(500))
     latitude: Mapped[float] = mapped_column(Float)

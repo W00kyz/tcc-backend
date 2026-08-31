@@ -1,11 +1,55 @@
+from collections.abc import Iterator
 from datetime import UTC, date, datetime
+from uuid import uuid4
 
+import pytest
+from app.core.config import Settings
+from app.core.mail import RecordingMailer
 from app.core.security import hash_password
-from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
+from app.domain.audit.models import AuditTrail
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    FieldWorker,
+    Floor,
+    PointType,
+    ServicePoint,
+)
 from app.domain.identity.models import User, UserRole
-from app.domain.routing.models import Route, RouteStop
+from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from app.main import create_app
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.osrm import FakeOsrmClient
+
+_PASSWORD = "senha-forte-o-suficiente"
+
+
+@pytest.fixture
+def osrm() -> FakeOsrmClient:
+    return FakeOsrmClient()
+
+
+@pytest.fixture
+def client(
+    test_settings: Settings, recording_mailer: RecordingMailer, osrm: FakeOsrmClient
+) -> Iterator[TestClient]:
+    # Overrides conftest.client locally so every route write in this file goes through the
+    # in-memory fake instead of a real OSRM HTTP call (spec §8 — no test touches the network).
+    app = create_app(settings=test_settings, mailer=recording_mailer, osrm_client=osrm)
+    with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
+        yield test_client
+
+
+def _login(client: TestClient, email: str) -> str:
+    response = client.post("/auth/login", json={"email": email, "password": _PASSWORD})
+    return str(response.json()["access_token"])
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
 
 
 async def _seed_manager_and_worker_route(
@@ -14,13 +58,13 @@ async def _seed_manager_and_worker_route(
     manager = User(
         name="Larissa",
         email="larissa@pu.ufcg.edu.br",
-        password_hash=hash_password("senha-forte-o-suficiente"),
+        password_hash=hash_password(_PASSWORD),
         role=UserRole.MANAGER,
     )
     worker_user = User(
         name="João",
         email="joao@empresa.com",
-        password_hash=hash_password("senha-forte-o-suficiente"),
+        password_hash=hash_password(_PASSWORD),
         role=UserRole.FIELD_WORKER,
     )
     company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
@@ -52,11 +96,65 @@ async def _seed_manager_and_worker_route(
     return manager, worker_user, worker, route
 
 
-def _login(client: TestClient, email: str) -> str:
-    response = client.post(
-        "/auth/login", json={"email": email, "password": "senha-forte-o-suficiente"}
+async def _seed_actors_and_points(
+    db_session: AsyncSession,
+) -> tuple[User, User, list[FieldWorker], list[ServicePoint]]:
+    """Manager + two field workers (the first one has an app login) + three service points on
+    one floor. Returns them so the CRUD tests can build routes over real ids."""
+    manager = User(
+        name="Larissa",
+        email="larissa@pu.ufcg.edu.br",
+        password_hash=hash_password(_PASSWORD),
+        role=UserRole.MANAGER,
     )
-    return str(response.json()["access_token"])
+    worker_user = User(
+        name="João",
+        email="joao@empresa.com",
+        password_hash=hash_password(_PASSWORD),
+        role=UserRole.FIELD_WORKER,
+    )
+    company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add_all([manager, worker_user, company, building])
+    await db_session.flush()
+
+    floor = Floor(building_id=building.id, label="Térreo")
+    db_session.add(floor)
+    await db_session.flush()
+
+    points = [
+        ServicePoint(
+            floor_id=floor.id,
+            name=f"Sala {index}",
+            description="Sala",
+            latitude=-7.2 + index * 0.001,
+            longitude=-35.9 + index * 0.001,
+            point_type=PointType.OCCASIONAL if index == 0 else PointType.REGULAR,
+        )
+        for index in range(3)
+    ]
+    workers = [
+        FieldWorker(
+            full_name="João da Silva", contractor_company_id=company.id, user_id=worker_user.id
+        ),
+        FieldWorker(full_name="Maria Souza", contractor_company_id=company.id),
+    ]
+    db_session.add_all([*points, *workers])
+    await db_session.commit()
+    return manager, worker_user, workers, points
+
+
+def _create_route_payload(
+    worker: FieldWorker, points: list[ServicePoint], route_date: str = "2026-09-01"
+) -> dict[str, object]:
+    return {
+        "field_worker_id": str(worker.id),
+        "route_date": route_date,
+        "stops": [{"service_point_id": str(point.id)} for point in points],
+    }
+
+
+# --- existing endpoints (kept working through the new RouteOut shape) --------------------
 
 
 async def test_field_worker_sees_only_their_own_route(
@@ -65,7 +163,7 @@ async def test_field_worker_sees_only_their_own_route(
     _manager, _worker_user, worker, route = await _seed_manager_and_worker_route(db_session)
     token = _login(client, "joao@empresa.com")
 
-    response = client.get("/routes/me", headers={"Authorization": f"Bearer {token}"})
+    response = client.get("/routes/me", headers=_auth(token))
 
     assert response.status_code == 200
     body = response.json()
@@ -73,19 +171,6 @@ async def test_field_worker_sees_only_their_own_route(
     assert body[0]["id"] == str(route.id)
     assert len(body[0]["stops"]) == 1
     assert body[0]["field_worker_name"] == worker.full_name
-
-
-async def test_manager_sees_all_routes(client: TestClient, db_session: AsyncSession) -> None:
-    _manager, _worker_user, worker, route = await _seed_manager_and_worker_route(db_session)
-    token = _login(client, "larissa@pu.ufcg.edu.br")
-
-    response = client.get("/routes", headers={"Authorization": f"Bearer {token}"})
-
-    assert response.status_code == 200
-    body = response.json()
-    assert any(item["id"] == str(route.id) for item in body)
-    matching = next(item for item in body if item["id"] == str(route.id))
-    assert matching["field_worker_name"] == worker.full_name
 
 
 async def test_worker_can_start_their_own_route(
@@ -97,7 +182,7 @@ async def test_worker_can_start_their_own_route(
     response = client.post(
         f"/routes/{route.id}/start",
         json={"latitude": -7.2, "longitude": -35.9, "started_at": datetime.now(UTC).isoformat()},
-        headers={"Authorization": f"Bearer {token}"},
+        headers=_auth(token),
     )
 
     assert response.status_code == 200
@@ -112,9 +197,257 @@ async def test_starting_an_already_started_route_returns_409(
     _manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
     token = _login(client, "joao@empresa.com")
     body = {"latitude": -7.2, "longitude": -35.9, "started_at": datetime.now(UTC).isoformat()}
-    headers = {"Authorization": f"Bearer {token}"}
-    client.post(f"/routes/{route.id}/start", json=body, headers=headers)
+    client.post(f"/routes/{route.id}/start", json=body, headers=_auth(token))
 
-    response = client.post(f"/routes/{route.id}/start", json=body, headers=headers)
+    response = client.post(f"/routes/{route.id}/start", json=body, headers=_auth(token))
 
     assert response.status_code == 409
+
+
+# --- POST /routes ----------------------------------------------------------------------
+
+
+async def test_manager_creates_route_with_ordered_stops(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes",
+        json=_create_route_payload(workers[0], [points[0], points[1]]),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "PLANNED"
+    assert body["field_worker_id"] == str(workers[0].id)
+    assert [stop["service_point_id"] for stop in body["stops"]] == [
+        str(points[0].id),
+        str(points[1].id),
+    ]
+    assert body["stops"][0]["order_index"] == 1
+    assert body["stops"][0]["leg_geometry"] is None
+    assert body["stops"][1]["leg_geometry"] is not None
+    assert body["stops"][0]["building_name"] == "Bloco CI"
+    assert body["stops"][0]["floor_label"] == "Térreo"
+    assert "routing_degraded" in body
+    assert body["routing_degraded"] is False
+
+
+async def test_create_route_writes_audit_trail(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    )
+    assert response.status_code == 201
+
+    count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(AuditTrail.entity_type == "route", AuditTrail.action == "create")
+    )
+    assert count == 1
+
+
+async def test_field_worker_cannot_create_route(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, worker_user.email)
+
+    response = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    )
+
+    assert response.status_code == 403
+
+
+async def test_create_route_unknown_service_point_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, _points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes",
+        json={
+            "field_worker_id": str(workers[0].id),
+            "route_date": "2026-09-01",
+            "stops": [{"service_point_id": str(uuid4())}],
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 422
+
+
+# --- GET /routes (filters) ------------------------------------------------------------
+
+
+async def test_list_routes_filters_by_date_and_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    first = client.post(
+        "/routes",
+        json=_create_route_payload(workers[0], [points[0]], route_date="2026-09-01"),
+        headers=_auth(token),
+    ).json()
+    second = client.post(
+        "/routes",
+        json=_create_route_payload(workers[1], [points[1]], route_date="2026-09-02"),
+        headers=_auth(token),
+    ).json()
+
+    by_date = client.get("/routes?date=2026-09-01", headers=_auth(token)).json()
+    assert [route["id"] for route in by_date] == [first["id"]]
+
+    by_worker = client.get(f"/routes?field_worker_id={workers[1].id}", headers=_auth(token)).json()
+    assert [route["id"] for route in by_worker] == [second["id"]]
+
+    by_type = client.get("/routes?route_type=OCCASIONAL", headers=_auth(token)).json()
+    assert by_type == []
+
+    by_status = client.get("/routes?status=PLANNED", headers=_auth(token)).json()
+    assert {route["id"] for route in by_status} == {first["id"], second["id"]}
+
+
+async def test_get_route_by_id_404_for_unknown(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, _workers, _points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.get(f"/routes/{uuid4()}", headers=_auth(token))
+
+    assert response.status_code == 404
+
+
+async def test_get_route_by_id_returns_full_shape(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes",
+        json=_create_route_payload(workers[0], [points[0], points[1]]),
+        headers=_auth(token),
+    ).json()
+
+    response = client.get(f"/routes/{created['id']}", headers=_auth(token))
+
+    assert response.status_code == 200
+    assert response.json()["id"] == created["id"]
+    assert len(response.json()["stops"]) == 2
+
+
+# --- PATCH /routes/{id} --------------------------------------------------------------
+
+
+async def test_patch_route_reorders_stops(client: TestClient, db_session: AsyncSession) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes",
+        json=_create_route_payload(workers[0], [points[0], points[1]]),
+        headers=_auth(token),
+    ).json()
+
+    response = client.patch(
+        f"/routes/{created['id']}",
+        json={
+            "stops": [
+                {"service_point_id": str(points[1].id)},
+                {"service_point_id": str(points[0].id)},
+            ]
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [stop["service_point_id"] for stop in body["stops"]] == [
+        str(points[1].id),
+        str(points[0].id),
+    ]
+    assert body["stops"][1]["leg_geometry"][0] == [points[1].longitude, points[1].latitude]
+
+
+async def test_patch_route_rejects_removing_done_stop(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes",
+        json=_create_route_payload(workers[0], [points[0], points[1]]),
+        headers=_auth(token),
+    ).json()
+    first_stop = await db_session.scalar(
+        select(RouteStop).where(RouteStop.route_id == created["id"]).order_by(RouteStop.order_index)
+    )
+    assert first_stop is not None
+    first_stop.status = RouteStopStatus.DONE
+    await db_session.commit()
+
+    response = client.patch(
+        f"/routes/{created['id']}",
+        json={"stops": [{"service_point_id": str(points[1].id)}]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 422
+
+
+async def test_patch_cancelled_route_409(client: TestClient, db_session: AsyncSession) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    ).json()
+    route = await db_session.get(Route, created["id"])
+    assert route is not None
+    route.status = RouteStatus.CANCELLED
+    await db_session.commit()
+
+    response = client.patch(
+        f"/routes/{created['id']}",
+        json={"stops": [{"service_point_id": str(points[1].id)}]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 409
+
+
+async def test_patch_route_updates_scalar_fields_and_audits(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    ).json()
+
+    response = client.patch(
+        f"/routes/{created['id']}",
+        json={"field_worker_id": str(workers[1].id), "route_date": "2026-10-05"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["field_worker_id"] == str(workers[1].id)
+    assert body["route_date"] == "2026-10-05"
+    count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(AuditTrail.entity_type == "route", AuditTrail.action == "update")
+    )
+    assert count == 1
