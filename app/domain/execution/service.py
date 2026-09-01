@@ -1,12 +1,12 @@
-"""Route start (RF34), check-in (RF29), check-out (RF31) and manager manual completion
-(RF33). The check-in path is floor-QR-first: the QR identifies a floor, `resolve_room`
-picks the room from the worker's PENDING stops on that floor, and the five anti-fraud
-layers (signature, QR status, GPS radius, room match, schedule window) attach validation
-flags without ever blocking a check-in that a manager can still review (spec §4.2, §4.4).
+"""Route start (RF34), check-in (RF29), check-out (RF31), manager manual completion (RF33).
+Check-in is floor-QR-first: the QR identifies a floor, `resolve_room` picks the room from
+the worker's PENDING stops there, and the five anti-fraud layers (signature, QR status, GPS
+radius, room match, schedule window) attach flags without blocking a reviewable check-in
+(spec §4.2, §4.4).
 
-This module is the documented exception to the "service layer flushes, never commits"
-rule: check-in/check-out/manual-completion each own a full transaction and commit it,
-just as `start_route` already does."""
+DO NOT CHANGE: this module is the documented exception to "service layer flushes, never
+commits" — check-in/check-out/manual-completion each own and commit a transaction, as
+`start_route` already does."""
 
 import uuid
 from collections.abc import Sequence
@@ -107,6 +107,10 @@ class NoOpenCheckIn(Exception):
     """Check-out found no IN_PROGRESS stop with an open execution on the scanned floor."""
 
 
+class StopNotOnRoute(Exception):
+    """The `stop` passed to `complete_manually` does not belong to the given `route`."""
+
+
 async def start_route(
     db: AsyncSession, *, route: Route, latitude: float, longitude: float, started_at: datetime
 ) -> Route:
@@ -141,11 +145,9 @@ async def check_in(
     chosen_route_stop_id: uuid.UUID | None,
     radius_m: int,
 ) -> Execution:
-    """Floor-QR check-in. Resolves the room from the worker's PENDING stops on the scanned
-    floor, attaches the anti-fraud flags and moves the stop to IN_PROGRESS. Pass
-    `chosen_route_stop_id` on the re-submit that follows an `AmbiguousRoom`; `latitude` and
-    `longitude` are `None` when the device has no GPS fix.
-    """
+    """Floor-QR check-in: resolves the room, attaches anti-fraud flags, moves the stop to
+    IN_PROGRESS. Pass `chosen_route_stop_id` on the re-submit after an `AmbiguousRoom`;
+    `latitude`/`longitude` are `None` when the device has no GPS fix."""
     existing = await db.scalar(
         select(Execution).where(Execution.idempotency_key == idempotency_key)
     )
@@ -155,13 +157,8 @@ async def check_in(
     _guard_route(route, worker_id, require_started=True)
     decoded, qr_code, qr_flags = await _verify_qr(db, qr_payload, public_key_hex)
 
-    candidates, stops = await _load_candidates(
-        db,
-        route_id=route.id,
-        floor_id=decoded.floor_id,
-        latitude=latitude,
-        longitude=longitude,
-        statuses=(RouteStopStatus.PENDING,),
+    candidates, stops = await _load_pending_candidates(
+        db, route_id=route.id, floor_id=decoded.floor_id, latitude=latitude, longitude=longitude
     )
     if not candidates:
         raise FloorNotOnRoute(
@@ -187,7 +184,7 @@ async def check_in(
         synced_at=now,
         source=ExecutionSource.APP,
         idempotency_key=idempotency_key,
-        review_status=_review_status(flags),
+        review_status=ExecutionReviewStatus.PENDING_REVIEW if flags else ExecutionReviewStatus.NONE,
         validation_flags=flags,
     )
     db.add(execution)
@@ -199,7 +196,6 @@ async def check_in(
             qr_code_id=qr_code.id,
             kind=QrScanKind.CHECK_IN,
             scanned_at=scanned_at,
-            received_at=now,
             resolved=resolved,
             geo_validation=resolution.geo_validation,
             latitude=latitude,
@@ -259,21 +255,25 @@ async def check_out(
         if candidate.route_stop_id == resolved.route_stop_id
     )
 
-    new_flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags)
-    execution.validation_flags = sorted(set(execution.validation_flags) | set(new_flags))
-    if execution.validation_flags and execution.review_status is ExecutionReviewStatus.NONE:
+    previous_flags = set(execution.validation_flags)
+    checkout_flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags)
+    merged = previous_flags | set(checkout_flags)
+    execution.validation_flags = sorted(merged)
+    if merged - previous_flags:
+        # A check-out-time anomaly must reach a human even if a manager already resolved the
+        # check-in review — the resolve covered a different scan (spec review-queue owner ruling).
+        execution.review_status = ExecutionReviewStatus.PENDING_REVIEW
+    elif merged and execution.review_status is ExecutionReviewStatus.NONE:
         execution.review_status = ExecutionReviewStatus.PENDING_REVIEW
     execution.checked_out_at = scanned_at
     execution.checkout_idempotency_key = checkout_idempotency_key
 
-    now = datetime.now(UTC)
     db.add(
         _build_scan(
             execution_id=execution.id,
             qr_code_id=qr_code.id,
             kind=QrScanKind.CHECK_OUT,
             scanned_at=scanned_at,
-            received_at=now,
             resolved=resolved,
             geo_validation=resolution.geo_validation,
             latitude=latitude,
@@ -295,8 +295,13 @@ async def complete_manually(
     reason: str,
     completed_at: datetime,
 ) -> Execution:
-    """Manager closes a stop the worker could not (RF33): a synthetic MANAGER_MANUAL
-    execution plus an audited `manual_completions` row. No QR scan is recorded."""
+    """Manager closes a stop the worker could not (RF33) with an audited `manual_completions`
+    row. An IN_PROGRESS stop's open check-in `Execution` is closed in place (no orphan row);
+    a PENDING stop gets a synthetic MANAGER_MANUAL execution. No QR scan either way."""
+    if stop.route_id != route.id:
+        raise StopNotOnRoute(
+            f'Route stop "{stop.id}" belongs to route "{stop.route_id}", not "{route.id}".'
+        )
     already_manual = await db.scalar(
         select(ManualCompletion).where(ManualCompletion.route_stop_id == stop.id)
     )
@@ -310,19 +315,28 @@ async def complete_manually(
         raise RouteCancelled(f'Route "{route.id}" was cancelled and cannot be completed.')
 
     now = datetime.now(UTC)
-    execution = Execution(
-        route_stop_id=stop.id,
-        field_worker_id=route.field_worker_id,
-        checked_in_at=completed_at,
-        checked_out_at=completed_at,
-        synced_at=now,
-        source=ExecutionSource.MANAGER_MANUAL,
-        idempotency_key=uuid.uuid4(),
-        review_status=ExecutionReviewStatus.NONE,
-        validation_flags=[],
+    open_checkin = await db.scalar(
+        select(Execution).where(
+            Execution.route_stop_id == stop.id, Execution.checked_out_at.is_(None)
+        )
     )
-    db.add(execution)
-    await db.flush()
+    if open_checkin is not None:
+        open_checkin.checked_out_at = completed_at
+        execution = open_checkin
+    else:
+        execution = Execution(
+            route_stop_id=stop.id,
+            field_worker_id=route.field_worker_id,
+            checked_in_at=completed_at,
+            checked_out_at=completed_at,
+            synced_at=now,
+            source=ExecutionSource.MANAGER_MANUAL,
+            idempotency_key=uuid.uuid4(),
+            review_status=ExecutionReviewStatus.NONE,
+            validation_flags=[],
+        )
+        db.add(execution)
+        await db.flush()
 
     db.add(
         ManualCompletion(
@@ -375,45 +389,45 @@ async def _verify_qr(
     return decoded, qr_code, qr_flags
 
 
-def _candidate(stop: RouteStop, point: ServicePoint, distance_m: float | None) -> Candidate:
+def _candidate(
+    stop: RouteStop, point: ServicePoint, latitude: float | None, longitude: float | None
+) -> Candidate:
+    distance = (
+        haversine_meters(latitude, longitude, point.latitude, point.longitude)
+        if latitude is not None and longitude is not None
+        else None
+    )
     return Candidate(
         route_stop_id=stop.id,
         service_point_id=point.id,
         name=point.name,
         latitude=point.latitude,
         longitude=point.longitude,
-        distance_m=distance_m,
+        distance_m=distance,
     )
 
 
-def _distance(latitude: float | None, longitude: float | None, point: ServicePoint) -> float | None:
-    if latitude is None or longitude is None:
-        return None
-    return haversine_meters(latitude, longitude, point.latitude, point.longitude)
-
-
-async def _load_candidates(
+async def _load_pending_candidates(
     db: AsyncSession,
     *,
     route_id: uuid.UUID,
     floor_id: uuid.UUID,
     latitude: float | None,
     longitude: float | None,
-    statuses: tuple[RouteStopStatus, ...],
 ) -> tuple[list[Candidate], dict[uuid.UUID, RouteStop]]:
     rows = await db.execute(
         select(RouteStop, ServicePoint)
         .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
         .where(
             RouteStop.route_id == route_id,
-            RouteStop.status.in_(statuses),
+            RouteStop.status == RouteStopStatus.PENDING,
             ServicePoint.floor_id == floor_id,
         )
     )
     candidates: list[Candidate] = []
     stops: dict[uuid.UUID, RouteStop] = {}
     for stop, point in rows.all():
-        candidates.append(_candidate(stop, point, _distance(latitude, longitude, point)))
+        candidates.append(_candidate(stop, point, latitude, longitude))
         stops[stop.id] = stop
     return candidates, stops
 
@@ -438,7 +452,7 @@ async def _load_open_checkins(
         )
     )
     return [
-        (_candidate(stop, point, _distance(latitude, longitude, point)), execution, stop)
+        (_candidate(stop, point, latitude, longitude), execution, stop)
         for execution, stop, point in rows.all()
     ]
 
@@ -457,17 +471,12 @@ def _merge_flags(*groups: Sequence[str]) -> list[str]:
     return sorted(merged)
 
 
-def _review_status(flags: Sequence[str]) -> ExecutionReviewStatus:
-    return ExecutionReviewStatus.PENDING_REVIEW if flags else ExecutionReviewStatus.NONE
-
-
 def _build_scan(
     *,
     execution_id: uuid.UUID,
     qr_code_id: uuid.UUID,
     kind: QrScanKind,
     scanned_at: datetime,
-    received_at: datetime,
     resolved: Candidate,
     geo_validation: GeoValidation,
     latitude: float | None,
@@ -478,7 +487,7 @@ def _build_scan(
         qr_code_id=qr_code_id,
         kind=kind,
         scanned_at=scanned_at,
-        received_at=received_at,
+        received_at=datetime.now(UTC),  # server clock; `scanned_at` is the device's
         geo_validation=geo_validation,
         distance_m=resolved.distance_m,
         service_point_id=resolved.service_point_id,

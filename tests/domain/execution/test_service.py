@@ -9,6 +9,7 @@ from app.domain.execution.models import (
     ExecutionReviewStatus,
     ExecutionSource,
     GeoValidation,
+    ManualCompletion,
     QrScan,
     QrScanKind,
 )
@@ -23,6 +24,7 @@ from app.domain.execution.service import (
     StopAlreadyDone,
     StopAlreadyManuallyCompleted,
     StopNotAssignedToWorker,
+    StopNotOnRoute,
     check_in,
     check_out,
     complete_manually,
@@ -84,12 +86,18 @@ async def _seed(
     route_status: RouteStatus | None = None,
     qr_version: int = 1,
     qr_status: QrCodeStatus = QrCodeStatus.ACTIVE,
+    tag: str = "1",
 ) -> _Seed:
+    # `tag` keeps the unique columns (manager email, company CNPJ) distinct when a test
+    # seeds two independent routes in one session.
     rooms = rooms or [("Sala 101", _LAT, _LON)]
     manager = User(
-        name="Larissa", email="larissa@pu.ufcg.edu.br", password_hash="x", role=UserRole.MANAGER
+        name="Larissa",
+        email=f"larissa-{tag}@pu.ufcg.edu.br",
+        password_hash="x",
+        role=UserRole.MANAGER,
     )
-    company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
+    company = ContractorCompany(name="Limpa Tudo", cnpj=(tag.rjust(2, "0") + "345678000199")[:14])
     building = Building(name="Bloco CI", campus_area="CCT")
     db.add_all([manager, company, building])
     await db.flush()
@@ -190,8 +198,38 @@ async def _do_check_out(
     )
 
 
+async def _manual(
+    db: AsyncSession, seed: _Seed, stop: RouteStop, *, reason: str = "Verified in person."
+) -> Execution:
+    return await complete_manually(
+        db,
+        route=seed.route,
+        stop=stop,
+        actor_id=seed.manager.id,
+        reason=reason,
+        completed_at=datetime.now(UTC),
+    )
+
+
+async def _add_assignment(db: AsyncSession, seed: _Seed, stop: RouteStop) -> None:
+    db.add(
+        StopAssignment(
+            route_stop_id=stop.id,
+            field_worker_id=seed.worker.id,
+            sequence=1,
+            assigned_by=seed.manager.id,
+        )
+    )
+    await db.commit()
+
+
 async def _scans(db: AsyncSession, execution_id: uuid.UUID) -> list[QrScan]:
     result = await db.scalars(select(QrScan).where(QrScan.execution_id == execution_id))
+    return list(result)
+
+
+async def _executions_for_stop(db: AsyncSession, stop_id: uuid.UUID) -> list[Execution]:
+    result = await db.scalars(select(Execution).where(Execution.route_stop_id == stop_id))
     return list(result)
 
 
@@ -228,6 +266,7 @@ async def test_check_in_resolves_single_stop_on_floor_and_marks_in_progress(
     assert scans[0].kind is QrScanKind.CHECK_IN
     assert scans[0].geo_validation is GeoValidation.VALIDATED
     assert scans[0].service_point_id == seed.points[0].id
+    assert scans[0].distance_m is not None
     await db_session.refresh(seed.stops[0])
     assert seed.stops[0].status is RouteStopStatus.IN_PROGRESS
 
@@ -455,6 +494,49 @@ async def test_check_out_idempotent_by_checkout_key(db_session: AsyncSession) ->
     assert len(checkout_scans) == 1
 
 
+async def test_check_out_on_cancelled_route_raises(db_session: AsyncSession) -> None:
+    seed = await _seed(db_session)
+    await _do_check_in(db_session, seed)
+    seed.route.status = RouteStatus.CANCELLED
+    await db_session.commit()
+
+    with pytest.raises(RouteCancelled):
+        await _do_check_out(db_session, seed)
+
+
+async def test_check_out_reopens_resolved_review_on_new_flag(db_session: AsyncSession) -> None:
+    seed = await _seed(db_session)
+    checkin = await _do_check_in(db_session, seed)
+    assert checkin.validation_flags == []
+    # Simulate a manager clearing the check-in review before the worker checks out.
+    checkin.review_status = ExecutionReviewStatus.RESOLVED
+    await db_session.commit()
+
+    execution = await _do_check_out(db_session, seed, latitude=_FAR_LAT, longitude=_FAR_LON)
+
+    assert FLAG_OUT_OF_RADIUS in execution.validation_flags
+    assert execution.review_status is ExecutionReviewStatus.PENDING_REVIEW
+
+
+async def test_check_out_two_open_checkins_same_floor_raises_ambiguous(
+    db_session: AsyncSession,
+) -> None:
+    seed = await _seed(
+        db_session,
+        rooms=[("Sala 101", _LAT, _LON), ("Sala 102", _NEAR_LAT, _NEAR_LON)],
+    )
+    await _do_check_in(db_session, seed, chosen_route_stop_id=seed.stops[0].id)
+    await _do_check_in(db_session, seed, chosen_route_stop_id=seed.stops[1].id)
+
+    with pytest.raises(AmbiguousRoom) as excinfo:
+        await _do_check_out(db_session, seed)
+
+    assert [c.route_stop_id for c in excinfo.value.candidates] == [
+        seed.stops[0].id,
+        seed.stops[1].id,
+    ]
+
+
 # --- complete_manually ----------------------------------------------------------------------
 
 
@@ -482,8 +564,6 @@ async def test_complete_manually_creates_synthetic_execution(db_session: AsyncSe
 
     assert execution.source is ExecutionSource.MANAGER_MANUAL
     assert await _scans(db_session, execution.id) == []
-    from app.domain.execution.models import ManualCompletion
-
     manual = await db_session.scalar(
         select(ManualCompletion).where(ManualCompletion.execution_id == execution.id)
     )
@@ -528,11 +608,50 @@ async def test_complete_manually_on_done_stop_raises(db_session: AsyncSession) -
     await _do_check_out(db_session, seed)
 
     with pytest.raises(StopAlreadyDone):
-        await complete_manually(
-            db_session,
-            route=seed.route,
-            stop=seed.stops[0],
-            actor_id=seed.manager.id,
-            reason="Too late.",
-            completed_at=datetime.now(UTC),
-        )
+        await _manual(db_session, seed, seed.stops[0])
+
+
+async def test_complete_manually_on_in_progress_stop_closes_the_open_checkin(
+    db_session: AsyncSession,
+) -> None:
+    seed = await _seed(db_session)
+    await _add_assignment(db_session, seed, seed.stops[0])
+    checkin = await _do_check_in(db_session, seed)
+    assert checkin.checked_out_at is None
+
+    manual = await _manual(db_session, seed, seed.stops[0])
+
+    assert manual.id == checkin.id
+    assert manual.source is ExecutionSource.APP
+    assert manual.checked_out_at is not None
+    assert len(await _executions_for_stop(db_session, seed.stops[0].id)) == 1
+    row = await db_session.scalar(
+        select(ManualCompletion).where(ManualCompletion.route_stop_id == seed.stops[0].id)
+    )
+    assert row is not None
+    assert row.execution_id == checkin.id
+    await db_session.refresh(seed.stops[0])
+    assert seed.stops[0].status is RouteStopStatus.DONE
+    assignment = await db_session.scalar(
+        select(StopAssignment).where(StopAssignment.route_stop_id == seed.stops[0].id)
+    )
+    assert assignment is not None
+    assert assignment.outcome is not None
+    assert assignment.outcome.value == "EXECUTED"
+
+
+async def test_complete_manually_on_cancelled_route_raises(db_session: AsyncSession) -> None:
+    seed = await _seed(db_session)
+    seed.route.status = RouteStatus.CANCELLED
+    await db_session.commit()
+
+    with pytest.raises(RouteCancelled):
+        await _manual(db_session, seed, seed.stops[0])
+
+
+async def test_complete_manually_stop_from_another_route_raises(db_session: AsyncSession) -> None:
+    seed = await _seed(db_session, tag="1")
+    other = await _seed(db_session, tag="2")
+
+    with pytest.raises(StopNotOnRoute):
+        await _manual(db_session, seed, other.stops[0])
