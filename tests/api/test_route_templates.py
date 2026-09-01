@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
 _PASSWORD = "senha-forte-o-suficiente"
@@ -38,7 +39,12 @@ def osrm() -> FakeOsrmClient:
 def client(
     test_settings: Settings, recording_mailer: RecordingMailer, osrm: FakeOsrmClient
 ) -> Iterator[TestClient]:
-    app = create_app(settings=test_settings, mailer=recording_mailer, osrm_client=osrm)
+    app = create_app(
+        settings=test_settings,
+        mailer=recording_mailer,
+        osrm_client=osrm,
+        object_store=FakeObjectStore(),
+    )
     with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
         yield test_client
 

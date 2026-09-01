@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
 _PASSWORD = "senha-forte-o-suficiente"
@@ -46,7 +47,12 @@ def client(
 ) -> Iterator[TestClient]:
     # Overrides conftest.client locally so every route write in this file goes through the
     # in-memory fake instead of a real OSRM HTTP call (spec §8 — no test touches the network).
-    app = create_app(settings=test_settings, mailer=recording_mailer, osrm_client=osrm)
+    app = create_app(
+        settings=test_settings,
+        mailer=recording_mailer,
+        osrm_client=osrm,
+        object_store=FakeObjectStore(),
+    )
     with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
         yield test_client
 
@@ -57,7 +63,12 @@ def _client_with_osrm(
 ) -> Iterator[TestClient]:
     # A one-off app whose OSRM seam differs from the module `osrm` fixture — needed by the
     # tests that require a specific trip order or a deliberate outage (spec §4.2, Ruling 6).
-    app = create_app(settings=test_settings, mailer=recording_mailer, osrm_client=osrm_client)
+    app = create_app(
+        settings=test_settings,
+        mailer=recording_mailer,
+        osrm_client=osrm_client,
+        object_store=FakeObjectStore(),
+    )
     with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
         yield test_client
 

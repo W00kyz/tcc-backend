@@ -27,6 +27,8 @@ os.environ.setdefault("QR_SIGNING_PRIVATE_KEY_HEX", "00" * 32)
 
 from app.main import create_app
 
+from tests.support.object_store import FakeObjectStore
+
 _POSTGIS_IMAGE = (
     "postgis/postgis:17-3.5@sha256:83e9999dc3ad8390c210e76130c3a16365ef4f957bb55200d22b7937cfbcb321"
 )
@@ -76,7 +78,9 @@ def recording_mailer() -> RecordingMailer:
 
 @pytest.fixture
 def client(test_settings: Settings, recording_mailer: RecordingMailer) -> Iterator[TestClient]:
-    app = create_app(settings=test_settings, mailer=recording_mailer)
+    app = create_app(
+        settings=test_settings, mailer=recording_mailer, object_store=FakeObjectStore()
+    )
     # TestClient's default fake client address ("testclient", 50000) is not a valid IP, and
     # auth_logs.ip_address is a strict Postgres INET column (RF04) — a real loopback address
     # keeps every route that records the caller's IP (login, refresh, logout, ...) working.

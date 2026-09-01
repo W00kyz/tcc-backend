@@ -6,11 +6,13 @@ request before it is ever sent. See app/main.py's create_app() for the middlewar
 from app.main import create_app
 from fastapi.testclient import TestClient
 
+from tests.support.object_store import FakeObjectStore
+
 _DASHBOARD_ORIGIN = "http://localhost:5173"
 
 
 def test_actual_request_echoes_dashboard_origin_with_credentials() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(object_store=FakeObjectStore()))
 
     response = client.get("/health", headers={"Origin": _DASHBOARD_ORIGIN})
 
@@ -20,7 +22,7 @@ def test_actual_request_echoes_dashboard_origin_with_credentials() -> None:
 
 
 def test_preflight_allows_bearer_auth_header_and_post_method() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(object_store=FakeObjectStore()))
 
     response = client.options(
         "/checkins",
@@ -40,7 +42,7 @@ def test_preflight_allows_bearer_auth_header_and_post_method() -> None:
 
 
 def test_preflight_rejects_an_unrecognized_origin() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(object_store=FakeObjectStore()))
 
     response = client.options(
         "/checkins",

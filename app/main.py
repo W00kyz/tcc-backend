@@ -1,3 +1,6 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import httpx2
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +21,7 @@ from app.api.service_types import router as service_types_router
 from app.api.users import router as users_router
 from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
+from app.core.object_store import MinioObjectStore, ObjectStore
 from app.db.session import build_engine, build_session_factory
 from app.domain.routing.osrm import HttpxOsrmClient, OsrmClient
 
@@ -46,6 +50,7 @@ def create_app(
     settings: Settings | None = None,
     mailer: Mailer | None = None,
     osrm_client: OsrmClient | None = None,
+    object_store: ObjectStore | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -56,9 +61,33 @@ def create_app(
         app = create_app(settings=Settings(database_url=test_url, ...))
     """
     settings = settings or get_settings()
+
+    _httpx_client = httpx2.AsyncClient(timeout=10.0)
+    resolved_osrm = osrm_client or HttpxOsrmClient(settings.osrm_base_url, _httpx_client)
+    resolved_store = object_store or MinioObjectStore(
+        endpoint=settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        bucket=settings.minio_bucket_evidence,
+        secure=settings.minio_secure,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # ensure_bucket() only exists on the real MinIO seam; a FakeObjectStore in tests must
+        # never reach the network (spec §8). The isinstance check is against the concrete
+        # class, not the Protocol, so it needs no @runtime_checkable.
+        if isinstance(resolved_store, MinioObjectStore):
+            await resolved_store.ensure_bucket()
+        yield
+        # Only close the client we own. An injected osrm_client brings its own transport.
+        if osrm_client is None:
+            await _httpx_client.aclose()
+
     app = FastAPI(
         title="UFCG Service Route Monitoring API",
-        version="0.2.0",
+        version="0.3.0",
+        lifespan=lifespan,
     )
     app.state.settings = settings
     _add_cors_middleware(app, settings)
@@ -69,9 +98,8 @@ def create_app(
         port=settings.mail_smtp_port,
         from_address=settings.mail_from_address,
     )
-    app.state.osrm_client = osrm_client or HttpxOsrmClient(
-        settings.osrm_base_url, httpx2.AsyncClient(timeout=10.0)
-    )
+    app.state.osrm_client = resolved_osrm
+    app.state.object_store = resolved_store
 
     app.include_router(health_router)
     app.include_router(auth_router)

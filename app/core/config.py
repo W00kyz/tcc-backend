@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     dashboard_base_url: str = "http://localhost:5173"
     qr_signing_private_key_hex: str
     osrm_base_url: str = "http://osrm:5000"
+    minio_endpoint: str = "minio:9000"
+    minio_access_key: str = "route_monitor"
+    minio_secret_key: str = "change_me_in_local_env"
+    minio_bucket_evidence: str = "evidence"
+    minio_secure: bool = False
 
 
 @lru_cache
