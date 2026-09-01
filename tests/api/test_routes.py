@@ -671,7 +671,47 @@ async def test_patch_cancelled_route_409(client: TestClient, db_session: AsyncSe
     assert response.status_code == 409
 
 
-async def test_patch_route_unknown_worker_404(client: TestClient, db_session: AsyncSession) -> None:
+async def test_patch_route_rejects_changing_the_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """PATCH must not be a second reassignment path: changing field_worker_id here bypasses the
+    append-only stop_assignments chain that POST /routes/{id}/reassign maintains (spec §3.4
+    Ruling 1 / RF21). A differing worker is rejected outright — no partial write."""
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    worker_a_id, worker_b_id = workers[0].id, workers[1].id
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    ).json()
+    assignments_before = await db_session.scalar(select(func.count()).select_from(StopAssignment))
+
+    response = client.patch(
+        f"/routes/{created['id']}",
+        json={"field_worker_id": str(worker_b_id)},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 409
+    assert "reassign" in response.json()["detail"]
+    current_worker_id = await db_session.scalar(
+        select(Route.field_worker_id).where(Route.id == created["id"])
+    )
+    assert current_worker_id == worker_a_id
+    assignments_after = await db_session.scalar(select(func.count()).select_from(StopAssignment))
+    assert assignments_after == assignments_before
+    update_audits = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(AuditTrail.entity_type == "route", AuditTrail.action == "update")
+    )
+    assert update_audits == 0
+
+
+async def test_patch_route_accepts_the_unchanged_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Echoing the current field_worker_id back (as the dashboard edit form does) is a no-op for
+    the worker — it is not validated and not rewritten — and the rest of the PATCH still applies."""
     manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
     token = _login(client, manager.email)
     created = client.post(
@@ -680,11 +720,14 @@ async def test_patch_route_unknown_worker_404(client: TestClient, db_session: As
 
     response = client.patch(
         f"/routes/{created['id']}",
-        json={"field_worker_id": str(uuid4())},
+        json={"field_worker_id": str(workers[0].id), "route_date": "2026-10-05"},
         headers=_auth(token),
     )
 
-    assert response.status_code == 404
+    assert response.status_code == 200
+    body = response.json()
+    assert body["field_worker_id"] == str(workers[0].id)
+    assert body["route_date"] == "2026-10-05"
 
 
 async def test_patch_route_updates_scalar_fields_and_audits(
@@ -698,13 +741,13 @@ async def test_patch_route_updates_scalar_fields_and_audits(
 
     response = client.patch(
         f"/routes/{created['id']}",
-        json={"field_worker_id": str(workers[1].id), "route_date": "2026-10-05"},
+        json={"route_date": "2026-10-05", "scheduled_start_at": "2026-10-05T08:00:00Z"},
         headers=_auth(token),
     )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["field_worker_id"] == str(workers[1].id)
+    assert body["field_worker_id"] == str(workers[0].id)
     assert body["route_date"] == "2026-10-05"
     count = await db_session.scalar(
         select(func.count())

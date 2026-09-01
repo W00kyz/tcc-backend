@@ -42,7 +42,6 @@ from app.domain.routing.service import (
     UnknownServicePoint,
     cancel_route,
     create_route,
-    ensure_field_worker_exists,
     optimize_route,
     reassign_route,
     replace_route_stops,
@@ -273,13 +272,18 @@ async def patch_route(
             f'Route "{route_id}" is {route.status.value} and cannot be edited.',
         )
 
+    # A changed field_worker_id here would bypass the append-only stop_assignments chain that
+    # POST /routes/{id}/reassign maintains (spec §3.4 Ruling 1 / RF21), leaving route and
+    # assignments pointing at different workers. Reject it before any write; an unchanged value
+    # (dashboard edit forms echo it back) is a no-op and is not validated.
+    if body.field_worker_id is not None and body.field_worker_id != route.field_worker_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f'Route "{route_id}" worker cannot be changed here; '
+            f"use POST /routes/{route_id}/reassign.",
+        )
+
     before = _route_snapshot(route)
-    if body.field_worker_id is not None:
-        try:
-            await ensure_field_worker_exists(db, body.field_worker_id)
-        except UnknownFieldWorker as exc:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-        route.field_worker_id = body.field_worker_id
     if body.route_date is not None:
         route.route_date = body.route_date
     if body.scheduled_start_at is not None:
