@@ -80,6 +80,7 @@ class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class RouteStopStatus(enum.StrEnum):
     PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
     DONE = "DONE"
 
 

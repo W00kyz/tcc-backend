@@ -6,8 +6,17 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -16,6 +25,22 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 class ExecutionSource(enum.StrEnum):
     APP = "APP"
     MANAGER_MANUAL = "MANAGER_MANUAL"
+
+
+class QrScanKind(enum.StrEnum):
+    CHECK_IN = "CHECK_IN"
+    CHECK_OUT = "CHECK_OUT"
+
+
+class ExecutionReviewStatus(enum.StrEnum):
+    NONE = "NONE"
+    PENDING_REVIEW = "PENDING_REVIEW"
+    RESOLVED = "RESOLVED"
+
+
+class EvidenceKind(enum.StrEnum):
+    PHOTO = "PHOTO"
+    NOTE = "NOTE"
 
 
 class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -37,6 +62,17 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source: Mapped[ExecutionSource] = mapped_column(Enum(ExecutionSource, name="execution_source"))
     idempotency_key: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True)
+    # Check-out (RF31) is a second idempotent write on the same execution — its own key so a
+    # retried check-out never collides with the check-in key stored above.
+    checkout_idempotency_key: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), unique=True, nullable=True
+    )
+    review_status: Mapped[ExecutionReviewStatus] = mapped_column(
+        Enum(ExecutionReviewStatus, name="execution_review_status"),
+        default=ExecutionReviewStatus.NONE,
+        server_default=ExecutionReviewStatus.NONE.value,
+    )
+    validation_flags: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
 
 
 class GeoValidation(enum.StrEnum):
@@ -58,5 +94,43 @@ class QrScan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Enum(GeoValidation, name="geo_validation")
     )
     distance_m: Mapped[float | None] = mapped_column(Float, nullable=True)
-    latitude: Mapped[float] = mapped_column(Float)
-    longitude: Mapped[float] = mapped_column(Float)
+    # nullable: the check-in rewrite (Etapa 5) stores None when the device has no GPS fix.
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    kind: Mapped[QrScanKind] = mapped_column(Enum(QrScanKind, name="qr_scan_kind"))
+    service_point_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("service_points.id"), nullable=True
+    )
+
+
+class EvidenceItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "evidence_items"
+    __table_args__ = (
+        CheckConstraint(
+            "(kind = 'PHOTO' AND object_key IS NOT NULL AND content_type IS NOT NULL "
+            "AND byte_size IS NOT NULL AND sha256 IS NOT NULL AND text_body IS NULL) "
+            "OR (kind = 'NOTE' AND text_body IS NOT NULL AND object_key IS NULL)",
+            name="evidence_items_kind_shape",
+        ),
+    )
+
+    execution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("executions.id"))
+    kind: Mapped[EvidenceKind] = mapped_column(Enum(EvidenceKind, name="evidence_kind"))
+    object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    text_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    byte_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ManualCompletion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "manual_completions"
+
+    route_stop_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("route_stops.id"), unique=True
+    )
+    execution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("executions.id"))
+    completed_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    reason: Mapped[str] = mapped_column(String(500))
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
