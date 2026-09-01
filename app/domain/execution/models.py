@@ -47,17 +47,17 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "executions"
 
     route_stop_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("route_stops.id")
+        UUID(as_uuid=True), ForeignKey("route_stops.id"), index=True
     )
     field_worker_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("field_workers.id")
+        UUID(as_uuid=True), ForeignKey("field_workers.id"), index=True
     )
     # form_version_id arrives in Etapa 7; nullable until then — there is no form this stage.
     form_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     # timezone=True (not the plan's bare mapped_column): the caller always passes a
     # timezone-aware datetime (datetime.now(UTC)) — asyncpg rejects binding that into a
     # bare TIMESTAMP WITHOUT TIME ZONE column, so this matches TimestampMixin's own choice.
-    checked_in_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    checked_in_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     checked_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source: Mapped[ExecutionSource] = mapped_column(Enum(ExecutionSource, name="execution_source"))
@@ -67,12 +67,14 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     checkout_idempotency_key: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), unique=True, nullable=True
     )
+    # default= only, no server_default: the migration drops the transient server default it
+    # used to backfill existing rows, so the ORM's Python-side default is the sole source of
+    # truth — matches routing.models RouteStatus / route_type.
     review_status: Mapped[ExecutionReviewStatus] = mapped_column(
         Enum(ExecutionReviewStatus, name="execution_review_status"),
         default=ExecutionReviewStatus.NONE,
-        server_default=ExecutionReviewStatus.NONE.value,
     )
-    validation_flags: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    validation_flags: Mapped[list[str]] = mapped_column(JSONB, default=list)
 
 
 class GeoValidation(enum.StrEnum):
@@ -84,7 +86,9 @@ class GeoValidation(enum.StrEnum):
 class QrScan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "qr_scans"
 
-    execution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("executions.id"))
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("executions.id"), index=True
+    )
     qr_code_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("qr_codes.id"))
     scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -114,7 +118,9 @@ class EvidenceItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ),
     )
 
-    execution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("executions.id"))
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("executions.id"), index=True
+    )
     kind: Mapped[EvidenceKind] = mapped_column(Enum(EvidenceKind, name="evidence_kind"))
     object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     text_body: Mapped[str | None] = mapped_column(Text, nullable=True)

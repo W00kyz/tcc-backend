@@ -52,7 +52,7 @@ class Route(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # The operational date of the route (RF11 "para uma data específica") — the key the
     # app's "rota do dia" (RF27) and the panel board filter by. NOT NULL, no server default:
     # the migration backfills existing rows before applying the constraint.
-    route_date: Mapped[date] = mapped_column(Date)
+    route_date: Mapped[date] = mapped_column(Date, index=True)
     route_type: Mapped[RouteType] = mapped_column(ROUTE_TYPE_ENUM, default=RouteType.REGULAR)
     status: Mapped[RouteStatus] = mapped_column(ROUTE_STATUS_ENUM, default=RouteStatus.PLANNED)
     cancellation_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)

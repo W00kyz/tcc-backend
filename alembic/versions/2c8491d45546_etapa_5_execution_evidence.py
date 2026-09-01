@@ -158,13 +158,14 @@ def upgrade() -> None:
             nullable=False,
         ),
     )
-    op.create_index("ix_manual_completions_route_stop_id", "manual_completions", ["route_stop_id"])
+    # route_stop_id needs no explicit index: its UNIQUE constraint (one manual completion per
+    # stop, spec §3.6) is already index-backed by Postgres.
 
     # 6. system_settings singleton — replaces the Etapa 2 key/value placeholder (no consumer).
     op.drop_table("system_settings")
     op.create_table(
         "system_settings",
-        sa.Column("id", sa.Boolean(), primary_key=True),
+        sa.Column("id", sa.Boolean(), primary_key=True, server_default=sa.text("true")),
         sa.Column("check_radius_meters", sa.Integer(), nullable=False, server_default="50"),
         sa.Column(
             "updated_by",
@@ -210,7 +211,6 @@ def downgrade() -> None:
         sa.PrimaryKeyConstraint("key"),
     )
 
-    op.drop_index("ix_manual_completions_route_stop_id", table_name="manual_completions")
     op.drop_table("manual_completions")
 
     op.drop_index("ix_evidence_items_execution_id", table_name="evidence_items")
