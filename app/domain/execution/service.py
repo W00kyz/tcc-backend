@@ -1,17 +1,40 @@
-"""Route start (RF34) and check-in (RF29) business logic. Only layer 1 of the anti-fraud
-defense (QR signature) is enforced here — layers 2-5 (GPS radius, time window, QR status)
-arrive in Etapas 3 and 5. See "Decisões de escopo desta etapa", item 6."""
+"""Route start (RF34), check-in (RF29), check-out (RF31) and manager manual completion
+(RF33). The check-in path is floor-QR-first: the QR identifies a floor, `resolve_room`
+picks the room from the worker's PENDING stops on that floor, and the five anti-fraud
+layers (signature, QR status, GPS radius, room match, schedule window) attach validation
+flags without ever blocking a check-in that a manager can still review (spec §4.2, §4.4).
 
+This module is the documented exception to the "service layer flushes, never commits"
+rule: check-in/check-out/manual-completion each own a full transaction and commit it,
+just as `start_route` already does."""
+
+import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.catalog.models import ServicePoint
-from app.domain.execution.models import Execution, ExecutionSource, GeoValidation, QrScan
-from app.domain.qr.crypto import decode_qr_payload
-from app.domain.qr.models import QrCode
+from app.domain.execution.geo import haversine_meters
+from app.domain.execution.models import (
+    Execution,
+    ExecutionReviewStatus,
+    ExecutionSource,
+    GeoValidation,
+    ManualCompletion,
+    QrScan,
+    QrScanKind,
+)
+from app.domain.execution.validation import (
+    FLAG_QR_SUPERSEDED,
+    Candidate,
+    ScheduleWindow,
+    resolve_room,
+    schedule_flag,
+)
+from app.domain.qr.crypto import QrPayload, decode_qr_payload
+from app.domain.qr.models import QrCode, QrCodeStatus
 from app.domain.routing.models import (
     Route,
     RouteStatus,
@@ -30,6 +53,10 @@ class RouteNotStartable(Exception):
     """The route is CANCELLED (or DONE) — a worker cannot start it (spec §3 Ruling 4)."""
 
 
+class RouteCancelled(Exception):
+    """The route was cancelled — it can no longer take check-ins or completions."""
+
+
 class QrSignatureInvalid(Exception):
     pass
 
@@ -38,8 +65,26 @@ class QrCodeUnknown(Exception):
     pass
 
 
+class QrRevoked(Exception):
+    """The scanned QR code is REVOKED (anti-fraud layer 2)."""
+
+
 class FloorMismatch(Exception):
-    pass
+    """LEGACY: the pre-Etapa-5 stop-first check-in raised this. Kept until Task 5 rewrites
+    the API error map; the floor-first path raises `FloorNotOnRoute` instead."""
+
+
+class FloorNotOnRoute(Exception):
+    """The scanned QR's floor has no PENDING stop on this worker's route."""
+
+
+class AmbiguousRoom(Exception):
+    """Two or more service points on the scanned floor match — the app must pick one and
+    re-submit with `chosen_route_stop_id` (spec §4.4)."""
+
+    def __init__(self, candidates: list[Candidate]) -> None:
+        super().__init__(f"{len(candidates)} rooms on this floor match; a choice is required.")
+        self.candidates = candidates
 
 
 class StopNotAssignedToWorker(Exception):
@@ -52,6 +97,14 @@ class RouteNotStarted(Exception):
 
 class StopAlreadyDone(Exception):
     pass
+
+
+class StopAlreadyManuallyCompleted(Exception):
+    """A `manual_completions` row already exists for this stop (its unique constraint)."""
+
+
+class NoOpenCheckIn(Exception):
+    """Check-out found no IN_PROGRESS stop with an open execution on the scanned floor."""
 
 
 async def start_route(
@@ -77,49 +130,54 @@ async def start_route(
 async def check_in(
     db: AsyncSession,
     *,
-    stop: RouteStop,
-    worker_id: UUID,
+    route: Route,
+    worker_id: uuid.UUID,
     qr_payload: str,
     public_key_hex: str,
-    latitude: float,
-    longitude: float,
+    latitude: float | None,
+    longitude: float | None,
     scanned_at: datetime,
-    idempotency_key: UUID,
+    idempotency_key: uuid.UUID,
+    chosen_route_stop_id: uuid.UUID | None,
+    radius_m: int,
 ) -> Execution:
+    """Floor-QR check-in. Resolves the room from the worker's PENDING stops on the scanned
+    floor, attaches the anti-fraud flags and moves the stop to IN_PROGRESS. Pass
+    `chosen_route_stop_id` on the re-submit that follows an `AmbiguousRoom`; `latitude` and
+    `longitude` are `None` when the device has no GPS fix.
+    """
     existing = await db.scalar(
         select(Execution).where(Execution.idempotency_key == idempotency_key)
     )
     if existing is not None:
         return existing
 
-    route = await db.get(Route, stop.route_id)
-    # FK guarantees this — if missing, it's a bug elsewhere, not a case to handle here.
-    assert route is not None
+    _guard_route(route, worker_id, require_started=True)
+    decoded, qr_code, qr_flags = await _verify_qr(db, qr_payload, public_key_hex)
 
-    if route.field_worker_id != worker_id:
-        raise StopNotAssignedToWorker(
-            f'Route stop "{stop.id}" is not on worker "{worker_id}"\'s route.'
+    candidates, stops = await _load_candidates(
+        db,
+        route_id=route.id,
+        floor_id=decoded.floor_id,
+        latitude=latitude,
+        longitude=longitude,
+        statuses=(RouteStopStatus.PENDING,),
+    )
+    if not candidates:
+        raise FloorNotOnRoute(
+            f'QR floor "{decoded.floor_id}" has no PENDING stop on route "{route.id}".'
         )
-    if route.started_at is None:
-        raise RouteNotStarted(f'Route "{route.id}" has not been started yet.')
-    if stop.status == RouteStopStatus.DONE:
-        raise StopAlreadyDone(f'Route stop "{stop.id}" was already checked in.')
 
-    decoded = decode_qr_payload(qr_payload, public_key_hex=public_key_hex)
-    if decoded is None:
-        raise QrSignatureInvalid("QR signature failed verification.")
+    has_gps = latitude is not None and longitude is not None
+    resolution = resolve_room(
+        candidates, radius_m=radius_m, has_gps=has_gps, chosen_route_stop_id=chosen_route_stop_id
+    )
+    if resolution.resolved is None:
+        raise AmbiguousRoom(resolution.ambiguous)
 
-    qr_code = await db.scalar(select(QrCode).where(QrCode.public_code == qr_payload))
-    if qr_code is None:
-        raise QrCodeUnknown("QR payload does not match any registered code.")
-
-    point = await db.get(ServicePoint, stop.service_point_id)
-    assert point is not None
-    if decoded.floor_id != point.floor_id:
-        raise FloorMismatch(
-            f'QR is for floor "{decoded.floor_id}", but stop "{stop.id}" is on floor '
-            f'"{point.floor_id}".'
-        )
+    resolved = resolution.resolved
+    stop = stops[resolved.route_stop_id]
+    flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags)
 
     now = datetime.now(UTC)
     execution = Execution(
@@ -129,31 +187,312 @@ async def check_in(
         synced_at=now,
         source=ExecutionSource.APP,
         idempotency_key=idempotency_key,
+        review_status=_review_status(flags),
+        validation_flags=flags,
     )
     db.add(execution)
     await db.flush()
 
     db.add(
-        QrScan(
+        _build_scan(
             execution_id=execution.id,
             qr_code_id=qr_code.id,
+            kind=QrScanKind.CHECK_IN,
             scanned_at=scanned_at,
             received_at=now,
-            geo_validation=GeoValidation.NOT_VALIDATED,
+            resolved=resolved,
+            geo_validation=resolution.geo_validation,
+            latitude=latitude,
+            longitude=longitude,
+        )
+    )
+    stop.status = RouteStopStatus.IN_PROGRESS
+    await db.commit()
+    return execution
+
+
+async def check_out(
+    db: AsyncSession,
+    *,
+    route: Route,
+    worker_id: uuid.UUID,
+    qr_payload: str,
+    public_key_hex: str,
+    latitude: float | None,
+    longitude: float | None,
+    scanned_at: datetime,
+    checkout_idempotency_key: uuid.UUID,
+    chosen_route_stop_id: uuid.UUID | None,
+    radius_m: int,
+) -> Execution:
+    """Close the open check-in on the scanned floor: sets `checked_out_at`, merges any new
+    flags into the execution, marks the stop DONE and its assignment EXECUTED."""
+    existing = await db.scalar(
+        select(Execution).where(Execution.checkout_idempotency_key == checkout_idempotency_key)
+    )
+    if existing is not None:
+        return existing
+
+    _guard_route(route, worker_id, require_started=False)
+    decoded, qr_code, qr_flags = await _verify_qr(db, qr_payload, public_key_hex)
+
+    open_rows = await _load_open_checkins(
+        db, route_id=route.id, floor_id=decoded.floor_id, latitude=latitude, longitude=longitude
+    )
+    if not open_rows:
+        raise NoOpenCheckIn(
+            f'Route "{route.id}" has no open check-in on floor "{decoded.floor_id}".'
+        )
+
+    has_gps = latitude is not None and longitude is not None
+    candidates = [candidate for candidate, _, _ in open_rows]
+    resolution = resolve_room(
+        candidates, radius_m=radius_m, has_gps=has_gps, chosen_route_stop_id=chosen_route_stop_id
+    )
+    if resolution.resolved is None:
+        raise AmbiguousRoom(resolution.ambiguous)
+
+    resolved = resolution.resolved
+    execution, stop = next(
+        (execution, stop)
+        for candidate, execution, stop in open_rows
+        if candidate.route_stop_id == resolved.route_stop_id
+    )
+
+    new_flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags)
+    execution.validation_flags = sorted(set(execution.validation_flags) | set(new_flags))
+    if execution.validation_flags and execution.review_status is ExecutionReviewStatus.NONE:
+        execution.review_status = ExecutionReviewStatus.PENDING_REVIEW
+    execution.checked_out_at = scanned_at
+    execution.checkout_idempotency_key = checkout_idempotency_key
+
+    now = datetime.now(UTC)
+    db.add(
+        _build_scan(
+            execution_id=execution.id,
+            qr_code_id=qr_code.id,
+            kind=QrScanKind.CHECK_OUT,
+            scanned_at=scanned_at,
+            received_at=now,
+            resolved=resolved,
+            geo_validation=resolution.geo_validation,
             latitude=latitude,
             longitude=longitude,
         )
     )
     stop.status = RouteStopStatus.DONE
+    await _mark_assignment_executed(db, stop.id)
+    await db.commit()
+    return execution
 
+
+async def complete_manually(
+    db: AsyncSession,
+    *,
+    route: Route,
+    stop: RouteStop,
+    actor_id: uuid.UUID,
+    reason: str,
+    completed_at: datetime,
+) -> Execution:
+    """Manager closes a stop the worker could not (RF33): a synthetic MANAGER_MANUAL
+    execution plus an audited `manual_completions` row. No QR scan is recorded."""
+    already_manual = await db.scalar(
+        select(ManualCompletion).where(ManualCompletion.route_stop_id == stop.id)
+    )
+    if already_manual is not None:
+        raise StopAlreadyManuallyCompleted(
+            f'Route stop "{stop.id}" was already completed manually.'
+        )
+    if stop.status is RouteStopStatus.DONE:
+        raise StopAlreadyDone(f'Route stop "{stop.id}" is already DONE.')
+    if route.status is RouteStatus.CANCELLED:
+        raise RouteCancelled(f'Route "{route.id}" was cancelled and cannot be completed.')
+
+    now = datetime.now(UTC)
+    execution = Execution(
+        route_stop_id=stop.id,
+        field_worker_id=route.field_worker_id,
+        checked_in_at=completed_at,
+        checked_out_at=completed_at,
+        synced_at=now,
+        source=ExecutionSource.MANAGER_MANUAL,
+        idempotency_key=uuid.uuid4(),
+        review_status=ExecutionReviewStatus.NONE,
+        validation_flags=[],
+    )
+    db.add(execution)
+    await db.flush()
+
+    db.add(
+        ManualCompletion(
+            route_stop_id=stop.id,
+            execution_id=execution.id,
+            completed_by=actor_id,
+            reason=reason,
+            completed_at=completed_at,
+        )
+    )
+    stop.status = RouteStopStatus.DONE
+    await _mark_assignment_executed(db, stop.id)
+    await db.commit()
+    return execution
+
+
+# --- internal helpers -----------------------------------------------------------------------
+
+
+def _guard_route(route: Route, worker_id: uuid.UUID, *, require_started: bool) -> None:
+    if route.status is RouteStatus.CANCELLED:
+        raise RouteCancelled(f'Route "{route.id}" was cancelled and cannot take check-ins.')
+    if route.field_worker_id != worker_id:
+        raise StopNotAssignedToWorker(f'Route "{route.id}" is not on worker "{worker_id}"\'s list.')
+    if require_started and route.started_at is None:
+        raise RouteNotStarted(f'Route "{route.id}" has not been started yet.')
+
+
+async def _verify_qr(
+    db: AsyncSession, qr_payload: str, public_key_hex: str
+) -> tuple[QrPayload, QrCode, list[str]]:
+    decoded = decode_qr_payload(qr_payload, public_key_hex=public_key_hex)
+    if decoded is None:
+        raise QrSignatureInvalid("QR signature failed verification.")
+
+    qr_code = await db.scalar(select(QrCode).where(QrCode.public_code == qr_payload))
+    if qr_code is None:
+        raise QrCodeUnknown(f'QR payload "{qr_payload}" does not match any registered code.')
+    if qr_code.status is QrCodeStatus.REVOKED:
+        raise QrRevoked(f'QR code "{qr_code.id}" was revoked and cannot be used.')
+
+    newer = await db.scalar(
+        select(QrCode).where(
+            QrCode.floor_id == decoded.floor_id,
+            QrCode.status == QrCodeStatus.ACTIVE,
+            QrCode.version > qr_code.version,
+        )
+    )
+    qr_flags = [FLAG_QR_SUPERSEDED] if newer is not None else []
+    return decoded, qr_code, qr_flags
+
+
+def _candidate(stop: RouteStop, point: ServicePoint, distance_m: float | None) -> Candidate:
+    return Candidate(
+        route_stop_id=stop.id,
+        service_point_id=point.id,
+        name=point.name,
+        latitude=point.latitude,
+        longitude=point.longitude,
+        distance_m=distance_m,
+    )
+
+
+def _distance(latitude: float | None, longitude: float | None, point: ServicePoint) -> float | None:
+    if latitude is None or longitude is None:
+        return None
+    return haversine_meters(latitude, longitude, point.latitude, point.longitude)
+
+
+async def _load_candidates(
+    db: AsyncSession,
+    *,
+    route_id: uuid.UUID,
+    floor_id: uuid.UUID,
+    latitude: float | None,
+    longitude: float | None,
+    statuses: tuple[RouteStopStatus, ...],
+) -> tuple[list[Candidate], dict[uuid.UUID, RouteStop]]:
+    rows = await db.execute(
+        select(RouteStop, ServicePoint)
+        .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
+        .where(
+            RouteStop.route_id == route_id,
+            RouteStop.status.in_(statuses),
+            ServicePoint.floor_id == floor_id,
+        )
+    )
+    candidates: list[Candidate] = []
+    stops: dict[uuid.UUID, RouteStop] = {}
+    for stop, point in rows.all():
+        candidates.append(_candidate(stop, point, _distance(latitude, longitude, point)))
+        stops[stop.id] = stop
+    return candidates, stops
+
+
+async def _load_open_checkins(
+    db: AsyncSession,
+    *,
+    route_id: uuid.UUID,
+    floor_id: uuid.UUID,
+    latitude: float | None,
+    longitude: float | None,
+) -> list[tuple[Candidate, Execution, RouteStop]]:
+    rows = await db.execute(
+        select(Execution, RouteStop, ServicePoint)
+        .join(RouteStop, Execution.route_stop_id == RouteStop.id)
+        .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
+        .where(
+            RouteStop.route_id == route_id,
+            RouteStop.status == RouteStopStatus.IN_PROGRESS,
+            Execution.checked_out_at.is_(None),
+            ServicePoint.floor_id == floor_id,
+        )
+    )
+    return [
+        (_candidate(stop, point, _distance(latitude, longitude, point)), execution, stop)
+        for execution, stop, point in rows.all()
+    ]
+
+
+def _schedule_flags(stop: RouteStop, scanned_at: datetime) -> list[str]:
+    window = ScheduleWindow(
+        arrival_from=stop.expected_arrival_from, arrival_to=stop.expected_arrival_to
+    )
+    return schedule_flag(window, scanned_at)
+
+
+def _merge_flags(*groups: Sequence[str]) -> list[str]:
+    merged: set[str] = set()
+    for group in groups:
+        merged.update(group)
+    return sorted(merged)
+
+
+def _review_status(flags: Sequence[str]) -> ExecutionReviewStatus:
+    return ExecutionReviewStatus.PENDING_REVIEW if flags else ExecutionReviewStatus.NONE
+
+
+def _build_scan(
+    *,
+    execution_id: uuid.UUID,
+    qr_code_id: uuid.UUID,
+    kind: QrScanKind,
+    scanned_at: datetime,
+    received_at: datetime,
+    resolved: Candidate,
+    geo_validation: GeoValidation,
+    latitude: float | None,
+    longitude: float | None,
+) -> QrScan:
+    return QrScan(
+        execution_id=execution_id,
+        qr_code_id=qr_code_id,
+        kind=kind,
+        scanned_at=scanned_at,
+        received_at=received_at,
+        geo_validation=geo_validation,
+        distance_m=resolved.distance_m,
+        service_point_id=resolved.service_point_id,
+        latitude=latitude,
+        longitude=longitude,
+    )
+
+
+async def _mark_assignment_executed(db: AsyncSession, route_stop_id: uuid.UUID) -> None:
     assignment = await db.scalar(
         select(StopAssignment)
-        .where(StopAssignment.route_stop_id == stop.id)
+        .where(StopAssignment.route_stop_id == route_stop_id)
         .order_by(StopAssignment.sequence.desc())
         .limit(1)
     )
     if assignment is not None:
         assignment.outcome = StopAssignmentOutcome.EXECUTED
-
-    await db.commit()
-    return execution
