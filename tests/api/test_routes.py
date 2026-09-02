@@ -16,6 +16,7 @@ from app.domain.catalog.models import (
     PointType,
     ServicePoint,
 )
+from app.domain.execution.models import Execution, ExecutionSource, ManualCompletion
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import (
     Route,
@@ -1047,3 +1048,154 @@ async def test_route_actions_forbidden_for_field_worker(
         ).status_code
         == 403
     )
+
+
+# --- POST /routes/{id}/stops/{stop_id}/complete-manually (RF53) ----------------------
+
+
+async def _start_route(db_session: AsyncSession, route: Route) -> None:
+    db_route = await db_session.get(Route, route.id)
+    assert db_route is not None
+    db_route.status = RouteStatus.IN_PROGRESS
+    db_route.started_at = datetime.now(UTC)
+    await db_session.commit()
+
+
+async def _first_stop_id(db_session: AsyncSession, route: Route) -> str:
+    stop = await db_session.scalar(
+        select(RouteStop).where(RouteStop.route_id == route.id).order_by(RouteStop.order_index)
+    )
+    assert stop is not None
+    return str(stop.id)
+
+
+async def test_complete_manually_marks_done_and_audits(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    manager_id = manager.id
+    await _start_route(db_session, route)
+    stop_id = await _first_stop_id(db_session, route)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        f"/routes/{route.id}/stops/{stop_id}/complete-manually",
+        json={"reason": "celular quebrado"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    done = [stop for stop in body["stops"] if stop["id"] == stop_id]
+    assert len(done) == 1
+    assert done[0]["status"] == "DONE"
+
+    manual = await db_session.scalar(
+        select(ManualCompletion).where(ManualCompletion.route_stop_id == stop_id)
+    )
+    assert manual is not None
+    assert manual.reason == "celular quebrado"
+    assert manual.completed_by == manager_id
+    assert manual.completed_at is not None
+
+    audit_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(AuditTrail.entity_type == "route_stop", AuditTrail.action == "complete_manually")
+    )
+    assert audit_count == 1
+
+    execution = await db_session.scalar(select(Execution).where(Execution.route_stop_id == stop_id))
+    assert execution is not None
+    assert execution.source == ExecutionSource.MANAGER_MANUAL
+
+
+async def test_complete_manually_empty_reason_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    await _start_route(db_session, route)
+    stop_id = await _first_stop_id(db_session, route)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        f"/routes/{route.id}/stops/{stop_id}/complete-manually",
+        json={"reason": ""},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 422
+
+
+async def test_complete_manually_already_done_409(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    await _start_route(db_session, route)
+    stop_id = await _first_stop_id(db_session, route)
+    token = _login(client, manager.email)
+    url = f"/routes/{route.id}/stops/{stop_id}/complete-manually"
+
+    first = client.post(url, json={"reason": "celular quebrado"}, headers=_auth(token))
+    second = client.post(url, json={"reason": "de novo"}, headers=_auth(token))
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+
+
+async def test_complete_manually_cancelled_route_409(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    stop_id = await _first_stop_id(db_session, route)
+    db_route = await db_session.get(Route, route.id)
+    assert db_route is not None
+    db_route.status = RouteStatus.CANCELLED
+    await db_session.commit()
+    token = _login(client, manager.email)
+
+    response = client.post(
+        f"/routes/{route.id}/stops/{stop_id}/complete-manually",
+        json={"reason": "prédio fechado"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 409
+
+
+async def test_complete_manually_field_worker_forbidden_403(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    token = _login(client, worker_user.email)
+
+    response = client.post(
+        f"/routes/{route.id}/stops/{uuid4()}/complete-manually",
+        json={"reason": "x"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 403
+
+
+async def test_complete_manually_stop_not_on_route_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, worker, route = await _seed_manager_and_worker_route(db_session)
+    point_id = await db_session.scalar(select(ServicePoint.id))
+    other_route = Route(field_worker_id=worker.id, route_date=date.today())
+    db_session.add(other_route)
+    await db_session.flush()
+    other_stop = RouteStop(route_id=other_route.id, service_point_id=point_id, order_index=1)
+    db_session.add(other_stop)
+    await db_session.commit()
+    other_stop_id = str(other_stop.id)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        f"/routes/{route.id}/stops/{other_stop_id}/complete-manually",
+        json={"reason": "x"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 404

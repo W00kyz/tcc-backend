@@ -5,7 +5,7 @@ route looks the same on mobile and the dashboard. Business rules live in
 `app.domain.routing.service` / `app.domain.execution.service`; this router validates input,
 owns the transaction, and records the audit trail."""
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Annotated, Literal
 from uuid import UUID
@@ -28,11 +28,16 @@ from app.domain.audit.service import record_audit_trail
 from app.domain.catalog.models import FieldWorker
 from app.domain.execution.service import (
     RouteAlreadyStarted,
+    RouteCancelled,
     RouteNotStartable,
+    StopAlreadyDone,
+    StopAlreadyManuallyCompleted,
+    StopNotOnRoute,
+    complete_manually,
     start_route,
 )
 from app.domain.identity.models import User, UserRole
-from app.domain.routing.models import Route, RouteStatus, RouteType
+from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteType
 from app.domain.routing.osrm import OsrmUnavailable
 from app.domain.routing.service import (
     DoneStopRemoved,
@@ -89,6 +94,10 @@ class ReassignBody(BaseModel):
 
 class CancelBody(BaseModel):
     reason: str = Field(min_length=1, max_length=300)
+
+
+class CompleteManuallyBody(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class StartRouteRequest(BaseModel):
@@ -439,6 +448,57 @@ async def start_route_endpoint(
     except (RouteAlreadyStarted, RouteNotStartable) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
+    return _to_route_out(await _reload(db, route_id))
+
+
+@router.post(
+    "/{route_id}/stops/{stop_id}/complete-manually",
+    response_model=RouteOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def complete_stop_manually(
+    route_id: UUID, stop_id: UUID, body: CompleteManuallyBody, actor: _Manager, db: _Db
+) -> RouteOut:
+    """RF53 — a manager closes a stop the worker could not reach, with a reason and no
+    evidence. `complete_manually` owns and commits its own transaction (the execution module
+    exception to "service flushes, never commits"); the audit trail is appended in a second
+    transaction afterwards, exactly as `start_route` does."""
+    route = await _load_route(db, route_id)
+    if route is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
+
+    stop = await db.scalar(select(RouteStop).where(RouteStop.id == stop_id))
+    if stop is None or stop.route_id != route_id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f'Route stop "{stop_id}" not found on route "{route_id}".',
+        )
+
+    prior_status = stop.status.value
+    try:
+        await complete_manually(
+            db,
+            route=route,
+            stop=stop,
+            actor_id=actor.id,
+            reason=body.reason,
+            completed_at=datetime.now(UTC),
+        )
+    except StopNotOnRoute as exc:  # defensive — the check above already 404s a mismatched pair
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except (RouteCancelled, StopAlreadyDone, StopAlreadyManuallyCompleted) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="route_stop",
+        entity_id=stop_id,
+        action="complete_manually",
+        before={"status": prior_status},
+        after={"status": "DONE", "reason": body.reason},
+    )
+    await db.commit()
     return _to_route_out(await _reload(db, route_id))
 
 
