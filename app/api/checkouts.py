@@ -9,7 +9,7 @@ this endpoint answers 409 with the candidate list and the app re-submits with th
 `check_out` owns and commits its own transaction (the documented service-layer exception),
 so this router neither opens one nor records an audit trail for check-out."""
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -18,10 +18,15 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api._execution_common import (
+    NoActiveRoute,
+    RouteStopMissing,
+    current_worker,
+    resolve_route,
+)
 from app.api.checkins import CandidateOut
 from app.api.deps import require_role
 from app.db.session import get_db
-from app.domain.catalog.models import FieldWorker
 from app.domain.execution.service import (
     AmbiguousRoom,
     NoOpenCheckIn,
@@ -35,7 +40,6 @@ from app.domain.execution.service import (
 from app.domain.execution.validation import ChosenStopNotOnFloor
 from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import derive_public_key_hex
-from app.domain.routing.models import Route, RouteStatus, RouteStop
 from app.domain.settings.models import SystemSettings
 
 router = APIRouter(prefix="/check-outs", tags=["execution"])
@@ -72,31 +76,6 @@ class CheckOutResponse(BaseModel):
     review_status: str
 
 
-async def _resolve_route(db: AsyncSession, body: CheckOutRequest, worker_id: UUID) -> Route:
-    """The route to check out against: the one owning the chosen stop on a re-submit, else the
-    worker's started route for today."""
-    if body.route_stop_id is not None:
-        stop = await db.get(RouteStop, body.route_stop_id)
-        if stop is None:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, f'Route stop "{body.route_stop_id}" not found.'
-            )
-        route = await db.get(Route, stop.route_id)
-        assert route is not None
-        return route
-
-    started_route: Route | None = await db.scalar(
-        select(Route).where(
-            Route.field_worker_id == worker_id,
-            Route.route_date == date.today(),
-            Route.status == RouteStatus.IN_PROGRESS,
-        )
-    )
-    if started_route is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "No active route for today.")
-    return started_route
-
-
 def _ambiguous_conflict(exc: AmbiguousRoom) -> HTTPException:
     """The 409 body the app re-submits against — identical shape to check-in's."""
     return HTTPException(
@@ -123,11 +102,18 @@ async def create_check_out(
     user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> CheckOutResponse:
-    worker = await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
+    worker = await current_worker(db, user)
     if worker is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has no field worker profile.")
 
-    route = await _resolve_route(db, body, worker.id)
+    try:
+        route = await resolve_route(db, worker_id=worker.id, route_stop_id=body.route_stop_id)
+    except RouteStopMissing as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f'Route stop "{body.route_stop_id}" not found.'
+        ) from exc
+    except NoActiveRoute as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "No active route for today.") from exc
 
     settings = request.app.state.settings
     public_key_hex = derive_public_key_hex(settings.qr_signing_private_key_hex)

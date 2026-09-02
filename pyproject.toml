@@ -64,6 +64,9 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "PT", "
 # RouteNotEditable / DoneStopRemoved / UnknownServicePoint name the condition the routers and
 # Etapa 4's Task 4 catch by name, same convention as execution/service.py (Task 3 brief).
 "app/domain/routing/service.py" = ["N818"]
+# NoActiveRoute / RouteStopMissing are signal conditions the check-in and check-out routers
+# catch by name to raise their own HTTPException — same convention as execution/service.py.
+"app/api/_execution_common.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.13"
