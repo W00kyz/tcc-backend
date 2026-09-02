@@ -46,7 +46,6 @@ class ExecutionListItem(BaseModel):
     building_id: UUID
     building_name: str
     floor_label: str
-    service_type_name: str | None
     checked_in_at: datetime
     checked_out_at: datetime | None
     geo_validation: str | None
@@ -111,7 +110,6 @@ def _to_item(row: ExecutionListRow) -> ExecutionListItem:
         building_id=row.building_id,
         building_name=row.building_name,
         floor_label=row.floor_label,
-        service_type_name=row.service_type_name,
         checked_in_at=row.checked_in_at,
         checked_out_at=row.checked_out_at,
         geo_validation=row.geo_validation,
@@ -174,7 +172,6 @@ async def list_execution_history(
     field_worker_id: UUID | None = None,
     service_point_id: UUID | None = None,
     building_id: UUID | None = None,
-    service_type_id: UUID | None = None,
     review_status: str | None = None,
     geo_validation: str | None = None,
     source: str | None = None,
@@ -190,7 +187,6 @@ async def list_execution_history(
         field_worker_id=field_worker_id,
         service_point_id=service_point_id,
         building_id=building_id,
-        service_type_id=service_type_id,
         review_status=review_status,
         geo_validation=geo_validation,
         source=source,
@@ -240,5 +236,6 @@ async def resolve_execution_review(
     await db.commit()
 
     detail = await get_execution_detail(db, execution_id)
-    assert detail is not None  # just resolved above; the row exists
+    if detail is None:  # just resolved above; the row must exist
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Execution "{execution_id}" not found.')
     return _to_detail(detail)

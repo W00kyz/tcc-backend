@@ -342,6 +342,43 @@ async def test_pagination_caps_the_page_and_keeps_total(db_session: AsyncSession
     assert len(page_two) == 1
 
 
+async def test_pagination_is_stable_with_equal_timestamps(db_session: AsyncSession) -> None:
+    company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
+    building = Building(name="Bloco A", campus_area="CCT")
+    db_session.add_all([company, building])
+    await db_session.flush()
+    _, point = await _floor_with_point(db_session, building.id, "Térreo", "Sala A")
+    worker = FieldWorker(full_name="Ana", contractor_company_id=company.id)
+    db_session.add(worker)
+    await db_session.flush()
+    route = Route(field_worker_id=worker.id, route_date=_NOW.date(), status=RouteStatus.IN_PROGRESS)
+    db_session.add(route)
+    await db_session.flush()
+
+    same_instant = _NOW
+    ids = set()
+    for _ in range(3):
+        execution_id, _ = await _execution(
+            db_session,
+            worker_id=worker.id,
+            route_id=route.id,
+            point_id=point,
+            checked_in_at=same_instant,
+            source=ExecutionSource.APP,
+            review_status=ExecutionReviewStatus.NONE,
+        )
+        ids.add(execution_id)
+    await db_session.commit()
+
+    page_one, total = await list_executions(db_session, ExecutionFilters(), page=1, page_size=2)
+    page_two, _ = await list_executions(db_session, ExecutionFilters(), page=2, page_size=2)
+
+    assert total == 3
+    seen = [r.execution_id for r in page_one] + [r.execution_id for r in page_two]
+    assert len(seen) == 3
+    assert set(seen) == ids
+
+
 async def test_unknown_enum_filter_raises_value_error(db_session: AsyncSession) -> None:
     await _seed_world(db_session)
 

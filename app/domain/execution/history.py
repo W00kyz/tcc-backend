@@ -20,10 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.catalog.models import (
     Building,
     FieldWorker,
-    FieldWorkerServiceType,
     Floor,
     ServicePoint,
-    ServiceType,
 )
 from app.domain.execution.models import (
     EvidenceItem,
@@ -53,7 +51,6 @@ class ExecutionFilters:
     field_worker_id: UUID | None = None
     service_point_id: UUID | None = None
     building_id: UUID | None = None
-    service_type_id: UUID | None = None
     review_status: str | None = None
     geo_validation: str | None = None
     source: str | None = None
@@ -70,9 +67,6 @@ class ExecutionListRow:
     building_id: UUID
     building_name: str
     floor_label: str
-    # The system has no per-service-point service type; this is the field worker's first
-    # qualification (spec §5.4 lists the column, the data model only links it to the worker).
-    service_type_name: str | None
     checked_in_at: datetime
     checked_out_at: datetime | None
     geo_validation: str | None  # from the CHECK_IN scan; None for a MANAGER_MANUAL execution
@@ -137,17 +131,6 @@ def _evidence_count_subquery() -> ScalarSelect[Any]:
     )
 
 
-def _service_type_name_subquery() -> ScalarSelect[Any]:
-    return (
-        select(ServiceType.name)
-        .join(FieldWorkerServiceType, FieldWorkerServiceType.service_type_id == ServiceType.id)
-        .where(FieldWorkerServiceType.field_worker_id == Execution.field_worker_id)
-        .order_by(ServiceType.name)
-        .limit(1)
-        .scalar_subquery()
-    )
-
-
 def _row_query() -> Select[Any]:
     """The list/detail column set with the fixed joins, no filters or ordering yet."""
     return (
@@ -159,7 +142,6 @@ def _row_query() -> Select[Any]:
             Building.id,
             Building.name,
             Floor.label,
-            _service_type_name_subquery().label("service_type_name"),
             _checkin_geo_subquery().label("checkin_geo"),
             _evidence_count_subquery().label("evidence_count"),
             RouteStop.route_id,
@@ -185,15 +167,6 @@ def _id_conditions(f: ExecutionFilters) -> list[ColumnElement[bool]]:
         conditions.append(RouteStop.service_point_id == f.service_point_id)
     if f.building_id is not None:
         conditions.append(Floor.building_id == f.building_id)
-    if f.service_type_id is not None:
-        conditions.append(
-            select(FieldWorkerServiceType.field_worker_id)
-            .where(
-                FieldWorkerServiceType.field_worker_id == Execution.field_worker_id,
-                FieldWorkerServiceType.service_type_id == f.service_type_id,
-            )
-            .exists()
-        )
     return conditions
 
 
@@ -223,7 +196,6 @@ def _to_list_row(
     building_id: UUID,
     building_name: str,
     floor_label: str,
-    service_type_name: str | None,
     checkin_geo: GeoValidation | None,
     evidence_count: int,
     route_id: UUID,
@@ -237,7 +209,6 @@ def _to_list_row(
         building_id=building_id,
         building_name=building_name,
         floor_label=floor_label,
-        service_type_name=service_type_name,
         checked_in_at=execution.checked_in_at,
         checked_out_at=execution.checked_out_at,
         geo_validation=checkin_geo.value if checkin_geo is not None else None,
@@ -254,7 +225,7 @@ async def list_executions(
 ) -> tuple[list[ExecutionListRow], int]:
     stmt = (
         _filtered(_row_query(), filters)
-        .order_by(Execution.checked_in_at.desc())
+        .order_by(Execution.checked_in_at.desc(), Execution.id.desc())
         .limit(page_size)
         .offset((page - 1) * page_size)
     )
