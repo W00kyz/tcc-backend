@@ -437,6 +437,7 @@ async def start_route_endpoint(
     if worker is None or route.field_worker_id != worker.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This route is not assigned to you.")
 
+    prior_status = route.status.value
     try:
         route = await start_route(
             db,
@@ -448,6 +449,19 @@ async def start_route_endpoint(
     except (RouteAlreadyStarted, RouteNotStartable) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
+    # `start_route` commits internally (the documented execution-module exception); the audit
+    # row is appended in a second transaction, exactly as `complete_stop_manually` does.
+    assert route.started_at is not None
+    await record_audit_trail(
+        db,
+        actor_id=user.id,
+        entity_type="route",
+        entity_id=route_id,
+        action="start",
+        before={"status": prior_status},
+        after={"status": route.status.value, "started_at": route.started_at.isoformat()},
+    )
+    await db.commit()
     return _to_route_out(await _reload(db, route_id))
 
 

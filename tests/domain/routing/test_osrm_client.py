@@ -54,6 +54,41 @@ async def test_route_legs_parses_two_legs_and_slices_shared_geometry() -> None:
     assert legs[0].geometry[-1] == legs[1].geometry[0]
 
 
+async def test_osrm_leg_without_annotation_degrades_not_crashes() -> None:
+    """A leg with no `annotation` block must not raise KeyError; it degrades to an empty
+    geometry, which `_recompute_legs` stores as `distance_from_prev_m=None`."""
+    geometry = [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "code": "Ok",
+                "routes": [
+                    {
+                        "geometry": {"coordinates": geometry},
+                        "legs": [
+                            {"distance": 111.1, "duration": 90.0},  # no "annotation"
+                            {
+                                "distance": 222.2,
+                                "duration": 180.0,
+                                "annotation": {"distance": [111.0, 111.2]},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
+        client = HttpxOsrmClient("http://osrm:5000", http)
+        legs = await client.route_legs(_THREE_WAYPOINTS)
+
+    assert len(legs) == 2
+    assert legs[0].geometry == []  # degraded — the recompute leaves distance_from_prev_m None
+    assert legs[1].distance_m == 222.2
+
+
 async def test_route_legs_zeroes_every_leg_on_noroute() -> None:
     def handler(_request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200, json={"code": "NoRoute"})

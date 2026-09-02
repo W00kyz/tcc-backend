@@ -62,7 +62,10 @@ class HttpxOsrmClient:
         legs: list[OsrmLeg] = []
         cursor = 0
         for leg in legs_json:
-            step_count = len(leg["annotation"]["distance"])
+            # A leg without an `annotation` block (OSRM omits it for a degenerate/zero-length
+            # leg) must degrade to an empty geometry slice, not raise KeyError.
+            annotation_distances = (leg.get("annotation") or {}).get("distance") or []
+            step_count = len(annotation_distances)
             geo_slice = full_geometry[cursor : cursor + step_count + 1]
             cursor += step_count
             legs.append(

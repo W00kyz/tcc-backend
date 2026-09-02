@@ -21,6 +21,7 @@ from app.api.route_templates import router as route_templates_router
 from app.api.routes import router as routes_router
 from app.api.service_points import router as service_points_router
 from app.api.service_types import router as service_types_router
+from app.api.settings import router as settings_router
 from app.api.users import router as users_router
 from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
@@ -65,8 +66,14 @@ def create_app(
     """
     settings = settings or get_settings()
 
-    _httpx_client = httpx2.AsyncClient(timeout=10.0)
-    resolved_osrm = osrm_client or HttpxOsrmClient(settings.osrm_base_url, _httpx_client)
+    # Only build (and later close) an HTTP client when we own the OSRM seam. An injected
+    # osrm_client — the case in almost every test — brings its own transport.
+    owned_httpx_client: httpx2.AsyncClient | None = None
+    if osrm_client is None:
+        owned_httpx_client = httpx2.AsyncClient(timeout=10.0)
+        resolved_osrm: OsrmClient = HttpxOsrmClient(settings.osrm_base_url, owned_httpx_client)
+    else:
+        resolved_osrm = osrm_client
     resolved_store = object_store or MinioObjectStore(
         endpoint=settings.minio_endpoint,
         access_key=settings.minio_access_key,
@@ -83,9 +90,9 @@ def create_app(
         if isinstance(resolved_store, MinioObjectStore):
             await resolved_store.ensure_bucket()
         yield
-        # Only close the client we own. An injected osrm_client brings its own transport.
-        if osrm_client is None:
-            await _httpx_client.aclose()
+        # Only close the client we built above (real-OSRM branch only).
+        if owned_httpx_client is not None:
+            await owned_httpx_client.aclose()
 
     app = FastAPI(
         title="UFCG Service Route Monitoring API",
@@ -121,6 +128,7 @@ def create_app(
     app.include_router(events_router)
     app.include_router(service_points_router)
     app.include_router(qr_codes_router)
+    app.include_router(settings_router)
 
     return app
 

@@ -364,6 +364,23 @@ async def test_starting_an_already_started_route_returns_409(
     assert response.status_code == 409
 
 
+async def test_start_route_records_audit_row(client: TestClient, db_session: AsyncSession) -> None:
+    _manager, _worker_user, _worker, route = await _seed_manager_and_worker_route(db_session)
+    token = _login(client, "joao@empresa.com")
+    body = {"latitude": -7.2, "longitude": -35.9, "started_at": datetime.now(UTC).isoformat()}
+
+    assert (
+        client.post(f"/routes/{route.id}/start", json=body, headers=_auth(token)).status_code == 200
+    )
+
+    count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(AuditTrail.entity_type == "route", AuditTrail.action == "start")
+    )
+    assert count == 1
+
+
 # --- POST /routes ----------------------------------------------------------------------
 
 

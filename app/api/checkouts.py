@@ -15,7 +15,6 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api._execution_common import (
@@ -40,13 +39,9 @@ from app.domain.execution.service import (
 from app.domain.execution.validation import ChosenStopNotOnFloor
 from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import derive_public_key_hex
-from app.domain.settings.models import SystemSettings
+from app.domain.settings.service import get_settings_row
 
 router = APIRouter(prefix="/check-outs", tags=["execution"])
-
-# Fallback when the singleton settings row is somehow absent (the Etapa 5 migration seeds
-# it); Task 11 extracts `get_settings_row` and this inline read goes with it.
-_DEFAULT_RADIUS_M = 50
 
 _DOMAIN_ERROR_STATUS: dict[type[Exception], int] = {
     QrSignatureInvalid: status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -117,8 +112,7 @@ async def create_check_out(
 
     settings = request.app.state.settings
     public_key_hex = derive_public_key_hex(settings.qr_signing_private_key_hex)
-    settings_row = await db.scalar(select(SystemSettings))
-    radius_m = settings_row.check_radius_meters if settings_row is not None else _DEFAULT_RADIUS_M
+    radius_m = (await get_settings_row(db)).check_radius_meters
 
     try:
         execution = await check_out(
