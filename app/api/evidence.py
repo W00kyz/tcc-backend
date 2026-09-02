@@ -13,7 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api._execution_common import current_worker
@@ -38,6 +38,14 @@ router = APIRouter(tags=["evidence"])
 # and keeps a single evidence sync from ballooning on a weak connection (spec §8).
 _MAX_PHOTO_BYTES = 5 * 1024 * 1024
 
+# The first bytes of every JPEG (SOI marker + start of the first segment). We accept JPEG
+# only: an `image/svg+xml` body with a `<script>` would otherwise be served inline from this
+# API's own origin by the content proxy — stored XSS. `file.content_type` is ignored entirely.
+_JPEG_MAGIC = b"\xff\xd8\xff"
+
+# What the content proxy serves a stored photo as — a fixed, non-sniffable media type.
+_EVIDENCE_MEDIA_TYPE = "image/jpeg"
+
 _READ_ROLES = (UserRole.FIELD_WORKER, UserRole.MANAGER, UserRole.ADMIN)
 
 
@@ -54,7 +62,8 @@ class EvidenceItemOut(BaseModel):
 
 
 class EvidenceNoteRequest(BaseModel):
-    text_body: str
+    # spec §3.4: a short field note, not a report. Whitespace-only is rejected in the handler.
+    text_body: str = Field(min_length=1, max_length=2000)
     captured_at: datetime
 
 
@@ -113,19 +122,16 @@ async def upload_photo(
     execution = await _load_execution(db, execution_id)
     worker_id = await _require_owning_worker(db, user, execution)
 
-    content_type = file.content_type or "image/jpeg"
-    if not content_type.startswith("image/"):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f'Evidence photo content type "{content_type}" is not an "image/*" type.',
-        )
-
-    data = await file.read()
+    # Read one byte past the ceiling — enough to know it is over the limit without
+    # buffering an arbitrarily large upload into memory.
+    data = await file.read(_MAX_PHOTO_BYTES + 1)
     if len(data) > _MAX_PHOTO_BYTES:
         raise HTTPException(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            f"Evidence photo is {len(data)} bytes; the limit is {_MAX_PHOTO_BYTES} bytes.",
+            f"Evidence photo exceeds the {_MAX_PHOTO_BYTES}-byte limit.",
         )
+    if data[:3] != _JPEG_MAGIC:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Only JPEG images are accepted.")
 
     store: ObjectStore = request.app.state.object_store
     try:
@@ -136,7 +142,6 @@ async def upload_photo(
             uploader_worker_id=worker_id,
             data=data,
             declared_sha256=sha256,
-            content_type=content_type,
             captured_at=captured_at,
         )
     except EvidenceIntegrityError as exc:
@@ -208,7 +213,16 @@ async def get_evidence_content(
 
     store: ObjectStore = request.app.state.object_store
     try:
-        data, content_type = await load_content(db, store, evidence_id=evidence_id)
+        data, _stored_type = await load_content(db, store, evidence_id=evidence_id)
     except EvidenceContentMissingError as exc:  # pragma: no cover - kind check above covers it
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    return StreamingResponse(iter([data]), media_type=content_type)
+    # Fixed media type + nosniff: the stored bytes are JPEG-validated on upload, and the
+    # browser must not be free to re-interpret them as anything executable.
+    return StreamingResponse(
+        iter([data]),
+        media_type=_EVIDENCE_MEDIA_TYPE,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": 'inline; filename="evidence.jpg"',
+        },
+    )

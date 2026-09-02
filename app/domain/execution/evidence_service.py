@@ -16,9 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.object_store import ObjectStore
 from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution
 
-# The upload endpoint enforces the byte ceiling (so it can answer 413 cleanly); this
-# module only guards ownership and integrity.
+# The upload endpoint enforces the byte ceiling and the JPEG magic-byte check (so it can
+# answer 413/422 cleanly); this module only guards ownership and integrity.
 _JPEG_SUFFIX = ".jpg"
+# Evidence photos are always JPEG (endpoint-validated). The content type is server-chosen
+# and stored as this literal — never the client's `Content-Type` header — so the content
+# proxy can serve it with a fixed, safe media type (no SVG/script smuggling).
+_EVIDENCE_CONTENT_TYPE = "image/jpeg"
 
 
 class EvidenceOwnershipError(Exception):
@@ -41,28 +45,30 @@ async def add_photo(
     uploader_worker_id: UUID,
     data: bytes,
     declared_sha256: str,
-    content_type: str,
     captured_at: datetime,
 ) -> EvidenceItem:
     """Verify integrity, put the object in MinIO, then flush the row. The hash is checked
-    BEFORE `store.put` so a mismatch leaves neither an object nor a row."""
+    BEFORE `store.put` so a mismatch leaves neither an object nor a row. The stored
+    content type is always `image/jpeg` (the endpoint enforces JPEG), never the client's
+    header."""
     _guard_ownership(execution, uploader_worker_id)
 
     digest = hashlib.sha256(data).hexdigest()
-    if digest != declared_sha256:
+    # Accept an uppercase-hex declaration too (`hexdigest()` is lowercase).
+    if digest != declared_sha256.lower():
         raise EvidenceIntegrityError(
             f'Declared sha256 "{declared_sha256}" does not match the {len(data)} received '
             f'bytes (actual "{digest}"); nothing was stored.'
         )
 
     object_key = f"evidence/{execution.id}/{uuid4()}{_JPEG_SUFFIX}"
-    await store.put(object_key, data, content_type=content_type)
+    await store.put(object_key, data, content_type=_EVIDENCE_CONTENT_TYPE)
 
     item = EvidenceItem(
         execution_id=execution.id,
         kind=EvidenceKind.PHOTO,
         object_key=object_key,
-        content_type=content_type,
+        content_type=_EVIDENCE_CONTENT_TYPE,
         byte_size=len(data),
         sha256=digest,
         captured_at=captured_at,
@@ -107,7 +113,7 @@ async def list_evidence(db: AsyncSession, *, execution_id: UUID) -> list[Evidenc
 async def load_content(
     db: AsyncSession, store: ObjectStore, *, evidence_id: UUID
 ) -> tuple[bytes, str]:
-    """The object bytes and content type for a PHOTO. Raises `EvidenceContentMissing`
+    """The object bytes and content type for a PHOTO. Raises `EvidenceContentMissingError`
     when the row is absent or is a NOTE — the endpoint maps that to 404."""
     item = await db.get(EvidenceItem, evidence_id)
     if item is None or item.object_key is None:
