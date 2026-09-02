@@ -21,6 +21,7 @@ dependencies = [
     "fpdf2==2.8.8",
     "httpx2==2.12.0",
     "minio==7.2.20",
+    "python-multipart==0.0.32",
 ]
 
 [dependency-groups]

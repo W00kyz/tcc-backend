@@ -11,6 +11,7 @@ from app.api.checkins import router as checkins_router
 from app.api.checkouts import router as checkouts_router
 from app.api.contractor_companies import router as contractor_companies_router
 from app.api.events import router as events_router
+from app.api.evidence import router as evidence_router
 from app.api.field_workers import router as field_workers_router
 from app.api.floors import router as floors_router
 from app.api.health import router as health_router
@@ -108,6 +109,7 @@ def create_app(
     app.include_router(route_templates_router)
     app.include_router(checkins_router)
     app.include_router(checkouts_router)
+    app.include_router(evidence_router)
     app.include_router(users_router)
     app.include_router(service_types_router)
     app.include_router(contractor_companies_router)
