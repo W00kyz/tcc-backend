@@ -46,12 +46,18 @@ async def add_photo(
     data: bytes,
     declared_sha256: str,
     captured_at: datetime,
-) -> EvidenceItem:
+    idempotency_key: UUID | None = None,
+) -> tuple[EvidenceItem, bool]:
     """Verify integrity, put the object in MinIO, then flush the row. The hash is checked
     BEFORE `store.put` so a mismatch leaves neither an object nor a row. The stored
     content type is always `image/jpeg` (the endpoint enforces JPEG), never the client's
-    header."""
+    header. Returns `(item, created)`; a repeat call with a seen `idempotency_key`
+    returns the stored row with `created=False` and touches neither MinIO nor the row."""
     _guard_ownership(execution, uploader_worker_id)
+
+    existing = await _find_by_key(db, idempotency_key)
+    if existing is not None:
+        return existing, False
 
     digest = hashlib.sha256(data).hexdigest()
     # Accept an uppercase-hex declaration too (`hexdigest()` is lowercase).
@@ -72,10 +78,11 @@ async def add_photo(
         byte_size=len(data),
         sha256=digest,
         captured_at=captured_at,
+        idempotency_key=idempotency_key,
     )
     db.add(item)
     await db.flush()
-    return item
+    return item, True
 
 
 async def add_note(
@@ -85,19 +92,38 @@ async def add_note(
     uploader_worker_id: UUID,
     text_body: str,
     captured_at: datetime,
-) -> EvidenceItem:
-    """Attach a free-text note (no object). The endpoint rejects empty text with 422."""
+    idempotency_key: UUID | None = None,
+) -> tuple[EvidenceItem, bool]:
+    """Attach a free-text note (no object). The endpoint rejects empty text with 422.
+    Returns `(item, created)`; a repeat call with a seen `idempotency_key` returns the
+    stored row with `created=False`."""
     _guard_ownership(execution, uploader_worker_id)
+
+    existing = await _find_by_key(db, idempotency_key)
+    if existing is not None:
+        return existing, False
 
     item = EvidenceItem(
         execution_id=execution.id,
         kind=EvidenceKind.NOTE,
         text_body=text_body,
         captured_at=captured_at,
+        idempotency_key=idempotency_key,
     )
     db.add(item)
     await db.flush()
-    return item
+    return item, True
+
+
+async def _find_by_key(db: AsyncSession, idempotency_key: UUID | None) -> EvidenceItem | None:
+    """The evidence row already stored under this sync key, if the app is retrying an
+    upload it already completed (spec §8). `None` key means the client sent no key."""
+    if idempotency_key is None:
+        return None
+    row: EvidenceItem | None = await db.scalar(
+        select(EvidenceItem).where(EvidenceItem.idempotency_key == idempotency_key)
+    )
+    return row
 
 
 async def list_evidence(db: AsyncSession, *, execution_id: UUID) -> list[EvidenceItem]:

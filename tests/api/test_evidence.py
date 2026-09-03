@@ -56,19 +56,35 @@ def _upload_photo(
     sha256: str,
     *,
     content_type: str = "image/jpeg",
+    idempotency_key: str | None = None,
 ) -> Response:
     return client.post(
         f"/executions/{execution_id}/evidence/photo",
         files={"file": ("photo.jpg", data, content_type)},
-        data={"sha256": sha256, "captured_at": datetime.now(UTC).isoformat()},
+        data={
+            "sha256": sha256,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "idempotency_key": idempotency_key or str(uuid.uuid4()),
+        },
         headers={"Authorization": f"Bearer {token}"},
     )
 
 
-def _upload_note(client: TestClient, token: str, execution_id: str, text_body: str) -> Response:
+def _upload_note(
+    client: TestClient,
+    token: str,
+    execution_id: str,
+    text_body: str,
+    *,
+    idempotency_key: str | None = None,
+) -> Response:
     return client.post(
         f"/executions/{execution_id}/evidence/note",
-        json={"text_body": text_body, "captured_at": datetime.now(UTC).isoformat()},
+        json={
+            "text_body": text_body,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "idempotency_key": idempotency_key or str(uuid.uuid4()),
+        },
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -381,3 +397,72 @@ async def test_list_evidence_owner_200_and_non_owner_403(
         f"/executions/{execution_a}/evidence", headers={"Authorization": f"Bearer {token_b}"}
     )
     assert other_worker.status_code == 403, other_worker.text
+
+
+async def test_upload_note_repeat_idempotency_key_returns_existing(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    """spec §8: the app's sync worker retries the same note after a network drop — the
+    second POST returns 200 + the stored row, not a duplicate."""
+    token, execution_id = await _seed_execution(client, db_session, test_settings)
+    key = str(uuid.uuid4())
+
+    first = _upload_note(client, token, execution_id, "Piso molhado.", idempotency_key=key)
+    second = _upload_note(client, token, execution_id, "Piso molhado.", idempotency_key=key)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["id"] == second.json()["id"]
+
+    rows = (
+        await db_session.scalars(
+            select(EvidenceItem).where(EvidenceItem.execution_id == uuid.UUID(execution_id))
+        )
+    ).all()
+    assert len(rows) == 1
+
+
+async def test_upload_photo_repeat_idempotency_key_returns_existing(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, execution_id = await _seed_execution(client, db_session, test_settings)
+    key = str(uuid.uuid4())
+
+    first = _upload_photo(
+        client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA, idempotency_key=key
+    )
+    second = _upload_photo(
+        client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA, idempotency_key=key
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["id"] == second.json()["id"]
+
+    assert len(_store(client).objects) == 1
+    rows = (
+        await db_session.scalars(
+            select(EvidenceItem).where(EvidenceItem.execution_id == uuid.UUID(execution_id))
+        )
+    ).all()
+    assert len(rows) == 1
+
+
+async def test_upload_note_distinct_idempotency_keys_create_two_rows(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, execution_id = await _seed_execution(client, db_session, test_settings)
+
+    first = _upload_note(client, token, execution_id, "Nota 1.")
+    second = _upload_note(client, token, execution_id, "Nota 2.")
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["id"] != second.json()["id"]
+
+    rows = (
+        await db_session.scalars(
+            select(EvidenceItem).where(EvidenceItem.execution_id == uuid.UUID(execution_id))
+        )
+    ).all()
+    assert len(rows) == 2

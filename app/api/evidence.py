@@ -11,7 +11,17 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,6 +75,9 @@ class EvidenceNoteRequest(BaseModel):
     # spec §3.4: a short field note, not a report. Whitespace-only is rejected in the handler.
     text_body: str = Field(min_length=1, max_length=2000)
     captured_at: datetime
+    # spec §8: the app's sync worker sends the same key when it retries after a network
+    # drop; a repeat POST returns the stored item (200) instead of a second row.
+    idempotency_key: UUID
 
 
 def _to_out(item: EvidenceItem) -> EvidenceItemOut:
@@ -113,11 +126,13 @@ async def _authorize_read(db: AsyncSession, user: User, execution: Execution) ->
 async def upload_photo(
     execution_id: UUID,
     request: Request,
+    response: Response,
     user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
     db: Annotated[AsyncSession, Depends(get_db)],
     file: Annotated[UploadFile, File()],
     sha256: Annotated[str, Form()],
     captured_at: Annotated[datetime, Form()],
+    idempotency_key: Annotated[UUID, Form()],
 ) -> EvidenceItemOut:
     execution = await _load_execution(db, execution_id)
     worker_id = await _require_owning_worker(db, user, execution)
@@ -135,7 +150,7 @@ async def upload_photo(
 
     store: ObjectStore = request.app.state.object_store
     try:
-        item = await add_photo(
+        item, created = await add_photo(
             db,
             store,
             execution=execution,
@@ -143,6 +158,7 @@ async def upload_photo(
             data=data,
             declared_sha256=sha256,
             captured_at=captured_at,
+            idempotency_key=idempotency_key,
         )
     except EvidenceIntegrityError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
@@ -150,6 +166,8 @@ async def upload_photo(
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
     await db.commit()
+    if not created:
+        response.status_code = status.HTTP_200_OK
     return _to_out(item)
 
 
@@ -161,6 +179,7 @@ async def upload_photo(
 async def upload_note(
     execution_id: UUID,
     body: EvidenceNoteRequest,
+    response: Response,
     user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> EvidenceItemOut:
@@ -172,14 +191,17 @@ async def upload_note(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Evidence note text_body must not be empty."
         )
 
-    item = await add_note(
+    item, created = await add_note(
         db,
         execution=execution,
         uploader_worker_id=worker_id,
         text_body=body.text_body,
         captured_at=body.captured_at,
+        idempotency_key=body.idempotency_key,
     )
     await db.commit()
+    if not created:
+        response.status_code = status.HTTP_200_OK
     return _to_out(item)
 
 
