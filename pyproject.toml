@@ -78,4 +78,7 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra --strict-markers --cov=app --cov-report=term-missing --cov-fail-under=70"
+addopts = "-ra --strict-markers -m 'not slow' --cov=app --cov-report=term-missing --cov-fail-under=70"
+markers = [
+    "slow: perf/e2e checks kept out of the default run; select with `-m slow`.",
+]
