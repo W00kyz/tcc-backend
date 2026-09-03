@@ -75,6 +75,9 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         default=ExecutionReviewStatus.NONE,
     )
     validation_flags: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    # Set when the app-reported device/server clock offset at sync exceeds the plausible
+    # threshold (spec Ruling 7); drives the CLOCK_SKEW review flag. NULL until Etapa 6 sync.
+    clock_skew_seconds: Mapped[float | None] = mapped_column(Float(), nullable=True)
 
 
 class GeoValidation(enum.StrEnum):
@@ -128,6 +131,11 @@ class EvidenceItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     byte_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The sync worker retries an evidence upload with the same key so a replayed request
+    # never creates a duplicate row (Etapa 6). NULL for evidence created server-side.
+    idempotency_key: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), unique=True, nullable=True
+    )
 
 
 class ManualCompletion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
