@@ -31,6 +31,7 @@ from app.domain.execution.service import (
     start_route,
 )
 from app.domain.execution.validation import (
+    FLAG_CLOCK_SKEW,
     FLAG_GPS_UNAVAILABLE,
     FLAG_OUT_OF_RADIUS,
     FLAG_OUTSIDE_SCHEDULE,
@@ -157,6 +158,8 @@ async def _do_check_in(
     idempotency_key: uuid.UUID | None = None,
     chosen_route_stop_id: uuid.UUID | None = None,
     qr_payload: str | None = None,
+    execution_id: uuid.UUID | None = None,
+    client_clock_offset_seconds: float | None = None,
 ) -> Execution:
     return await check_in(
         db,
@@ -170,6 +173,8 @@ async def _do_check_in(
         idempotency_key=idempotency_key or uuid.uuid4(),
         chosen_route_stop_id=chosen_route_stop_id,
         radius_m=_RADIUS_M,
+        execution_id=execution_id,
+        client_clock_offset_seconds=client_clock_offset_seconds,
     )
 
 
@@ -182,6 +187,7 @@ async def _do_check_out(
     scanned_at: datetime | None = None,
     checkout_idempotency_key: uuid.UUID | None = None,
     chosen_route_stop_id: uuid.UUID | None = None,
+    client_clock_offset_seconds: float | None = None,
 ) -> Execution:
     return await check_out(
         db,
@@ -195,6 +201,7 @@ async def _do_check_out(
         checkout_idempotency_key=checkout_idempotency_key or uuid.uuid4(),
         chosen_route_stop_id=chosen_route_stop_id,
         radius_m=_RADIUS_M,
+        client_clock_offset_seconds=client_clock_offset_seconds,
     )
 
 
@@ -437,6 +444,47 @@ async def test_check_in_with_a_forged_qr_is_rejected(db_session: AsyncSession) -
 
     with pytest.raises(QrSignatureInvalid):
         await _do_check_in(db_session, seed, qr_payload=forged)
+
+
+async def test_check_in_uses_app_supplied_execution_id(db_session: AsyncSession) -> None:
+    seed = await _seed(db_session)
+    fixed_id = uuid.uuid4()
+
+    execution = await _do_check_in(db_session, seed, execution_id=fixed_id)
+
+    assert execution.id == fixed_id
+
+
+async def test_check_in_large_clock_offset_flags_and_pending_review(
+    db_session: AsyncSession,
+) -> None:
+    seed = await _seed(db_session)
+
+    execution = await _do_check_in(db_session, seed, client_clock_offset_seconds=600.0)
+
+    assert execution.clock_skew_seconds == 600.0
+    assert FLAG_CLOCK_SKEW in execution.validation_flags
+    assert execution.review_status is ExecutionReviewStatus.PENDING_REVIEW
+
+
+async def test_check_in_small_clock_offset_is_not_flagged(db_session: AsyncSession) -> None:
+    seed = await _seed(db_session)
+
+    execution = await _do_check_in(db_session, seed, client_clock_offset_seconds=60.0)
+
+    assert execution.clock_skew_seconds is None
+    assert FLAG_CLOCK_SKEW not in execution.validation_flags
+
+
+async def test_check_out_large_clock_offset_flags_execution(db_session: AsyncSession) -> None:
+    seed = await _seed(db_session)
+    await _do_check_in(db_session, seed)
+
+    execution = await _do_check_out(db_session, seed, client_clock_offset_seconds=-600.0)
+
+    assert FLAG_CLOCK_SKEW in execution.validation_flags
+    assert execution.clock_skew_seconds == -600.0
+    assert execution.review_status is ExecutionReviewStatus.PENDING_REVIEW
 
 
 # --- check_out -------------------------------------------------------------------------------

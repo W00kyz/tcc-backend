@@ -15,6 +15,12 @@ FLAG_OUTSIDE_SCHEDULE = "OUTSIDE_SCHEDULE"
 FLAG_QR_SUPERSEDED = "QR_SUPERSEDED"
 FLAG_GPS_UNAVAILABLE = "GPS_UNAVAILABLE"
 FLAG_ROOM_CHOSEN_MANUALLY = "ROOM_CHOSEN_MANUALLY"
+FLAG_CLOCK_SKEW = "CLOCK_SKEW"
+
+# The app reports its measured device/server clock offset on check-in/check-out; an offset
+# past this bound is implausible and routes the execution to review (spec §3.7, §4.2).
+# spec Ruling 7 open point 1 — this threshold belongs in system_settings eventually.
+_CLOCK_SKEW_THRESHOLD_SECONDS = 300
 
 
 class ChosenStopNotOnFloor(Exception):  # noqa: N818 — a signal condition, caught by name in Task 4
@@ -134,6 +140,14 @@ def resolve_room(
         geo_validation=GeoValidation.NOT_VALIDATED,
         flags=[],
     )
+
+
+def clock_skew_flag(offset_seconds: float | None) -> list[str]:
+    """Flag a device/server clock offset whose magnitude is implausible (spec §4.2).
+    `clock_skew_flag(600.0) == ["CLOCK_SKEW"]`; `clock_skew_flag(120.0) == []`."""
+    if offset_seconds is not None and abs(offset_seconds) > _CLOCK_SKEW_THRESHOLD_SECONDS:
+        return [FLAG_CLOCK_SKEW]
+    return []
 
 
 def schedule_flag(

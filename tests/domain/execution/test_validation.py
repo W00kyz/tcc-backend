@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from app.domain.execution.models import GeoValidation
 from app.domain.execution.validation import (
+    FLAG_CLOCK_SKEW,
     FLAG_GPS_UNAVAILABLE,
     FLAG_OUT_OF_RADIUS,
     FLAG_OUTSIDE_SCHEDULE,
@@ -11,6 +12,7 @@ from app.domain.execution.validation import (
     Candidate,
     ChosenStopNotOnFloor,
     ScheduleWindow,
+    clock_skew_flag,
     resolve_room,
     schedule_flag,
 )
@@ -143,3 +145,19 @@ def test_schedule_flag_after_window_plus_grace_flags() -> None:
 def test_schedule_flag_no_window_is_empty() -> None:
     window = ScheduleWindow(arrival_from=None, arrival_to=None)
     assert schedule_flag(window, datetime(2026, 9, 1, 10, 0, tzinfo=UTC)) == []
+
+
+def test_clock_skew_flag_none_is_empty() -> None:
+    assert clock_skew_flag(None) == []
+
+
+def test_clock_skew_flag_within_threshold_is_empty() -> None:
+    assert clock_skew_flag(120.0) == []
+
+
+def test_clock_skew_flag_large_positive_offset_flags() -> None:
+    assert clock_skew_flag(600.0) == [FLAG_CLOCK_SKEW]
+
+
+def test_clock_skew_flag_large_negative_offset_flags() -> None:
+    assert clock_skew_flag(-600.0) == [FLAG_CLOCK_SKEW]

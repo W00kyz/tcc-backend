@@ -38,8 +38,9 @@ def _post_check_out(
         "scanned_at": overrides.pop("scanned_at", datetime.now(UTC).isoformat()),
         "checkout_idempotency_key": overrides.pop("checkout_idempotency_key", str(uuid.uuid4())),
     }
-    if "route_stop_id" in overrides:
-        body["route_stop_id"] = overrides.pop("route_stop_id")
+    for key in ("route_stop_id", "execution_id", "client_clock_offset_seconds"):
+        if key in overrides:
+            body[key] = overrides.pop(key)
     return client.post("/check-outs", json=body, headers={"Authorization": f"Bearer {token}"})
 
 
@@ -61,6 +62,28 @@ async def test_check_out_after_check_in_marks_done(
     # The service committed on its own session; refresh this session's stale copy.
     await db_session.refresh(seeded.stops[0])
     assert seeded.stops[0].status is RouteStopStatus.DONE
+
+
+async def test_check_out_accepts_execution_id_and_flags_clock_skew(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    token = _login(client)
+    assert _post(client, token, seeded.qr_code.public_code).status_code == 201
+
+    response = _post_check_out(
+        client,
+        token,
+        seeded.qr_code.public_code,
+        execution_id=str(uuid.uuid4()),
+        client_clock_offset_seconds=600.0,
+    )
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["execution_id"] is not None  # check-out ignores the app-supplied id
+    assert "CLOCK_SKEW" in payload["validation_flags"]
+    assert payload["review_status"] == "PENDING_REVIEW"
 
 
 async def test_check_out_no_open_check_in_422(

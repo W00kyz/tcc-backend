@@ -30,6 +30,7 @@ from app.domain.execution.validation import (
     FLAG_QR_SUPERSEDED,
     Candidate,
     ScheduleWindow,
+    clock_skew_flag,
     resolve_room,
     schedule_flag,
 )
@@ -144,10 +145,14 @@ async def check_in(
     idempotency_key: uuid.UUID,
     chosen_route_stop_id: uuid.UUID | None,
     radius_m: int,
+    execution_id: uuid.UUID | None = None,
+    client_clock_offset_seconds: float | None = None,
 ) -> Execution:
     """Floor-QR check-in: resolves the room, attaches anti-fraud flags, moves the stop to
     IN_PROGRESS. Pass `chosen_route_stop_id` on the re-submit after an `AmbiguousRoom`;
-    `latitude`/`longitude` are `None` when the device has no GPS fix."""
+    `latitude`/`longitude` are `None` when the device has no GPS fix. The offline app supplies
+    `execution_id` so a retried check-in re-uses the same row, and reports its measured
+    `client_clock_offset_seconds` (device minus server clock) so implausible skew is flagged."""
     existing = await db.scalar(
         select(Execution).where(Execution.idempotency_key == idempotency_key)
     )
@@ -174,10 +179,13 @@ async def check_in(
 
     resolved = resolution.resolved
     stop = stops[resolved.route_stop_id]
-    flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags)
+    skew_flags = clock_skew_flag(client_clock_offset_seconds)
+    flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags, skew_flags)
 
     now = datetime.now(UTC)
     execution = Execution(
+        # The offline app owns the id so a retry lands on the same row (spec Ruling 7).
+        id=execution_id or uuid.uuid4(),
         route_stop_id=stop.id,
         field_worker_id=worker_id,
         checked_in_at=scanned_at,
@@ -186,6 +194,7 @@ async def check_in(
         idempotency_key=idempotency_key,
         review_status=ExecutionReviewStatus.PENDING_REVIEW if flags else ExecutionReviewStatus.NONE,
         validation_flags=flags,
+        clock_skew_seconds=client_clock_offset_seconds if skew_flags else None,
     )
     db.add(execution)
     await db.flush()
@@ -220,9 +229,15 @@ async def check_out(
     checkout_idempotency_key: uuid.UUID,
     chosen_route_stop_id: uuid.UUID | None,
     radius_m: int,
+    execution_id: uuid.UUID | None = None,
+    client_clock_offset_seconds: float | None = None,
 ) -> Execution:
     """Close the open check-in on the scanned floor: sets `checked_out_at`, merges any new
-    flags into the execution, marks the stop DONE and its assignment EXECUTED."""
+    flags into the execution, marks the stop DONE and its assignment EXECUTED. `execution_id`
+    is accepted for API symmetry with check-in but ignored here — check-out resolves the open
+    execution by floor, it does not create one. `client_clock_offset_seconds` still flags
+    implausible skew."""
+    _ = execution_id  # unused: check-out closes an existing execution, never creates one
     existing = await db.scalar(
         select(Execution).where(Execution.checkout_idempotency_key == checkout_idempotency_key)
     )
@@ -256,7 +271,12 @@ async def check_out(
     )
 
     previous_flags = set(execution.validation_flags)
-    checkout_flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags)
+    skew_flags = clock_skew_flag(client_clock_offset_seconds)
+    checkout_flags = _merge_flags(
+        resolution.flags, _schedule_flags(stop, scanned_at), qr_flags, skew_flags
+    )
+    if skew_flags and execution.clock_skew_seconds is None:
+        execution.clock_skew_seconds = client_clock_offset_seconds
     merged = previous_flags | set(checkout_flags)
     execution.validation_flags = sorted(merged)
     if merged - previous_flags:

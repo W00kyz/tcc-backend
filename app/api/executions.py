@@ -54,6 +54,7 @@ class ExecutionListItem(BaseModel):
     source: str
     evidence_count: int
     route_id: UUID
+    clock_skew_seconds: float | None  # app-reported device/server clock offset when flagged
 
 
 class PagedExecutions(BaseModel):
@@ -118,6 +119,7 @@ def _to_item(row: ExecutionListRow) -> ExecutionListItem:
         source=row.source,
         evidence_count=row.evidence_count,
         route_id=row.route_id,
+        clock_skew_seconds=row.clock_skew_seconds,
     )
 
 

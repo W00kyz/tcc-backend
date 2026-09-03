@@ -61,6 +61,8 @@ class CheckOutRequest(BaseModel):
     scanned_at: datetime
     checkout_idempotency_key: UUID
     route_stop_id: UUID | None = None  # the worker's room choice on a re-submit
+    execution_id: UUID | None = None  # accepted for symmetry with check-in; ignored by check-out
+    client_clock_offset_seconds: float | None = None  # device minus server clock, app-measured
 
 
 class CheckOutResponse(BaseModel):
@@ -127,6 +129,8 @@ async def create_check_out(
             checkout_idempotency_key=body.checkout_idempotency_key,
             chosen_route_stop_id=body.route_stop_id,
             radius_m=radius_m,
+            execution_id=body.execution_id,
+            client_clock_offset_seconds=body.client_clock_offset_seconds,
         )
     except AmbiguousRoom as exc:
         raise _ambiguous_conflict(exc) from exc

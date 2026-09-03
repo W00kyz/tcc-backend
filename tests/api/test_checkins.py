@@ -155,8 +155,9 @@ def _post(client: TestClient, token: str, qr_payload: str, **overrides: object) 
         "scanned_at": overrides.pop("scanned_at", datetime.now(UTC).isoformat()),
         "idempotency_key": overrides.pop("idempotency_key", str(uuid.uuid4())),
     }
-    if "route_stop_id" in overrides:
-        body["route_stop_id"] = overrides.pop("route_stop_id")
+    for key in ("route_stop_id", "execution_id", "client_clock_offset_seconds"):
+        if key in overrides:
+            body[key] = overrides.pop(key)
     return client.post("/check-ins", json=body, headers={"Authorization": f"Bearer {token}"})
 
 
@@ -226,6 +227,28 @@ async def test_check_in_out_of_radius_201_pending_review(
     payload = response.json()
     assert payload["geo_validation"] == "OUT_OF_RADIUS"
     assert "OUT_OF_RADIUS" in payload["validation_flags"]
+    assert payload["review_status"] == "PENDING_REVIEW"
+
+
+async def test_check_in_echoes_app_supplied_execution_id_and_flags_clock_skew(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    token = _login(client)
+    execution_id = str(uuid.uuid4())
+
+    response = _post(
+        client,
+        token,
+        seeded.qr_code.public_code,
+        execution_id=execution_id,
+        client_clock_offset_seconds=600.0,
+    )
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["execution_id"] == execution_id
+    assert "CLOCK_SKEW" in payload["validation_flags"]
     assert payload["review_status"] == "PENDING_REVIEW"
 
 

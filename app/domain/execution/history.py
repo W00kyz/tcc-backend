@@ -75,6 +75,7 @@ class ExecutionListRow:
     source: str
     evidence_count: int
     route_id: UUID
+    clock_skew_seconds: float | None  # app-reported device/server offset, set only when flagged
 
 
 @dataclass(frozen=True)
@@ -217,6 +218,7 @@ def _to_list_row(
         source=execution.source.value,
         evidence_count=evidence_count,
         route_id=route_id,
+        clock_skew_seconds=execution.clock_skew_seconds,
     )
 
 
