@@ -92,6 +92,11 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("service_points.id")
     )
     order_index: Mapped[int] = mapped_column(Integer)
+    # Etapa 7: which service type is executed at this stop — drives the dynamic check-out
+    # form. Nullable, no backfill (spec §3.2): an existing stop with no type has no form.
+    service_type_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("service_types.id"), nullable=True
+    )
     expected_arrival_from: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

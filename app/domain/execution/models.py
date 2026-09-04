@@ -5,6 +5,7 @@ offline mode (Etapa 6) must not lie about when the work actually happened."""
 import enum
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -15,6 +16,8 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -136,6 +139,28 @@ class EvidenceItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     idempotency_key: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), unique=True, nullable=True
     )
+
+
+class Answer(UUIDPrimaryKeyMixin, Base):
+    """One persisted response to a dynamic-form question (Etapa 7, spec §3.1).
+
+    No FK to `form_questions`: `question_stable_key` is the logical link, and RF38 keeps
+    answers whose key may no longer exist in the active version. ON DELETE CASCADE — an
+    answer has no meaning without its execution."""
+
+    __tablename__ = "answers"
+    __table_args__ = (
+        UniqueConstraint(
+            "execution_id", "question_stable_key", name="uq_answers_execution_stable_key"
+        ),
+    )
+
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("executions.id", ondelete="CASCADE")
+    )
+    question_stable_key: Mapped[str] = mapped_column(String(64))
+    value_json: Mapped[Any] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ManualCompletion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
