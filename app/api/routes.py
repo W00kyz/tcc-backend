@@ -21,6 +21,7 @@ from app.api.route_view import (
     RouteOut,
     _load_route,
     _reload,
+    _resolve_forms,
     _to_route_out,
 )
 from app.db.session import get_db
@@ -149,7 +150,8 @@ async def create_route_endpoint(
         },
     )
     await db.commit()
-    return _to_route_out(await _reload(db, route.id))
+    reloaded = await _reload(db, route.id)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))
 
 
 @router.post("/occasional", response_model=list[RouteOut], status_code=status.HTTP_201_CREATED)
@@ -194,7 +196,8 @@ async def create_occasional_routes(
             },
         )
     await db.commit()
-    return [_to_route_out(await _reload(db, route.id)) for route in created]
+    reloaded = [await _reload(db, route.id) for route in created]
+    return [_to_route_out(r, await _resolve_forms(db, r)) for r in reloaded]
 
 
 def _parse_enum[FilterEnum: Enum](enum_cls: type[FilterEnum], value: str, param: str) -> FilterEnum:
@@ -230,7 +233,7 @@ async def list_routes(
     if route_status is not None:
         stmt = stmt.where(Route.status == _parse_enum(RouteStatus, route_status, "status"))
     routes = (await db.scalars(stmt)).all()
-    return [_to_route_out(route) for route in routes]
+    return [_to_route_out(route, await _resolve_forms(db, route)) for route in routes]
 
 
 @router.get("/me", response_model=list[RouteOut])
@@ -256,7 +259,7 @@ async def list_my_routes(
         .order_by(Route.created_at)
     )
     routes = (await db.scalars(stmt)).all()
-    return [_to_route_out(route) for route in routes]
+    return [_to_route_out(route, await _resolve_forms(db, route)) for route in routes]
 
 
 @router.get("/{route_id}", response_model=RouteOut)
@@ -265,7 +268,7 @@ async def get_route(route_id: UUID, _actor: _Manager, db: _Db) -> RouteOut:
     route = await _load_route(db, route_id)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-    return _to_route_out(route)
+    return _to_route_out(route, await _resolve_forms(db, route))
 
 
 @router.patch("/{route_id}", response_model=RouteOut)
@@ -323,7 +326,7 @@ async def patch_route(
         after=_route_snapshot(reloaded),
     )
     await db.commit()
-    return _to_route_out(reloaded)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))
 
 
 @router.post("/{route_id}/optimize", response_model=RouteOut)
@@ -358,7 +361,7 @@ async def optimize_route_endpoint(
         after={"stop_order": _stop_order(reloaded)},
     )
     await db.commit()
-    return _to_route_out(reloaded)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))
 
 
 @router.post("/{route_id}/reassign", response_model=RouteOut)
@@ -394,7 +397,7 @@ async def reassign_route_endpoint(
         after={"field_worker_id": str(body.field_worker_id), "reason": body.reason},
     )
     await db.commit()
-    return _to_route_out(reloaded)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))
 
 
 @router.post("/{route_id}/cancel", response_model=RouteOut)
@@ -422,7 +425,7 @@ async def cancel_route_endpoint(
         after={"status": reloaded.status.value, "reason": body.reason},
     )
     await db.commit()
-    return _to_route_out(reloaded)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))
 
 
 @router.post("/{route_id}/start", response_model=RouteOut)
@@ -462,7 +465,8 @@ async def start_route_endpoint(
         after={"status": route.status.value, "started_at": route.started_at.isoformat()},
     )
     await db.commit()
-    return _to_route_out(await _reload(db, route_id))
+    reloaded = await _reload(db, route_id)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))
 
 
 @router.post(
@@ -513,7 +517,8 @@ async def complete_stop_manually(
         after={"status": "DONE", "reason": body.reason},
     )
     await db.commit()
-    return _to_route_out(await _reload(db, route_id))
+    reloaded = await _reload(db, route_id)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))
 
 
 def _route_snapshot(route: Route) -> dict[str, object]:

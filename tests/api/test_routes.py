@@ -15,8 +15,11 @@ from app.domain.catalog.models import (
     Floor,
     PointType,
     ServicePoint,
+    ServiceType,
 )
 from app.domain.execution.models import Execution, ExecutionSource, ManualCompletion
+from app.domain.forms.models import QuestionType
+from app.domain.forms.service import add_question, get_or_create_form, publish_form
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import (
     Route,
@@ -263,6 +266,77 @@ async def test_routes_me_defaults_to_today_and_includes_geometry(
     assert body[0]["route_type"] == "REGULAR"
     assert body[0]["stops"][0]["point_type"] == "OCCASIONAL"
     assert isinstance(body[0]["stops"][1]["leg_geometry"], list)
+
+
+async def test_routes_me_embeds_the_active_form_per_stop(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    published_type = ServiceType(name="Limpeza", average_duration_minutes=30)
+    draft_only_type = ServiceType(name="Jardinagem", average_duration_minutes=45)
+    db_session.add_all([published_type, draft_only_type])
+    await db_session.flush()
+
+    published_form = await get_or_create_form(db_session, service_type_id=published_type.id)
+    await add_question(
+        db_session,
+        form_id=published_form.id,
+        prompt="Piso lavado?",
+        question_type=QuestionType.TEXT,
+        required=True,
+        options=[],
+    )
+    published_version = await publish_form(db_session, form_id=published_form.id)
+
+    draft_form = await get_or_create_form(db_session, service_type_id=draft_only_type.id)
+    await add_question(
+        db_session,
+        form_id=draft_form.id,
+        prompt="Grama aparada?",
+        question_type=QuestionType.TEXT,
+        required=False,
+        options=[],
+    )
+
+    route = Route(field_worker_id=workers[0].id, route_date=date.today())
+    db_session.add(route)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            RouteStop(
+                route_id=route.id,
+                service_point_id=points[0].id,
+                order_index=1,
+                service_type_id=published_type.id,
+            ),
+            RouteStop(route_id=route.id, service_point_id=points[1].id, order_index=2),
+            RouteStop(
+                route_id=route.id,
+                service_point_id=points[2].id,
+                order_index=3,
+                service_type_id=draft_only_type.id,
+            ),
+        ]
+    )
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    response = client.get("/routes/me", headers=_auth(token))
+
+    assert response.status_code == 200
+    stops = response.json()[0]["stops"]
+
+    assert stops[0]["service_type_name"] == "Limpeza"
+    assert stops[0]["service_type_id"] == str(published_type.id)
+    assert stops[0]["form"]["form_version_id"] == str(published_version.id)
+    assert len(stops[0]["form"]["questions"][0]["content_hash"]) == 64
+
+    assert stops[1]["service_type_id"] is None
+    assert stops[1]["service_type_name"] is None
+    assert stops[1]["form"] is None
+
+    assert stops[2]["service_type_name"] == "Jardinagem"
+    assert stops[2]["form"] is None  # only a draft version exists
 
 
 async def test_routes_me_filters_by_date(client: TestClient, db_session: AsyncSession) -> None:

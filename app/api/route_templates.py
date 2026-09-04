@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_role
-from app.api.route_view import RouteOut, _reload, _to_route_out
+from app.api.route_view import RouteOut, _reload, _resolve_forms, _to_route_out
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
 from app.domain.identity.models import User, UserRole
@@ -336,4 +336,5 @@ async def materialize_route_template(
         },
     )
     await db.commit()
-    return _to_route_out(await _reload(db, route.id))
+    reloaded = await _reload(db, route.id)
+    return _to_route_out(reloaded, await _resolve_forms(db, reloaded))

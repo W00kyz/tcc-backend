@@ -16,7 +16,7 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 if TYPE_CHECKING:
     # Avoids a real circular import at runtime — catalog does not import routing, but
     # mypy strict still wants the annotation resolvable without executing the import eagerly.
-    from app.domain.catalog.models import FieldWorker, ServicePoint
+    from app.domain.catalog.models import FieldWorker, ServicePoint, ServiceType
 
 
 class RouteType(enum.StrEnum):
@@ -115,6 +115,9 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     route: Mapped["Route"] = relationship(back_populates="stops")
     service_point: Mapped["ServicePoint"] = relationship()
+    # Etapa 7: read-only lookup for RouteStopOut.service_type_name and the embedded form.
+    # Nullable — a stop with no service_type_id has no type and no form. One-directional.
+    service_type: Mapped["ServiceType | None"] = relationship()
     # Ordered by sequence so `assignments[-1]` is always the current designation (spec §3.4):
     # reassignment appends sequence + 1, never edits an existing row. One-directional — no
     # StopAssignment.route_stop back-reference is needed by any call site today.
