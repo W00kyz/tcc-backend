@@ -467,6 +467,19 @@ async def test_check_in_large_clock_offset_flags_and_pending_review(
     assert execution.review_status is ExecutionReviewStatus.PENDING_REVIEW
 
 
+async def test_check_in_negative_clock_offset_keeps_its_sign(db_session: AsyncSession) -> None:
+    # `client_clock_offset_seconds` is server-minus-device (spec Ruling 7), so a device
+    # running fast reports a negative offset. The persisted column must keep that sign —
+    # managers read the raw value on the dashboard — even though detection uses abs().
+    seed = await _seed(db_session)
+
+    execution = await _do_check_in(db_session, seed, client_clock_offset_seconds=-600.0)
+
+    assert execution.clock_skew_seconds == -600.0
+    assert FLAG_CLOCK_SKEW in execution.validation_flags
+    assert execution.review_status is ExecutionReviewStatus.PENDING_REVIEW
+
+
 async def test_check_in_small_clock_offset_is_not_flagged(db_session: AsyncSession) -> None:
     seed = await _seed(db_session)
 

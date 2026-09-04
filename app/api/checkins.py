@@ -64,7 +64,7 @@ class CheckInRequest(BaseModel):
     idempotency_key: UUID
     route_stop_id: UUID | None = None  # the worker's room choice on a re-submit
     execution_id: UUID | None = None  # the offline app owns the id so a retry re-uses the row
-    client_clock_offset_seconds: float | None = None  # device minus server clock, app-measured
+    client_clock_offset_seconds: float | None = None  # server minus device clock (spec Ruling 7)
 
 
 class CandidateOut(BaseModel):

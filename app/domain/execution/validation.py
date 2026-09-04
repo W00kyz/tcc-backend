@@ -17,7 +17,7 @@ FLAG_GPS_UNAVAILABLE = "GPS_UNAVAILABLE"
 FLAG_ROOM_CHOSEN_MANUALLY = "ROOM_CHOSEN_MANUALLY"
 FLAG_CLOCK_SKEW = "CLOCK_SKEW"
 
-# The app reports its measured device/server clock offset on check-in/check-out; an offset
+# The app reports its measured clock offset (server minus device) on check-in/check-out; an offset
 # past this bound is implausible and routes the execution to review (spec §3.7, §4.2).
 # spec Ruling 7 open point 1 — this threshold belongs in system_settings eventually.
 _CLOCK_SKEW_THRESHOLD_SECONDS = 300

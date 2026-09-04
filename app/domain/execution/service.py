@@ -152,7 +152,7 @@ async def check_in(
     IN_PROGRESS. Pass `chosen_route_stop_id` on the re-submit after an `AmbiguousRoom`;
     `latitude`/`longitude` are `None` when the device has no GPS fix. The offline app supplies
     `execution_id` so a retried check-in re-uses the same row, and reports its measured
-    `client_clock_offset_seconds` (device minus server clock) so implausible skew is flagged."""
+    `client_clock_offset_seconds` (server minus device clock) so implausible skew is flagged."""
     existing = await db.scalar(
         select(Execution).where(Execution.idempotency_key == idempotency_key)
     )

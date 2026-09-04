@@ -35,7 +35,10 @@ from app.domain.qr.models import QrCode
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 from sqlalchemy.ext.asyncio import AsyncSession
 
-_NOW = datetime.now(UTC)
+# Anchored to a fixed noon so every relative offset below (-1h, -25h) lands on its
+# intended UTC calendar day no matter the wall-clock time the suite runs at — a bare
+# `datetime.now(UTC)` makes `test_filter_by_date_range` flaky just after UTC midnight.
+_NOW = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
 
 
 @dataclass
