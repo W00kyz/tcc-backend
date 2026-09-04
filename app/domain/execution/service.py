@@ -14,8 +14,10 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.domain.catalog.models import ServicePoint
+from app.domain.execution.answers import AnswerIn, build_answers
 from app.domain.execution.geo import haversine_meters
 from app.domain.execution.models import (
     Execution,
@@ -34,6 +36,7 @@ from app.domain.execution.validation import (
     resolve_room,
     schedule_flag,
 )
+from app.domain.forms.models import FormVersion, FormVersionStatus
 from app.domain.qr.crypto import QrPayload, decode_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
 from app.domain.routing.models import (
@@ -110,6 +113,12 @@ class NoOpenCheckIn(Exception):
 
 class StopNotOnRoute(Exception):
     """The `stop` passed to `complete_manually` does not belong to the given `route`."""
+
+
+class FormVersionMismatch(Exception):
+    """The check-out's `form_version_id`/`answers` do not fit the stop (Ruling 7): missing one
+    of the pair, a non-PUBLISHED version, the wrong service type's form, or a stop with no
+    service type at all."""
 
 
 async def start_route(
@@ -231,6 +240,8 @@ async def check_out(
     radius_m: int,
     execution_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
+    form_version_id: uuid.UUID | None = None,
+    answers: list[AnswerIn] | None = None,
 ) -> Execution:
     """Close the open check-in on the scanned floor: sets `checked_out_at`, merges any new
     flags into the execution, marks the stop DONE and its assignment EXECUTED. `execution_id`
@@ -302,6 +313,9 @@ async def check_out(
     )
     stop.status = RouteStopStatus.DONE
     await _mark_assignment_executed(db, stop.id)
+    await _persist_answers(
+        db, execution=execution, stop=stop, form_version_id=form_version_id, answers=answers
+    )
     await db.commit()
     return execution
 
@@ -374,6 +388,46 @@ async def complete_manually(
 
 
 # --- internal helpers -----------------------------------------------------------------------
+
+
+async def _persist_answers(
+    db: AsyncSession,
+    *,
+    execution: Execution,
+    stop: RouteStop,
+    form_version_id: uuid.UUID | None,
+    answers: list[AnswerIn] | None,
+) -> None:
+    """RF37/RF38 (Ruling 6): persist the check-out form answers exactly as sent, inside the
+    check-out transaction. `form_version_id` and `answers` come as a pair — one without the
+    other, or a stop with no service type, is a `FormVersionMismatch` (Ruling 7)."""
+    if form_version_id is None and answers is None:
+        return
+    if form_version_id is None or answers is None:
+        raise FormVersionMismatch(
+            "check-out needs both form_version_id and answers, or neither; "
+            f"got form_version_id={form_version_id!r}, answers={'set' if answers else None}."
+        )
+    if stop.service_type_id is None:
+        raise FormVersionMismatch(
+            f'Route stop "{stop.id}" has no service_type_id; it cannot carry form answers.'
+        )
+    version = await db.scalar(
+        select(FormVersion)
+        .where(FormVersion.id == form_version_id)
+        .options(selectinload(FormVersion.questions), selectinload(FormVersion.form))
+    )
+    if (
+        version is None
+        or version.status != FormVersionStatus.PUBLISHED
+        or version.form.service_type_id != stop.service_type_id
+    ):
+        raise FormVersionMismatch(
+            f'Form version "{form_version_id}" is not a PUBLISHED version of the form for '
+            f'service type "{stop.service_type_id}".'
+        )
+    execution.form_version_id = form_version_id
+    db.add_all(build_answers(execution_id=execution.id, form_version=version, answers=answers))
 
 
 def _guard_route(route: Route, worker_id: uuid.UUID, *, require_started: bool) -> None:

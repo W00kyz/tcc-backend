@@ -10,7 +10,7 @@ this endpoint answers 409 with the candidate list and the app re-submits with th
 so this router neither opens one nor records an audit trail for check-out."""
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -26,8 +26,10 @@ from app.api._execution_common import (
 from app.api.checkins import CandidateOut
 from app.api.deps import require_role
 from app.db.session import get_db
+from app.domain.execution.answers import AnswerIn, AnswerValidationError
 from app.domain.execution.service import (
     AmbiguousRoom,
+    FormVersionMismatch,
     NoOpenCheckIn,
     QrCodeUnknown,
     QrRevoked,
@@ -49,9 +51,16 @@ _DOMAIN_ERROR_STATUS: dict[type[Exception], int] = {
     QrRevoked: status.HTTP_422_UNPROCESSABLE_ENTITY,
     ChosenStopNotOnFloor: status.HTTP_422_UNPROCESSABLE_ENTITY,
     NoOpenCheckIn: status.HTTP_422_UNPROCESSABLE_ENTITY,
+    AnswerValidationError: status.HTTP_422_UNPROCESSABLE_ENTITY,
+    FormVersionMismatch: status.HTTP_422_UNPROCESSABLE_ENTITY,
     StopNotAssignedToWorker: status.HTTP_403_FORBIDDEN,
     RouteCancelled: status.HTTP_409_CONFLICT,
 }
+
+
+class AnswerInBody(BaseModel):
+    stable_key: str
+    value: Any
 
 
 class CheckOutRequest(BaseModel):
@@ -63,6 +72,9 @@ class CheckOutRequest(BaseModel):
     route_stop_id: UUID | None = None  # the worker's room choice on a re-submit
     execution_id: UUID | None = None  # accepted for symmetry with check-in; ignored by check-out
     client_clock_offset_seconds: float | None = None  # server minus device clock (spec Ruling 7)
+    # Etapa 7 (Ruling 5): the execution form travels with the check-out — both or neither.
+    form_version_id: UUID | None = None
+    answers: list[AnswerInBody] | None = None
 
 
 class CheckOutResponse(BaseModel):
@@ -131,6 +143,12 @@ async def create_check_out(
             radius_m=radius_m,
             execution_id=body.execution_id,
             client_clock_offset_seconds=body.client_clock_offset_seconds,
+            form_version_id=body.form_version_id,
+            answers=(
+                [AnswerIn(stable_key=a.stable_key, value=a.value) for a in body.answers]
+                if body.answers is not None
+                else None
+            ),
         )
     except AmbiguousRoom as exc:
         raise _ambiguous_conflict(exc) from exc

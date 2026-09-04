@@ -5,21 +5,28 @@ check-in on that floor to close, and two or more open check-ins answer 409 with 
 candidate list so the app can re-submit with the chosen `route_stop_id`."""
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from app.core.config import Settings
+from app.domain.catalog.models import ServiceType
+from app.domain.execution.models import Answer, Execution
+from app.domain.forms.models import FormVersion, FormVersionStatus, QuestionType
+from app.domain.forms.service import add_question, get_or_create_form, publish_form
 from app.domain.identity.models import UserRole
 from app.domain.qr.crypto import sign_qr_payload
 from app.domain.qr.models import QrCodeStatus
 from app.domain.routing.models import RouteStopStatus
 from fastapi.testclient import TestClient
 from httpx2 import Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.api.test_checkins import (
     _POINT_LAT,
     _POINT_LNG,
     _TWO_ROOMS,
+    SeededRoute,
     _add_field_worker,
     _add_user,
     _login,
@@ -38,10 +45,156 @@ def _post_check_out(
         "scanned_at": overrides.pop("scanned_at", datetime.now(UTC).isoformat()),
         "checkout_idempotency_key": overrides.pop("checkout_idempotency_key", str(uuid.uuid4())),
     }
-    for key in ("route_stop_id", "execution_id", "client_clock_offset_seconds"):
+    for key in (
+        "route_stop_id",
+        "execution_id",
+        "client_clock_offset_seconds",
+        "form_version_id",
+        "answers",
+    ):
         if key in overrides:
             body[key] = overrides.pop(key)
     return client.post("/check-outs", json=body, headers={"Authorization": f"Bearer {token}"})
+
+
+@dataclass
+class SeededForm:
+    v1_id: uuid.UUID
+    v2_id: uuid.UUID
+    draft_id: uuid.UUID
+    text_key: str
+    bool_key: str
+
+
+async def _publish_form_for_stop(db_session: AsyncSession, seeded: SeededRoute) -> SeededForm:
+    """Give the first stop a service type and a form with two published versions.
+
+    v2 is the active version; v1 is stale — the RF38 case (a check-out sent against v1)."""
+    service_type = ServiceType(name="Limpeza pesada", average_duration_minutes=30)
+    db_session.add(service_type)
+    await db_session.flush()
+    seeded.stops[0].service_type_id = service_type.id
+
+    form = await get_or_create_form(db_session, service_type_id=service_type.id)
+    for prompt, question_type in (
+        ("Observações?", QuestionType.TEXT),
+        ("Área limpa?", QuestionType.BOOLEAN),
+    ):
+        await add_question(
+            db_session,
+            form_id=form.id,
+            prompt=prompt,
+            question_type=question_type,
+            required=True,
+            options=[],
+        )
+    v1 = await publish_form(db_session, form_id=form.id)
+    text_key, bool_key = (str(q.stable_key) for q in v1.questions)
+    v1_id = v1.id
+    v2_id = (await publish_form(db_session, form_id=form.id)).id
+    draft_id = await db_session.scalar(
+        select(FormVersion.id).where(
+            FormVersion.form_id == form.id,
+            FormVersion.status == FormVersionStatus.DRAFT,
+        )
+    )
+    assert draft_id is not None
+    await db_session.commit()
+    return SeededForm(v1_id, v2_id, draft_id, text_key, bool_key)
+
+
+async def test_check_out_persists_answers_against_the_sent_version(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    form = await _publish_form_for_stop(db_session, seeded)
+    token = _login(client)
+    assert _post(client, token, seeded.qr_code.public_code).status_code == 201
+
+    key = "44444444-4444-4444-4444-444444444444"
+    answers = [
+        {"stable_key": form.text_key, "value": "tudo certo"},
+        {"stable_key": form.bool_key, "value": True},
+    ]
+    first = _post_check_out(
+        client,
+        token,
+        seeded.qr_code.public_code,
+        checkout_idempotency_key=key,
+        form_version_id=str(form.v1_id),
+        answers=answers,
+    )
+    assert first.status_code == 201, first.text
+    execution_id = uuid.UUID(first.json()["execution_id"])
+
+    execution = await db_session.get(Execution, execution_id)
+    assert execution is not None
+    await db_session.refresh(execution)
+    assert execution.form_version_id == form.v1_id  # the sent (stale) version, not active v2
+    assert form.v1_id != form.v2_id
+
+    rows = (
+        await db_session.scalars(select(Answer).where(Answer.execution_id == execution_id))
+    ).all()
+    assert {(r.question_stable_key, r.value_json) for r in rows} == {
+        (form.text_key, "tudo certo"),
+        (form.bool_key, True),
+    }
+
+    # Replay: same checkout_idempotency_key short-circuits before any answer insert.
+    second = _post_check_out(
+        client,
+        token,
+        seeded.qr_code.public_code,
+        checkout_idempotency_key=key,
+        form_version_id=str(form.v1_id),
+        answers=answers,
+    )
+    assert second.status_code == 201, second.text
+    replayed = (
+        await db_session.scalars(select(Answer).where(Answer.execution_id == execution_id))
+    ).all()
+    assert len(replayed) == 2  # no duplicates
+
+
+async def test_check_out_rejects_draft_form_version(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    form = await _publish_form_for_stop(db_session, seeded)
+    token = _login(client)
+    assert _post(client, token, seeded.qr_code.public_code).status_code == 201
+
+    response = _post_check_out(
+        client,
+        token,
+        seeded.qr_code.public_code,
+        form_version_id=str(form.draft_id),
+        answers=[
+            {"stable_key": form.text_key, "value": "x"},
+            {"stable_key": form.bool_key, "value": False},
+        ],
+    )
+
+    assert response.status_code == 422, response.text
+
+
+async def test_check_out_rejects_answers_when_stop_has_no_service_type(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    token = _login(client)
+    assert _post(client, token, seeded.qr_code.public_code).status_code == 201
+
+    response = _post_check_out(
+        client,
+        token,
+        seeded.qr_code.public_code,
+        form_version_id=str(uuid.uuid4()),
+        answers=[{"stable_key": str(uuid.uuid4()), "value": "x"}],
+    )
+
+    assert response.status_code == 422, response.text
 
 
 async def test_check_out_after_check_in_marks_done(
