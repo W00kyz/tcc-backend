@@ -62,6 +62,14 @@ class UnknownFieldWorker(Exception):
     FK IntegrityError at commit — the API layer maps this to 404 instead)."""
 
 
+class StopNotOnRoute(Exception):
+    """A `reassign_stops` stop_id does not belong to the given source route."""
+
+
+class StopNotPending(Exception):
+    """A `reassign_stops` stop_id is not PENDING — only pending stops can move routes."""
+
+
 class TemplateHasNoWorker(Exception):
     """`materialize_template` got neither a body `field_worker_id` nor a template default —
     there is no worker to assign the materialised route to (spec §5.1; the API maps this to
@@ -336,6 +344,72 @@ async def reassign_route(
     await db.flush()
     await db.refresh(route, attribute_names=["stops"])
     return route
+
+
+async def reassign_stops(
+    db: AsyncSession,
+    *,
+    source_route: Route,
+    target_route: Route,
+    stop_ids: list[uuid.UUID],
+    new_field_worker_id: uuid.UUID,
+    reason: str,
+    actor_id: uuid.UUID,
+    osrm: OsrmClient,
+) -> tuple[Route, Route]:
+    """Etapa 8 (spec Ruling 1): move the given PENDING stops from `source_route` to
+    `target_route`, appending a StopAssignment row per stop (never mutating one) — the
+    cross-route sibling of `reassign_route`, which keeps stops in place and only swaps the
+    worker. The rest of `source_route` keeps its original worker untouched. Both routes must
+    be editable; every stop_id must be a PENDING stop of `source_route`. Raises
+    `RouteNotEditable`, `UnknownFieldWorker`, `StopNotOnRoute`, `StopNotPending`."""
+    _ensure_editable(source_route)
+    _ensure_editable(target_route)
+    await ensure_field_worker_exists(db, new_field_worker_id)
+
+    source_stops = {s.id: s for s in await _ordered_stops(db, source_route)}
+    to_move = []
+    for stop_id in stop_ids:
+        stop = source_stops.get(stop_id)
+        if stop is None:
+            raise StopNotOnRoute(f'Stop "{stop_id}" is not on route "{source_route.id}".')
+        if stop.status != RouteStopStatus.PENDING:
+            raise StopNotPending(f'Stop "{stop_id}" is not PENDING.')
+        to_move.append(stop)
+
+    target_stops = await _ordered_stops(db, target_route)
+    next_index = max((s.order_index for s in target_stops), default=0) + 1
+
+    for stop in to_move:
+        assignments = await _assignments_for(db, stop)
+        current = assignments[-1] if assignments else None
+        if current is not None:
+            current.outcome = StopAssignmentOutcome.REASSIGNED
+        db.add(
+            StopAssignment(
+                route_stop_id=stop.id,
+                field_worker_id=new_field_worker_id,
+                sequence=(current.sequence + 1) if current is not None else 1,
+                assigned_by=actor_id,
+                transfer_reason=reason,
+            )
+        )
+        stop.route_id = target_route.id
+        stop.order_index = next_index
+        next_index += 1
+
+    await db.flush()
+    # Reindex what's left of source without gaps.
+    remaining = await _ordered_stops(db, source_route)
+    for index, stop in enumerate(remaining, start=1):
+        stop.order_index = index
+    await db.flush()
+
+    await _recompute_legs(db, route=source_route, osrm=osrm)
+    await _recompute_legs(db, route=target_route, osrm=osrm)
+    await db.refresh(source_route, attribute_names=["stops"])
+    await db.refresh(target_route, attribute_names=["stops"])
+    return source_route, target_route
 
 
 async def cancel_route(db: AsyncSession, *, route: Route, reason: str) -> Route:
