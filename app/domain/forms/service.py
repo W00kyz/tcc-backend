@@ -124,8 +124,13 @@ async def update_question(
 
 
 async def remove_question(db: AsyncSession, *, form_id: uuid.UUID, stable_key: uuid.UUID) -> None:
-    """Delete a question from the DRAFT version."""
-    question = await _draft_question(db, form_id, stable_key)
+    """Delete a question from the DRAFT version. Raises QuestionNotInDraft for a non-draft key."""
+    draft = await _draft_version(db, form_id)
+    question = next((q for q in draft.questions if q.stable_key == stable_key), None)
+    if question is None:
+        raise QuestionNotInDraft(f"Question {stable_key} is not in form {form_id}'s DRAFT version.")
+    # drop it from the loaded collection too, or the save-update cascade re-persists the row.
+    draft.questions.remove(question)
     await db.delete(question)
     await db.flush()
 

@@ -10,12 +10,14 @@ from app.domain.forms.models import FormVersion, FormVersionStatus, QuestionType
 from app.domain.forms.reads import to_form_overview
 from app.domain.forms.service import (
     EmptyDraft,
+    InvalidOptions,
     QuestionNotInDraft,
     ReorderMismatch,
     active_form_version,
     add_question,
     get_or_create_form,
     publish_form,
+    remove_question,
     reorder_questions,
     update_question,
 )
@@ -211,3 +213,82 @@ async def test_to_form_overview_reflects_draft_and_published(db_session: AsyncSe
     assert len(overview.draft.questions) == 1
     assert [p.version_number for p in overview.published] == [1]
     assert overview.published[0].question_count == 1
+
+
+async def test_publish_rejects_choice_question_with_too_few_options(
+    db_session: AsyncSession,
+) -> None:
+    st = await _a_service_type(db_session)
+    form = await get_or_create_form(db_session, service_type_id=st.id)
+    await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="Nível",
+        question_type=QuestionType.SINGLE_CHOICE,
+        required=True,
+        options=["só um"],
+    )
+    with pytest.raises(InvalidOptions):
+        await publish_form(db_session, form_id=form.id)
+
+
+async def test_publish_rejects_non_choice_question_carrying_options(
+    db_session: AsyncSession,
+) -> None:
+    st = await _a_service_type(db_session)
+    form = await get_or_create_form(db_session, service_type_id=st.id)
+    await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="Comentário",
+        question_type=QuestionType.TEXT,
+        required=False,
+        options=["não deveria estar aqui"],
+    )
+    with pytest.raises(InvalidOptions):
+        await publish_form(db_session, form_id=form.id)
+
+
+async def test_remove_question_drops_one_and_rejects_unknown_key(
+    db_session: AsyncSession,
+) -> None:
+    st = await _a_service_type(db_session)
+    form = await get_or_create_form(db_session, service_type_id=st.id)
+    q0 = await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="A?",
+        question_type=QuestionType.TEXT,
+        required=False,
+        options=[],
+    )
+    q1 = await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="B?",
+        question_type=QuestionType.TEXT,
+        required=False,
+        options=[],
+    )
+    await remove_question(db_session, form_id=form.id, stable_key=q0.stable_key)
+    draft = await _draft_of(db_session, form.id)
+    assert [q.stable_key for q in draft.questions] == [q1.stable_key]
+    assert draft.questions[0].order_index == 1
+    with pytest.raises(QuestionNotInDraft):
+        await remove_question(db_session, form_id=form.id, stable_key=uuid.uuid4())
+
+
+async def test_active_form_version_is_none_without_a_published_version(
+    db_session: AsyncSession,
+) -> None:
+    st = await _a_service_type(db_session)
+    form = await get_or_create_form(db_session, service_type_id=st.id)
+    await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="A?",
+        question_type=QuestionType.TEXT,
+        required=False,
+        options=[],
+    )
+    assert await active_form_version(db_session, service_type_id=st.id) is None
