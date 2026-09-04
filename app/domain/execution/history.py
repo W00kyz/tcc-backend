@@ -16,6 +16,7 @@ from uuid import UUID
 
 from sqlalchemy import ColumnElement, ScalarSelect, Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.domain.catalog.models import (
     Building,
@@ -24,6 +25,7 @@ from app.domain.catalog.models import (
     ServicePoint,
 )
 from app.domain.execution.models import (
+    Answer,
     EvidenceItem,
     Execution,
     ExecutionReviewStatus,
@@ -33,6 +35,7 @@ from app.domain.execution.models import (
     QrScan,
     QrScanKind,
 )
+from app.domain.forms.models import FormVersion
 from app.domain.routing.models import RouteStop, RouteStopStatus
 
 
@@ -108,11 +111,20 @@ class ManualCompletionRow:
 
 
 @dataclass(frozen=True)
+class AnswerDetailRow:
+    question_stable_key: str
+    prompt: str | None  # None when the key is no longer in the recorded form version (Ruling 15)
+    value: Any
+
+
+@dataclass(frozen=True)
 class ExecutionDetailRow:
     execution: ExecutionListRow
     scans: list[ExecutionScanRow]
     evidence: list[ExecutionEvidenceRow]
     manual_completion: ManualCompletionRow | None
+    form_version_id: UUID | None
+    answers: list[AnswerDetailRow]
 
 
 def _checkin_geo_subquery() -> ScalarSelect[Any]:
@@ -274,6 +286,9 @@ async def get_execution_detail(db: AsyncSession, execution_id: UUID) -> Executio
     if row is None:
         return None
 
+    form_version_id: UUID | None = row[0].form_version_id
+    answers = await _load_answers(db, execution_id, form_version_id)
+
     scans = (
         await db.scalars(
             select(QrScan).where(QrScan.execution_id == execution_id).order_by(QrScan.scanned_at)
@@ -302,7 +317,40 @@ async def get_execution_detail(db: AsyncSession, execution_id: UUID) -> Executio
             if completion is not None
             else None
         ),
+        form_version_id=form_version_id,
+        answers=answers,
     )
+
+
+async def _load_answers(
+    db: AsyncSession, execution_id: UUID, form_version_id: UUID | None
+) -> list[AnswerDetailRow]:
+    """Ruling 15 — the execution's form answers, each joined to its question prompt from the
+    version the execution recorded. No form version means no answers to surface."""
+    if form_version_id is None:
+        return []
+
+    version = await db.scalar(
+        select(FormVersion)
+        .where(FormVersion.id == form_version_id)
+        .options(selectinload(FormVersion.questions))
+    )
+    prompt_map: dict[str, str] = (
+        {str(q.stable_key): q.prompt for q in version.questions} if version is not None else {}
+    )
+    answers = (
+        await db.scalars(
+            select(Answer).where(Answer.execution_id == execution_id).order_by(Answer.created_at)
+        )
+    ).all()
+    return [
+        AnswerDetailRow(
+            question_stable_key=a.question_stable_key,
+            prompt=prompt_map.get(a.question_stable_key),
+            value=a.value_json,
+        )
+        for a in answers
+    ]
 
 
 async def resolve_review(db: AsyncSession, *, execution_id: UUID) -> Execution:

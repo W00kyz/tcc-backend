@@ -7,7 +7,7 @@ detail endpoints are pure reads; only `resolve_review` writes (the status change
 """
 
 from datetime import date, datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -91,10 +91,18 @@ class ManualCompletionOut(BaseModel):
     completed_at: datetime
 
 
+class AnswerOut(BaseModel):
+    question_stable_key: str
+    prompt: str | None  # null when the key is no longer in the recorded form version (Ruling 15)
+    value: Any
+
+
 class ExecutionDetail(ExecutionListItem):
     scans: list[ExecutionScan]
     evidence: list[ExecutionEvidence]
     manual_completion: ManualCompletionOut | None
+    form_version_id: UUID | None
+    answers: list[AnswerOut]
 
 
 class ResolveReviewRequest(BaseModel):
@@ -162,6 +170,11 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
             if completion is not None
             else None
         ),
+        form_version_id=detail.form_version_id,
+        answers=[
+            AnswerOut(question_stable_key=a.question_stable_key, prompt=a.prompt, value=a.value)
+            for a in detail.answers
+        ],
     )
 
 

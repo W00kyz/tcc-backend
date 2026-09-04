@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.api.test_checkins import _add_user, _login, _post, _seed_route
+from tests.api.test_checkouts import _post_check_out, _publish_form_for_stop
 from tests.api.test_evidence import _PHOTO_BYTES, _PHOTO_SHA, _upload_photo
 
 _MANAGER_EMAIL = "gerente@empresa.com"
@@ -154,6 +155,46 @@ async def test_get_execution_detail_includes_scans_and_evidence(
     assert len(body["evidence"]) == 1
     assert body["evidence"][0]["kind"] == "PHOTO"
     assert body["manual_completion"] is None
+    # No service-type form on this stop → no form section (Ruling 15).
+    assert body["form_version_id"] is None
+    assert body["answers"] == []
+
+
+async def test_get_execution_detail_surfaces_form_answers(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    form = await _publish_form_for_stop(db_session, seeded)
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+    worker_token = _login(client)
+    checkin = _post(client, worker_token, seeded.qr_code.public_code)
+    execution_id = checkin.json()["execution_id"]
+
+    check_out = _post_check_out(
+        client,
+        worker_token,
+        seeded.qr_code.public_code,
+        form_version_id=str(form.v1_id),
+        answers=[
+            {"stable_key": form.text_key, "value": "tudo certo"},
+            {"stable_key": form.bool_key, "value": True},
+        ],
+    )
+    assert check_out.status_code == 201, check_out.text
+
+    response = client.get(
+        f"/executions/{execution_id}",
+        headers={"Authorization": f"Bearer {_manager_token(client)}"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["form_version_id"] == str(form.v1_id)
+    by_key = {a["question_stable_key"]: a for a in body["answers"]}
+    assert by_key[form.text_key]["prompt"] == "Observações?"
+    assert by_key[form.text_key]["value"] == "tudo certo"
+    assert by_key[form.bool_key]["prompt"] == "Área limpa?"
+    assert by_key[form.bool_key]["value"] is True
 
 
 async def test_get_execution_detail_missing_404(

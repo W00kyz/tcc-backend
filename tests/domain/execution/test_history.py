@@ -12,6 +12,7 @@ from app.domain.catalog.models import (
     FieldWorker,
     Floor,
     ServicePoint,
+    ServiceType,
 )
 from app.domain.execution.history import (
     ExecutionFilters,
@@ -22,6 +23,7 @@ from app.domain.execution.history import (
     resolve_review,
 )
 from app.domain.execution.models import (
+    Answer,
     EvidenceItem,
     EvidenceKind,
     Execution,
@@ -30,6 +32,13 @@ from app.domain.execution.models import (
     GeoValidation,
     QrScan,
     QrScanKind,
+)
+from app.domain.forms.models import (
+    Form,
+    FormQuestion,
+    FormVersion,
+    FormVersionStatus,
+    QuestionType,
 )
 from app.domain.qr.models import QrCode
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
@@ -404,6 +413,78 @@ async def test_get_execution_detail_bundles_scans_and_evidence(
     assert detail.scans[0].geo_validation == "OUT_OF_RADIUS"
     assert [e.kind for e in detail.evidence] == ["NOTE"]
     assert detail.manual_completion is None
+
+
+async def _seed_form_version(db: AsyncSession, *, known_key: uuid.UUID) -> uuid.UUID:
+    service_type = ServiceType(name="Limpeza", average_duration_minutes=30)
+    db.add(service_type)
+    await db.flush()
+    form = Form(service_type_id=service_type.id, name="Inspeção de limpeza")
+    db.add(form)
+    await db.flush()
+    version = FormVersion(form_id=form.id, status=FormVersionStatus.PUBLISHED, version_number=1)
+    db.add(version)
+    await db.flush()
+    db.add(
+        FormQuestion(
+            form_version_id=version.id,
+            stable_key=known_key,
+            order_index=0,
+            prompt="Área limpa?",
+            question_type=QuestionType.BOOLEAN,
+            required=True,
+            options=[],
+        )
+    )
+    await db.flush()
+    return version.id
+
+
+async def test_get_execution_detail_surfaces_form_answers(db_session: AsyncSession) -> None:
+    world = await _seed_world(db_session)
+    known_key = uuid.uuid4()
+    version_id = await _seed_form_version(db_session, known_key=known_key)
+
+    execution = await db_session.get(Execution, world.exec_old_b)
+    assert execution is not None
+    execution.form_version_id = version_id
+    db_session.add_all(
+        [
+            Answer(
+                execution_id=world.exec_old_b,
+                question_stable_key=str(known_key),
+                value_json=True,
+            ),
+            Answer(
+                execution_id=world.exec_old_b,
+                question_stable_key=str(uuid.uuid4()),  # not in the version → prompt None
+                value_json="observação",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    detail = await get_execution_detail(db_session, world.exec_old_b)
+
+    assert detail is not None
+    assert detail.form_version_id == version_id
+    assert len(detail.answers) == 2
+    known = next(a for a in detail.answers if a.question_stable_key == str(known_key))
+    assert known.prompt == "Área limpa?"
+    assert known.value is True
+    removed = next(a for a in detail.answers if a.question_stable_key != str(known_key))
+    assert removed.prompt is None
+    assert removed.value == "observação"
+
+
+async def test_get_execution_detail_without_form_has_no_answers(db_session: AsyncSession) -> None:
+    world = await _seed_world(db_session)
+
+    detail = await get_execution_detail(db_session, world.exec_today_a)
+
+    assert detail is not None
+    assert detail.form_version_id is None
+    assert detail.answers == []
 
 
 async def test_get_execution_detail_missing_returns_none(db_session: AsyncSession) -> None:
