@@ -15,6 +15,7 @@ from app.api.evidence import router as evidence_router
 from app.api.executions import router as executions_router
 from app.api.field_workers import router as field_workers_router
 from app.api.floors import router as floors_router
+from app.api.forms import router as forms_router
 from app.api.health import router as health_router
 from app.api.qr_codes import router as qr_codes_router
 from app.api.route_templates import router as route_templates_router
@@ -129,6 +130,7 @@ def create_app(
     app.include_router(service_points_router)
     app.include_router(qr_codes_router)
     app.include_router(settings_router)
+    app.include_router(forms_router)
 
     return app
 
