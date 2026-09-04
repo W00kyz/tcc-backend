@@ -38,7 +38,13 @@ def build_answers(
         db.add_all(rows)
     """
     questions = {str(q.stable_key): q for q in form_version.questions}
+    seen_keys: set[str] = set()
     for answer in answers:
+        if answer.stable_key in seen_keys:
+            raise AnswerValidationError(
+                f'duplicate stable_key "{answer.stable_key}" in answers payload'
+            )
+        seen_keys.add(answer.stable_key)
         question = questions.get(answer.stable_key)
         if question is None:
             raise AnswerValidationError(

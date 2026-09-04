@@ -107,6 +107,20 @@ def test_multi_choice_rejects_value_outside_options() -> None:
         )
 
 
+def test_duplicate_stable_key_rejected() -> None:
+    q = _question(QuestionType.TEXT)
+    version = _version([q])
+    with pytest.raises(AnswerValidationError, match="duplicate stable_key"):
+        build_answers(
+            execution_id=uuid.uuid4(),
+            form_version=version,
+            answers=[
+                AnswerIn(str(q.stable_key), "first"),
+                AnswerIn(str(q.stable_key), "second"),
+            ],
+        )
+
+
 def test_required_question_omitted_is_not_an_error() -> None:
     answered = _question(QuestionType.TEXT)
     _required_but_omitted = _question(QuestionType.BOOLEAN)
