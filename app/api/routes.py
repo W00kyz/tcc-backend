@@ -64,6 +64,7 @@ class StopBody(BaseModel):
     service_point_id: UUID
     expected_arrival_from: datetime | None = None
     expected_arrival_to: datetime | None = None
+    service_type_id: UUID | None = None
 
 
 class RouteCreateBody(BaseModel):
@@ -112,6 +113,7 @@ def _to_stop_input(body: StopBody) -> StopInput:
         service_point_id=body.service_point_id,
         expected_arrival_from=body.expected_arrival_from,
         expected_arrival_to=body.expected_arrival_to,
+        service_type_id=body.service_type_id,
     )
 
 

@@ -487,6 +487,36 @@ async def test_manager_creates_route_with_ordered_stops(
     assert body["routing_degraded"] is False
 
 
+async def test_create_route_stop_carries_service_type(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    service_type = ServiceType(name="Limpeza", average_duration_minutes=30)
+    db_session.add(service_type)
+    await db_session.commit()
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes",
+        json={
+            "field_worker_id": str(workers[0].id),
+            "route_date": "2026-09-01",
+            "stops": [
+                {"service_point_id": str(points[0].id), "service_type_id": str(service_type.id)}
+            ],
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201
+    created = response.json()
+    assert created["stops"][0]["service_type_id"] == str(service_type.id)
+    assert created["stops"][0]["service_type_name"] == "Limpeza"
+
+    fetched = client.get(f"/routes/{created['id']}", headers=_auth(token))
+    assert fetched.json()["stops"][0]["service_type_id"] == str(service_type.id)
+
+
 async def test_create_route_writes_audit_trail(
     client: TestClient, db_session: AsyncSession
 ) -> None:
@@ -726,6 +756,48 @@ async def test_patch_route_reorders_stops(client: TestClient, db_session: AsyncS
         str(points[0].id),
     ]
     assert body["stops"][1]["leg_geometry"][0] == [points[1].longitude, points[1].latitude]
+
+
+async def test_patch_route_updates_service_type_on_existing_pending_stop(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression test for the `pending_by_point` update-in-place branch of
+    `replace_route_stops`: a PATCH that keeps an already-PENDING stop's `service_point_id`
+    but changes its `service_type_id` must persist that change, not just reorder it."""
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    first_type = ServiceType(name="Limpeza", average_duration_minutes=30)
+    second_type = ServiceType(name="Jardinagem", average_duration_minutes=45)
+    db_session.add_all([first_type, second_type])
+    await db_session.commit()
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes",
+        json={
+            "field_worker_id": str(workers[0].id),
+            "route_date": "2026-09-01",
+            "stops": [
+                {"service_point_id": str(points[0].id), "service_type_id": str(first_type.id)}
+            ],
+        },
+        headers=_auth(token),
+    ).json()
+    assert created["stops"][0]["service_type_id"] == str(first_type.id)
+
+    response = client.patch(
+        f"/routes/{created['id']}",
+        json={
+            "stops": [
+                {"service_point_id": str(points[0].id), "service_type_id": str(second_type.id)}
+            ]
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stops"][0]["service_point_id"] == str(points[0].id)
+    assert body["stops"][0]["service_type_id"] == str(second_type.id)
+    assert body["stops"][0]["service_type_name"] == "Jardinagem"
 
 
 async def test_patch_route_rejects_removing_done_stop(

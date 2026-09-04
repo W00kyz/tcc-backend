@@ -42,6 +42,7 @@ class StopInput:
     service_point_id: uuid.UUID
     expected_arrival_from: datetime | None = None
     expected_arrival_to: datetime | None = None
+    service_type_id: uuid.UUID | None = None
 
 
 class RouteNotEditable(Exception):
@@ -109,6 +110,7 @@ async def create_route(
             order_index=index,
             expected_arrival_from=item.expected_arrival_from,
             expected_arrival_to=item.expected_arrival_to,
+            service_type_id=item.service_type_id,
         )
         db.add(stop)
         await db.flush()
@@ -234,6 +236,12 @@ async def replace_route_stops(
             existing.order_index = next_index
             existing.expected_arrival_from = item.expected_arrival_from
             existing.expected_arrival_to = item.expected_arrival_to
+            existing.service_type_id = item.service_type_id
+            # Setting the FK column directly (there is no `ServiceType` object here to assign
+            # through the relationship) leaves `RouteStop.service_type` cached from before this
+            # update — expire it so the reload after this PATCH re-selects it and
+            # `RouteStopOut.service_type_name` reflects the new type, not the old one.
+            db.expire(existing, ["service_type"])
         else:
             new_stop = RouteStop(
                 route_id=route.id,
@@ -241,6 +249,7 @@ async def replace_route_stops(
                 order_index=next_index,
                 expected_arrival_from=item.expected_arrival_from,
                 expected_arrival_to=item.expected_arrival_to,
+                service_type_id=item.service_type_id,
             )
             db.add(new_stop)
             await db.flush()
