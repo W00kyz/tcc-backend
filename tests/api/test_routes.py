@@ -1101,6 +1101,52 @@ async def test_reassign_moves_route_and_appends_chain(
     assert count == 1
 
 
+async def test_stop_out_not_reassigned_hides_history(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    ).json()
+
+    stop = client.get(f"/routes/{created['id']}", headers=_auth(token)).json()["stops"][0]
+
+    assert stop["reassigned"] is False
+    assert stop["assignment_history"] is None
+
+
+async def test_stop_out_surfaces_reassignment_chain_with_names(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    ).json()
+    client.post(
+        f"/routes/{created['id']}/reassign",
+        json={"field_worker_id": str(workers[1].id), "reason": "coverage swap"},
+        headers=_auth(token),
+    )
+
+    stop = client.get(f"/routes/{created['id']}", headers=_auth(token)).json()["stops"][0]
+
+    assert stop["reassigned"] is True
+    history = stop["assignment_history"]
+    assert [row["sequence"] for row in history] == [1, 2]
+    assert [row["field_worker_id"] for row in history] == [
+        str(workers[0].id),
+        str(workers[1].id),
+    ]
+    assert [row["full_name"] for row in history] == ["João da Silva", "Maria Souza"]
+    assert all(row["assigned_by_name"] == "Larissa" for row in history)
+    assert history[0]["outcome"] == "REASSIGNED"
+    assert history[0]["transfer_reason"] is None
+    assert history[1]["transfer_reason"] == "coverage swap"
+    assert history[1]["outcome"] is None
+
+
 async def test_reassign_unknown_worker_404(client: TestClient, db_session: AsyncSession) -> None:
     manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
     token = _login(client, manager.email)

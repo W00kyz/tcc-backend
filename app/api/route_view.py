@@ -13,10 +13,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.domain.catalog.models import Floor, ServicePoint
+from app.domain.catalog.models import FieldWorker, Floor, ServicePoint
 from app.domain.forms.models import QuestionType
 from app.domain.forms.reads import FormVersionOut, to_form_version_out
 from app.domain.forms.service import active_form_version
+from app.domain.identity.models import User
 from app.domain.routing.models import Route, RouteStop
 from app.domain.routing.service import routing_degraded
 
@@ -30,6 +31,10 @@ _ROUTE_LOADERS = (
     .selectinload(Floor.building),
     selectinload(Route.field_worker),
     selectinload(Route.stops).selectinload(RouteStop.service_type),
+    # Etapa 8 (RF21): the append-only assignment chain per stop drives `reassigned` and
+    # `assignment_history`. Without this eager-load, reading `stop.assignments` in
+    # `_to_stop_out` triggers a lazy load outside the async context and raises MissingGreenlet.
+    selectinload(Route.stops).selectinload(RouteStop.assignments),
 )
 
 
@@ -55,6 +60,19 @@ class EmbeddedForm(BaseModel):
     questions: list[FormQuestionField]
 
 
+class AssignmentOut(BaseModel):
+    """One row of a stop's append-only `stop_assignments` chain (spec §3.4, RF21). Shipped
+    in `assignment_history` only when the stop was reassigned at least once; the manager
+    panel (Task 8) renders it, the mobile app ignores the field."""
+
+    field_worker_id: UUID
+    full_name: str
+    sequence: int
+    assigned_by_name: str
+    transfer_reason: str | None
+    outcome: str | None
+
+
 class RouteStopOut(BaseModel):
     id: UUID
     order_index: int
@@ -76,6 +94,10 @@ class RouteStopOut(BaseModel):
     service_type_id: UUID | None
     service_type_name: str | None
     form: EmbeddedForm | None
+    # Etapa 8 (RF21): `reassigned` is always present — mobile needs it for the "Reatribuído"
+    # badge (Task 11). `assignment_history` is populated only when `reassigned` is True, else null.
+    reassigned: bool
+    assignment_history: list[AssignmentOut] | None
 
 
 class RouteOut(BaseModel):
@@ -125,7 +147,55 @@ async def _resolve_forms(db: AsyncSession, route: Route) -> dict[uuid.UUID, Form
     return form_map
 
 
-def _to_stop_out(stop: RouteStop, form_map: dict[uuid.UUID, FormVersionOut]) -> RouteStopOut:
+async def _resolve_assignment_names(
+    db: AsyncSession, route: Route
+) -> tuple[dict[uuid.UUID, str], dict[uuid.UUID, str]]:
+    """Map every field-worker id and every `assigned_by` user id used across ALL of the route's
+    assignment chains to a display name — one batched query each, not one per assignment (same
+    N+1 discipline as `_resolve_forms`). Chains are usually empty, so both maps often are too."""
+    worker_ids = {a.field_worker_id for stop in route.stops for a in stop.assignments}
+    user_ids = {a.assigned_by for stop in route.stops for a in stop.assignments}
+    worker_names: dict[uuid.UUID, str] = {}
+    user_names: dict[uuid.UUID, str] = {}
+    if worker_ids:
+        worker_rows = await db.execute(
+            select(FieldWorker.id, FieldWorker.full_name).where(FieldWorker.id.in_(worker_ids))
+        )
+        worker_names = {row.id: row.full_name for row in worker_rows}
+    if user_ids:
+        user_rows = await db.execute(select(User.id, User.name).where(User.id.in_(user_ids)))
+        user_names = {row.id: row.name for row in user_rows}
+    return worker_names, user_names
+
+
+def _to_assignment_history(
+    stop: RouteStop,
+    worker_names: dict[uuid.UUID, str],
+    user_names: dict[uuid.UUID, str],
+) -> list[AssignmentOut] | None:
+    # `reassigned` = more than one row in the append-only chain (spec §4): at least one transfer
+    # happened. The whole chain is only shipped in that case.
+    if len(stop.assignments) <= 1:
+        return None
+    return [
+        AssignmentOut(
+            field_worker_id=a.field_worker_id,
+            full_name=worker_names.get(a.field_worker_id, ""),
+            sequence=a.sequence,
+            assigned_by_name=user_names.get(a.assigned_by, ""),
+            transfer_reason=a.transfer_reason,
+            outcome=a.outcome.value if a.outcome is not None else None,
+        )
+        for a in stop.assignments
+    ]
+
+
+def _to_stop_out(
+    stop: RouteStop,
+    form_map: dict[uuid.UUID, FormVersionOut],
+    worker_names: dict[uuid.UUID, str],
+    user_names: dict[uuid.UUID, str],
+) -> RouteStopOut:
     point = stop.service_point
     form = form_map.get(stop.service_type_id) if stop.service_type_id is not None else None
     return RouteStopOut(
@@ -147,10 +217,14 @@ def _to_stop_out(stop: RouteStop, form_map: dict[uuid.UUID, FormVersionOut]) -> 
         service_type_id=stop.service_type_id,
         service_type_name=stop.service_type.name if stop.service_type is not None else None,
         form=_to_embedded_form(form) if form is not None else None,
+        reassigned=len(stop.assignments) > 1,
+        assignment_history=_to_assignment_history(stop, worker_names, user_names),
     )
 
 
-def _to_route_out(route: Route, form_map: dict[uuid.UUID, FormVersionOut]) -> RouteOut:
+async def _to_route_out(db: AsyncSession, route: Route) -> RouteOut:
+    form_map = await _resolve_forms(db, route)
+    worker_names, user_names = await _resolve_assignment_names(db, route)
     return RouteOut(
         id=route.id,
         field_worker_id=route.field_worker_id,
@@ -163,7 +237,7 @@ def _to_route_out(route: Route, form_map: dict[uuid.UUID, FormVersionOut]) -> Ro
         routing_degraded=routing_degraded(route),
         # Route.stops is order_by="RouteStop.order_index" and every service function reloads it
         # in that order — no re-sort needed here.
-        stops=[_to_stop_out(stop, form_map) for stop in route.stops],
+        stops=[_to_stop_out(stop, form_map, worker_names, user_names) for stop in route.stops],
     )
 
 
