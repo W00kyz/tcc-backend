@@ -97,12 +97,31 @@ class AnswerOut(BaseModel):
     value: Any
 
 
+class ExecutionAssignmentOut(BaseModel):
+    """One row of the stop's append-only assignment chain (RF21), surfaced on the execution
+    detail so the manager panel (Task 8) can show who was originally designated and why the
+    stop moved. Named distinctly from `app.api.route_view.AssignmentOut`: FastAPI dedupes
+    OpenAPI component schemas by class name, so two different classes sharing one name would
+    silently clobber each other in the contract (Task 5 hit this)."""
+
+    field_worker_id: UUID
+    full_name: str
+    sequence: int
+    assigned_by_name: str
+    transfer_reason: str | None
+    outcome: str | None
+
+
 class ExecutionDetail(ExecutionListItem):
     scans: list[ExecutionScan]
     evidence: list[ExecutionEvidence]
     manual_completion: ManualCompletionOut | None
     form_version_id: UUID | None
     answers: list[AnswerOut]
+    # Etapa 8 (RF21): `reassigned` is always present; `assignment_history` is the ordered chain,
+    # populated only when `reassigned` is True, else null.
+    reassigned: bool
+    assignment_history: list[ExecutionAssignmentOut] | None
 
 
 class ResolveReviewRequest(BaseModel):
@@ -175,6 +194,22 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
             AnswerOut(question_stable_key=a.question_stable_key, prompt=a.prompt, value=a.value)
             for a in detail.answers
         ],
+        reassigned=detail.reassigned,
+        assignment_history=(
+            [
+                ExecutionAssignmentOut(
+                    field_worker_id=a.field_worker_id,
+                    full_name=a.full_name,
+                    sequence=a.sequence,
+                    assigned_by_name=a.assigned_by_name,
+                    transfer_reason=a.transfer_reason,
+                    outcome=a.outcome,
+                )
+                for a in detail.assignment_history
+            ]
+            if detail.assignment_history is not None
+            else None
+        ),
     )
 
 
