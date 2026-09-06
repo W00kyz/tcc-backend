@@ -39,14 +39,14 @@ from app.domain.impediments.service import (
     list_pending,
     reassign_impediment,
 )
-from app.domain.impediments.service import StopNotPending as ImpedimentStopNotPending
+from app.domain.impediments.service import StopNotReassignable as ImpedimentStopNotReassignable
 from app.domain.routing.models import Route, RouteStop
 from app.domain.routing.service import (
     RouteNotEditable,
     StopNotOnRoute,
     UnknownFieldWorker,
 )
-from app.domain.routing.service import StopNotPending as RoutingStopNotPending
+from app.domain.routing.service import StopNotReassignable as RoutingStopNotReassignable
 
 router = APIRouter(tags=["impediments"])
 
@@ -55,18 +55,18 @@ _FieldWorker = Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))]
 _Db = Annotated[AsyncSession, Depends(get_db)]
 
 # Every impediment-service and reassign-stops failure the endpoints translate to an HTTP
-# status by exact type. Both `StopNotPending` variants (the impediment guard at report time
-# and the `reassign_stops` guard at move time) mean the same thing to a caller — a stop that
-# can no longer move — so both land on 409.
+# status by exact type. Both `StopNotReassignable` variants (the impediment guard at report
+# time and the `reassign_stops` guard at move time) mean the same thing to a caller — a stop
+# that can no longer move (it is DONE) — so both land on 409.
 _DOMAIN_ERROR_STATUS: dict[type[Exception], int] = {
     ImpedimentNotFound: status.HTTP_404_NOT_FOUND,
     RouteNotInProgress: status.HTTP_409_CONFLICT,
-    ImpedimentStopNotPending: status.HTTP_409_CONFLICT,
+    ImpedimentStopNotReassignable: status.HTTP_409_CONFLICT,
     AlreadyResolved: status.HTTP_409_CONFLICT,
     NoAffectedStops: status.HTTP_409_CONFLICT,
     NoRouteForDate: status.HTTP_409_CONFLICT,
     SameRouteReassignment: status.HTTP_409_CONFLICT,
-    RoutingStopNotPending: status.HTTP_409_CONFLICT,
+    RoutingStopNotReassignable: status.HTTP_409_CONFLICT,
     StopNotOnRoute: status.HTTP_409_CONFLICT,
     RouteNotEditable: status.HTTP_409_CONFLICT,
     UnknownFieldWorker: status.HTTP_404_NOT_FOUND,

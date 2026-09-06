@@ -1,4 +1,4 @@
-# ruff: noqa: N818 — RouteNotInProgress / StopNotPending / AlreadyResolved name the signal
+# ruff: noqa: N818 — RouteNotInProgress / StopNotReassignable / AlreadyResolved name the signal
 # condition the caller catches by name, same convention as app/domain/forms/service.py.
 """Impediment reports service: register a field worker's impediment, list the PENDING queue
 for the manager, rank reassignment candidates by PostGIS distance and current load, and
@@ -39,8 +39,9 @@ class RouteNotInProgress(ImpedimentError):
     """The route is not IN_PROGRESS, so no impediment can be reported against it."""
 
 
-class StopNotPending(ImpedimentError):
-    """A STOP-scope impediment targets a stop that is not PENDING."""
+class StopNotReassignable(ImpedimentError):
+    """A STOP-scope impediment targets a stop that can no longer move — it is neither PENDING
+    (never reached) nor IN_PROGRESS (checked in, stuck); a DONE stop is finished work."""
 
 
 class AlreadyResolved(ImpedimentError):
@@ -79,20 +80,24 @@ async def create_impediment(
     stops (STOP).
 
     Raises RouteNotInProgress unless `route.status == IN_PROGRESS`. For scope=STOP also
-    raises StopNotPending unless `route_stop.status == PENDING` — a ROUTE_REMAINDER report
-    validates no individual stop; the route may have zero pending stops right now and the
-    request is still recorded, since "nothing left to reassign" only matters at reassign
-    time, not at report time."""
+    raises StopNotReassignable unless `route_stop.status` is PENDING (never reached) or
+    IN_PROGRESS (checked in, then hit a wall) — a worker who checked in and then can't
+    finish must still be able to signal it. A DONE stop is finished work and cannot move.
+    A ROUTE_REMAINDER report validates no individual stop; the route may have zero pending
+    stops right now and the request is still recorded, since "nothing left to reassign"
+    only matters at reassign time, not at report time."""
     if route.status != RouteStatus.IN_PROGRESS:
         raise RouteNotInProgress(
             f"Route {route.id} has status {route.status}; expected IN_PROGRESS."
         )
     if scope == ImpedimentScope.STOP and (
-        route_stop is None or route_stop.status != RouteStopStatus.PENDING
+        route_stop is None
+        or route_stop.status not in (RouteStopStatus.PENDING, RouteStopStatus.IN_PROGRESS)
     ):
         actual = route_stop.status if route_stop is not None else None
-        raise StopNotPending(
-            f"Route stop {route_stop and route_stop.id} has status {actual}; expected PENDING."
+        raise StopNotReassignable(
+            f"Route stop {route_stop and route_stop.id} has status {actual}; "
+            f"expected PENDING or IN_PROGRESS."
         )
     impediment = Impediment(
         route_id=route.id,
@@ -186,15 +191,19 @@ async def candidates_for(db: AsyncSession, *, impediment: Impediment) -> list[Ca
             )
             if not required_type_ids.issubset(worker_type_ids):
                 continue
-        pending = [s for s in candidate_route.stops if s.status == RouteStopStatus.PENDING]
-        if not pending:
+        open_stops = [
+            s
+            for s in candidate_route.stops
+            if s.status in (RouteStopStatus.PENDING, RouteStopStatus.IN_PROGRESS)
+        ]
+        if not open_stops:
             continue
         # PERF: one ST_DistanceSphere query per (candidate pending stop, affected point) pair —
         # acceptable for the real volume (few field workers, few points per impediment). A
         # future version could compose this into a single query with unnest/subquery if the
         # volume grows; not worth the complexity now (YAGNI).
         best: float | None = None
-        for cand_stop in pending:
+        for cand_stop in open_stops:
             cp = cand_stop.service_point
             for target_point in target_points.values():
                 dist = await db.scalar(
@@ -214,7 +223,7 @@ async def candidates_for(db: AsyncSession, *, impediment: Impediment) -> list[Ca
                 field_worker_id=worker.id,
                 full_name=worker.full_name,
                 distance_m=float(best),
-                pending_stop_count=len(pending),
+                pending_stop_count=len(open_stops),
             )
         )
     results.sort(key=lambda c: (c.distance_m, c.pending_stop_count))
@@ -239,7 +248,7 @@ async def reassign_impediment(
     Raises AlreadyResolved if already resolved; NoAffectedStops if scope=ROUTE_REMAINDER and
     the route has no PENDING stop left; NoRouteForDate if `new_field_worker_id` has no
     PLANNED/IN_PROGRESS route on that date; SameRouteReassignment if that route IS the impeded
-    route itself. Also propagates `reassign_stops`' own StopNotOnRoute, StopNotPending,
+    route itself. Also propagates `reassign_stops`' own StopNotOnRoute, StopNotReassignable,
     RouteNotEditable and UnknownFieldWorker."""
     if impediment.status == ImpedimentStatus.RESOLVED:
         raise AlreadyResolved(f"Impediment {impediment.id} is already RESOLVED; expected PENDING.")
@@ -292,9 +301,9 @@ async def reassign_impediment(
 
 
 async def _affected_stops(db: AsyncSession, impediment: Impediment) -> list[RouteStop]:
-    """The stop(s) an impediment covers: the one route_stop for STOP, or every PENDING stop of
-    the impeded route for ROUTE_REMAINDER (ordered — same order `reassign_stops` re-indexes
-    the target route in)."""
+    """The stop(s) an impediment covers: the one route_stop for STOP, or every still-open
+    (PENDING or IN_PROGRESS) stop of the impeded route for ROUTE_REMAINDER (ordered — same
+    order `reassign_stops` re-indexes the target route in)."""
     if impediment.scope == ImpedimentScope.STOP:
         stop = await db.get(RouteStop, impediment.route_stop_id)
         return [stop] if stop is not None else []
@@ -302,7 +311,7 @@ async def _affected_stops(db: AsyncSession, impediment: Impediment) -> list[Rout
         select(RouteStop)
         .where(
             RouteStop.route_id == impediment.route_id,
-            RouteStop.status == RouteStopStatus.PENDING,
+            RouteStop.status.in_([RouteStopStatus.PENDING, RouteStopStatus.IN_PROGRESS]),
         )
         .order_by(RouteStop.order_index)
     )

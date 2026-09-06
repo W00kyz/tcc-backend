@@ -41,7 +41,7 @@ from app.domain.routing.models import (
     RouteType,
     StopAssignment,
 )
-from app.domain.routing.service import StopInput, StopNotPending, create_route
+from app.domain.routing.service import StopInput, StopNotReassignable, create_route
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -328,7 +328,7 @@ async def test_reassign_impediment_rejects_same_route_target(db_session: AsyncSe
 async def test_reassign_impediment_mixed_batch_is_all_or_nothing(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TOCTOU guard: if one stop in a ROUTE_REMAINDER batch became non-PENDING between
+    """TOCTOU guard: if one stop in a ROUTE_REMAINDER batch became DONE between
     impediment creation and reassignment, `reassign_stops` rejects the whole batch and no
     stop is moved. Simulated by having `_affected_stops` hand back a stale (now-DONE) stop
     alongside the good ones."""
@@ -353,7 +353,7 @@ async def test_reassign_impediment_mixed_batch_is_all_or_nothing(
 
     monkeypatch.setattr(impediments_service, "_affected_stops", _stale_affected)
 
-    with pytest.raises(StopNotPending):
+    with pytest.raises(StopNotReassignable):
         await reassign_impediment(
             db_session,
             impediment=imp,

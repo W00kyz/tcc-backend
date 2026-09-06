@@ -254,6 +254,37 @@ async def test_candidates_tiebreak_prefers_lighter_load(db_session: AsyncSession
     assert (candidates[0].pending_stop_count, candidates[1].pending_stop_count) == (1, 2)
 
 
+async def test_candidates_count_in_progress_stop_as_load(db_session: AsyncSession) -> None:
+    # F1 fix: an IN_PROGRESS stop on a candidate's own route is still load they carry, so it
+    # counts toward pending_stop_count and the tiebreak.
+    world = await _world(db_session)
+    st_a = await world.service_type("Limpeza")
+    affected_point = await world.point(latitude=0.0, longitude=0.0)
+    impeded_worker = await world.worker(full_name="Impedido", service_type_ids=[st_a.id])
+    impeded_route = await world.route_with_stops(
+        worker=impeded_worker,
+        status=RouteStatus.IN_PROGRESS,
+        stops=[(affected_point, st_a.id)],
+    )
+    impeded_stop = (await _stops_of(db_session, impeded_route))[0]
+    imp = await world.impediment(
+        route=impeded_route, scope=ImpedimentScope.STOP, route_stop=impeded_stop
+    )
+
+    busy = await world.worker(full_name="Ocupado", service_type_ids=[st_a.id])
+    await world.route_with_stops(
+        worker=busy,
+        status=RouteStatus.IN_PROGRESS,
+        stops=[(await world.point(latitude=0.0, longitude=0.03), None)],
+        stop_status=RouteStopStatus.IN_PROGRESS,
+    )
+
+    candidates = await candidates_for(db_session, impediment=imp)
+
+    assert [c.field_worker_id for c in candidates] == [busy.id]
+    assert candidates[0].pending_stop_count == 1
+
+
 async def test_candidates_route_remainder_requires_every_service_type(
     db_session: AsyncSession,
 ) -> None:

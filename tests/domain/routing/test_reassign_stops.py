@@ -25,7 +25,7 @@ from app.domain.routing.service import (
     RouteNotEditable,
     StopInput,
     StopNotOnRoute,
-    StopNotPending,
+    StopNotReassignable,
     UnknownFieldWorker,
     create_route,
     reassign_stops,
@@ -266,7 +266,7 @@ async def test_reassign_stops_rejects_stop_not_on_source_route(db_session: Async
         )
 
 
-async def test_reassign_stops_rejects_non_pending_stop(db_session: AsyncSession) -> None:
+async def test_reassign_stops_rejects_done_stop(db_session: AsyncSession) -> None:
     manager, worker_a, worker_b, points = await _seed(db_session, n_points=4)
     source = await create_route(
         db_session,
@@ -292,7 +292,7 @@ async def test_reassign_stops_rejects_non_pending_stop(db_session: AsyncSession)
     source.stops[0].status = RouteStopStatus.DONE
     await db_session.flush()
 
-    with pytest.raises(StopNotPending):
+    with pytest.raises(StopNotReassignable):
         await reassign_stops(
             db_session,
             source_route=source,
@@ -303,6 +303,52 @@ async def test_reassign_stops_rejects_non_pending_stop(db_session: AsyncSession)
             actor_id=manager.id,
             osrm=FakeOsrmClient(),
         )
+
+
+async def test_reassign_stops_moves_in_progress_stop_and_resets_it_to_pending(
+    db_session: AsyncSession,
+) -> None:
+    # F1 fix (Ruling P3): an IN_PROGRESS stop (impeded worker checked in, then stuck) still
+    # moves — and the substitute starts it clean, so its status is reset to PENDING.
+    manager, worker_a, worker_b, points = await _seed(db_session, n_points=4)
+    source = await create_route(
+        db_session,
+        field_worker_id=worker_a.id,
+        route_date=_ROUTE_DATE,
+        route_type=RouteType.REGULAR,
+        scheduled_start_at=None,
+        stops=[StopInput(service_point_id=p.id) for p in points[:2]],
+        actor_id=manager.id,
+        osrm=FakeOsrmClient(),
+    )
+    target = await create_route(
+        db_session,
+        field_worker_id=worker_b.id,
+        route_date=_ROUTE_DATE,
+        route_type=RouteType.REGULAR,
+        scheduled_start_at=None,
+        stops=[StopInput(service_point_id=p.id) for p in points[2:]],
+        actor_id=manager.id,
+        osrm=FakeOsrmClient(),
+    )
+    moved_stop_id = source.stops[0].id
+    source.stops[0].status = RouteStopStatus.IN_PROGRESS
+    await db_session.flush()
+
+    await reassign_stops(
+        db_session,
+        source_route=source,
+        target_route=target,
+        stop_ids=[moved_stop_id],
+        new_field_worker_id=worker_b.id,
+        reason="reason",
+        actor_id=manager.id,
+        osrm=FakeOsrmClient(),
+    )
+
+    moved = next(s for s in target.stops if s.id == moved_stop_id)
+    assert moved.route_id == target.id
+    assert moved.status == RouteStopStatus.PENDING
 
 
 async def test_reassign_stops_rejects_not_editable_source_route(db_session: AsyncSession) -> None:

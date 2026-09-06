@@ -242,7 +242,7 @@ async def test_report_when_route_not_in_progress_is_409(
     assert response.status_code == 409
 
 
-async def test_report_stop_not_pending_is_409(client: TestClient, db_session: AsyncSession) -> None:
+async def test_report_stop_done_is_409(client: TestClient, db_session: AsyncSession) -> None:
     fx = await _seed(db_session)
     stop = await db_session.get(RouteStop, fx.source.stops[0].id)
     assert stop is not None
@@ -257,6 +257,26 @@ async def test_report_stop_not_pending_is_409(client: TestClient, db_session: As
     )
 
     assert response.status_code == 409
+
+
+async def test_report_stop_in_progress_is_201(client: TestClient, db_session: AsyncSession) -> None:
+    # F1 fix (Ruling P3): a worker who checked in (stop → IN_PROGRESS) and then hit a wall
+    # must still be able to signal the impediment — no 409.
+    fx = await _seed(db_session)
+    stop = await db_session.get(RouteStop, fx.source.stops[0].id)
+    assert stop is not None
+    stop.status = RouteStopStatus.IN_PROGRESS
+    await db_session.commit()
+    token = _login(client, fx.worker_a_user.email)
+
+    response = client.post(
+        f"/routes/{fx.source.id}/impediments",
+        json=_report_body(route_stop_id=str(fx.source.stops[0].id)),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "PENDING"
 
 
 async def test_report_forbidden_for_manager(client: TestClient, db_session: AsyncSession) -> None:
@@ -448,8 +468,9 @@ async def test_reassign_same_route_target_is_409(
 async def test_reassign_stale_stop_propagates_409(
     client: TestClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A stop that stopped being PENDING between the report and the reassign (moved by another
-    path) makes `reassign_stops` reject the batch — propagated as 409 via StopNotPending."""
+    """A stop that became DONE between the report and the reassign (finished by another
+    path) makes `reassign_stops` reject the batch — propagated as 409 via
+    StopNotReassignable."""
     fx = await _seed(db_session, source_points=2, target_points=1)
     stale = await db_session.get(RouteStop, fx.source.stops[1].id)
     assert stale is not None

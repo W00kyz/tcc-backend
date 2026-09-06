@@ -9,7 +9,7 @@ from app.domain.impediments.models import ImpedimentReason, ImpedimentScope
 from app.domain.impediments.service import (
     AlreadyResolved,
     RouteNotInProgress,
-    StopNotPending,
+    StopNotReassignable,
     create_impediment,
     dismiss_impediment,
     list_pending,
@@ -69,7 +69,7 @@ async def test_create_impediment_stop_scope_rejects_route_not_in_progress(
         )
 
 
-async def test_create_impediment_stop_scope_rejects_stop_not_pending(
+async def test_create_impediment_stop_scope_rejects_done_stop(
     db_session: AsyncSession,
 ) -> None:
     stop, worker = await seed_route_with_one_stop(db_session)
@@ -78,7 +78,7 @@ async def test_create_impediment_stop_scope_rejects_stop_not_pending(
     stop.status = RouteStopStatus.DONE
     await db_session.flush()
 
-    with pytest.raises(StopNotPending):
+    with pytest.raises(StopNotReassignable):
         await create_impediment(
             db_session,
             route=route,
@@ -89,6 +89,32 @@ async def test_create_impediment_stop_scope_rejects_stop_not_pending(
             reported_by_id=worker.id,
             reported_at=datetime.now(UTC),
         )
+
+
+async def test_create_impediment_stop_scope_accepts_in_progress_stop(
+    db_session: AsyncSession,
+) -> None:
+    # A worker who checked in (stop → IN_PROGRESS) and then hit a wall must still be able
+    # to signal the impediment (F1 fix, Ruling P3).
+    stop, worker = await seed_route_with_one_stop(db_session)
+    route = await db_session.get(Route, stop.route_id)
+    assert route is not None
+    stop.status = RouteStopStatus.IN_PROGRESS
+    await db_session.flush()
+
+    impediment = await create_impediment(
+        db_session,
+        route=route,
+        route_stop=stop,
+        scope=ImpedimentScope.STOP,
+        reason=ImpedimentReason.HEALTH_ISSUE,
+        note=None,
+        reported_by_id=worker.id,
+        reported_at=datetime.now(UTC),
+    )
+
+    assert impediment.route_stop_id == stop.id
+    assert impediment.status.value == "PENDING"
 
 
 async def test_create_impediment_route_remainder_scope_has_no_route_stop(

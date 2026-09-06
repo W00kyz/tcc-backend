@@ -66,8 +66,9 @@ class StopNotOnRoute(Exception):
     """A `reassign_stops` stop_id does not belong to the given source route."""
 
 
-class StopNotPending(Exception):
-    """A `reassign_stops` stop_id is not PENDING — only pending stops can move routes."""
+class StopNotReassignable(Exception):
+    """A `reassign_stops` stop_id is a DONE stop — finished work never moves routes. A PENDING
+    (never reached) or IN_PROGRESS (checked in, then impeded) stop is still reassignable."""
 
 
 class TemplateHasNoWorker(Exception):
@@ -357,12 +358,15 @@ async def reassign_stops(
     actor_id: uuid.UUID,
     osrm: OsrmClient,
 ) -> tuple[Route, Route]:
-    """Etapa 8 (spec Ruling 1): move the given PENDING stops from `source_route` to
+    """Etapa 8 (spec Ruling 1): move the given still-open stops from `source_route` to
     `target_route`, appending a StopAssignment row per stop (never mutating one) — the
     cross-route sibling of `reassign_route`, which keeps stops in place and only swaps the
     worker. The rest of `source_route` keeps its original worker untouched. Both routes must
-    be editable; every stop_id must be a PENDING stop of `source_route`. Raises
-    `RouteNotEditable`, `UnknownFieldWorker`, `StopNotOnRoute`, `StopNotPending`."""
+    be editable; every stop_id must be a PENDING or IN_PROGRESS stop of `source_route` (a
+    DONE stop is finished work and raises `StopNotReassignable`). A moved stop's status is
+    reset to PENDING — the substitute starts it clean; any partial check-in by the impeded
+    worker is abandoned, though their `Execution` row stays for the audit history. Raises
+    `RouteNotEditable`, `UnknownFieldWorker`, `StopNotOnRoute`, `StopNotReassignable`."""
     _ensure_editable(source_route)
     _ensure_editable(target_route)
     await ensure_field_worker_exists(db, new_field_worker_id)
@@ -373,8 +377,10 @@ async def reassign_stops(
         stop = source_stops.get(stop_id)
         if stop is None:
             raise StopNotOnRoute(f'Stop "{stop_id}" is not on route "{source_route.id}".')
-        if stop.status != RouteStopStatus.PENDING:
-            raise StopNotPending(f'Stop "{stop_id}" is not PENDING.')
+        if stop.status not in (RouteStopStatus.PENDING, RouteStopStatus.IN_PROGRESS):
+            raise StopNotReassignable(
+                f'Stop "{stop_id}" has status {stop.status}; expected PENDING or IN_PROGRESS.'
+            )
         to_move.append(stop)
 
     target_stops = await _ordered_stops(db, target_route)
@@ -396,6 +402,9 @@ async def reassign_stops(
         )
         stop.route_id = target_route.id
         stop.order_index = next_index
+        # The substitute starts the stop clean: an IN_PROGRESS stop the impeded worker
+        # checked into is reset to PENDING (their Execution row is left for the audit trail).
+        stop.status = RouteStopStatus.PENDING
         next_index += 1
 
     await db.flush()
