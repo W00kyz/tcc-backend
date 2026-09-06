@@ -65,7 +65,8 @@ class Impediment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Device-local clock (Etapa 6 offline-first): when the worker actually reported it,
     # possibly before the request reaches the server.
     reported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    # Server clock: when the request was received — the field the manager's queue orders by.
+    # Server clock: when the request was received, reconciled against the device-local
+    # `reported_at` (the manager's queue orders by `reported_at`, not this field).
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
