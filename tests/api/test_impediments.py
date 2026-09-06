@@ -292,6 +292,44 @@ async def test_report_forbidden_for_manager(client: TestClient, db_session: Asyn
     assert response.status_code == 403
 
 
+async def test_report_note_over_column_length_is_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    # F1 fix: a 501-char note exceeds the `impediments.note` column (`String(500)`); the
+    # Pydantic `max_length=500` guard must reject it with 422, not let Postgres 500.
+    fx = await _seed(db_session)
+    token = _login(client, fx.worker_a_user.email)
+    body = _report_body(route_stop_id=str(fx.source.stops[0].id))
+    body["note"] = "x" * 501
+
+    response = client.post(
+        f"/routes/{fx.source.id}/impediments",
+        json=body,
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 422, response.text
+
+
+async def test_report_remainder_forces_route_stop_id_null(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    # F3 fix (spec §3): `route_stop_id` is meaningless for a ROUTE_REMAINDER report; a stray
+    # non-null id in the body is dropped, not persisted.
+    fx = await _seed(db_session)
+    token = _login(client, fx.worker_a_user.email)
+    body = _report_body(route_stop_id=str(fx.source.stops[0].id), scope="ROUTE_REMAINDER")
+
+    response = client.post(
+        f"/routes/{fx.source.id}/impediments",
+        json=body,
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["route_stop_id"] is None
+
+
 # --- GET /impediments (manager) -------------------------------------------------------
 
 

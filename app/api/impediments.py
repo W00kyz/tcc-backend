@@ -77,7 +77,9 @@ class ImpedimentReportBody(BaseModel):
     route_stop_id: UUID | None = None
     scope: ImpedimentScope
     reason: ImpedimentReason
-    note: str | None = None
+    # Bounded to match the `impediments.note` column (`String(500)`) and spec §3 —
+    # an over-long note would otherwise reach Postgres and raise a 500.
+    note: str | None = Field(default=None, max_length=500)
     reported_at: datetime
 
 

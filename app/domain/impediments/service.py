@@ -99,6 +99,11 @@ async def create_impediment(
             f"Route stop {route_stop and route_stop.id} has status {actual}; "
             f"expected PENDING or IN_PROGRESS."
         )
+    # spec §3: `route_stop_id` is meaningless for a ROUTE_REMAINDER report ("nulo
+    # quando scope=ROUTE_REMAINDER"). Drop any stop the caller passed rather than
+    # reject it — a stray id is harmless to forgive and never load-bearing here.
+    if scope != ImpedimentScope.STOP:
+        route_stop = None
     impediment = Impediment(
         route_id=route.id,
         route_stop_id=route_stop.id if route_stop is not None else None,
