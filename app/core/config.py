@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     minio_secret_key: str = "change_me_in_local_env"
     minio_bucket_evidence: str = "evidence"
     minio_secure: bool = False
+    # Start the APScheduler interval job that runs the alert scan (spec §2 Ruling 1).
+    # Tests set this False so entering the app lifespan never starts a background scheduler.
+    alerts_scheduler_enabled: bool = True
 
 
 @lru_cache

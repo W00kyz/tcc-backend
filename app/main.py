@@ -29,6 +29,7 @@ from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
 from app.core.object_store import MinioObjectStore, ObjectStore
 from app.db.session import build_engine, build_session_factory
+from app.domain.monitoring.scheduler import build_alert_scheduler, run_scan_once
 from app.domain.routing.osrm import HttpxOsrmClient, OsrmClient
 
 
@@ -91,7 +92,22 @@ def create_app(
         # class, not the Protocol, so it needs no @runtime_checkable.
         if isinstance(resolved_store, MinioObjectStore):
             await resolved_store.ensure_bucket()
+
+        # The alert scan runs on a background interval (spec §2 Ruling 1). AsyncIOScheduler needs
+        # a running loop; the lifespan runs inside one, so start() works here. The job opens its
+        # own session — the scheduler has no request scope.
+        if settings.alerts_scheduler_enabled:
+
+            async def _scan_job() -> None:
+                await run_scan_once(_app.state.session_factory)
+
+            _app.state.alert_scheduler = build_alert_scheduler(_scan_job)
+
         yield
+
+        scheduler = getattr(_app.state, "alert_scheduler", None)
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
         # Only close the client we built above (real-OSRM branch only).
         if owned_httpx_client is not None:
             await owned_httpx_client.aclose()

@@ -54,6 +54,7 @@ def test_settings(postgres_url: str) -> Settings:
         qr_signing_private_key_hex="11" * 32,  # 32 bytes, deterministic test key
         mail_smtp_host="localhost",
         mail_smtp_port=1,  # no automated test should actually be able to connect here
+        alerts_scheduler_enabled=False,  # entering the app lifespan must not start a scheduler
     )
 
 
