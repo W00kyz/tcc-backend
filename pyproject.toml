@@ -88,6 +88,11 @@ plugins = ["pydantic.mypy"]
 module = "apscheduler.*"
 ignore_missing_imports = true
 
+# XlsxWriter 3.2.9 ships no py.typed marker, so mypy can't see its types.
+[[tool.mypy.overrides]]
+module = "xlsxwriter.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
