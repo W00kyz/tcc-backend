@@ -58,22 +58,28 @@ async def _probe(url: str) -> tuple[list[str], list[str], list[tuple[int, str, b
 def test_migration_round_trips_and_seeds_notice_v1(postgres_url: str) -> None:
     cfg = _alembic_config(postgres_url)
 
-    command.downgrade(cfg, "-1")
-    tables, settings_cols, _ = asyncio.run(_probe(postgres_url))
-    assert tables == []
-    assert "worker_position_retention_days" not in settings_cols
-    assert "evidence_retention_days" not in settings_cols
+    # Target the Etapa 9 head by id, not "-1": later etapas stack migrations on top of this
+    # one, and a relative "-1" would then reverse the wrong revision. The try/finally makes
+    # sure a mid-test failure can never leave the shared session container downgraded.
+    try:
+        command.downgrade(cfg, "8433dd2af4fe")
+        tables, settings_cols, _ = asyncio.run(_probe(postgres_url))
+        assert tables == []
+        assert "worker_position_retention_days" not in settings_cols
+        assert "evidence_retention_days" not in settings_cols
 
-    command.upgrade(cfg, "head")
-    tables, settings_cols, notices = asyncio.run(_probe(postgres_url))
-    assert sorted(tables) == sorted(_PRIVACY_TABLES)
-    assert "worker_position_retention_days" in settings_cols
-    assert "evidence_retention_days" in settings_cols
+        command.upgrade(cfg, "head")
+        tables, settings_cols, notices = asyncio.run(_probe(postgres_url))
+        assert sorted(tables) == sorted(_PRIVACY_TABLES)
+        assert "worker_position_retention_days" in settings_cols
+        assert "evidence_retention_days" in settings_cols
 
-    current = [n for n in notices if n[2]]
-    assert len(current) == 1
-    assert current[0][0] == 1  # version
-    assert current[0][1]  # body_markdown non-empty
+        current = [n for n in notices if n[2]]
+        assert len(current) == 1
+        assert current[0][0] == 1  # version
+        assert current[0][1]  # body_markdown non-empty
+    finally:
+        command.upgrade(cfg, "head")
 
 
 async def test_only_one_current_notice_allowed(db_session: AsyncSession) -> None:

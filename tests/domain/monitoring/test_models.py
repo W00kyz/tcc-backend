@@ -159,13 +159,17 @@ def test_migration_round_trips_clean_and_seeds_alert_rules(postgres_url: str) ->
     inside an already-running event loop."""
     cfg = _alembic_config(postgres_url)
 
-    command.downgrade(cfg, "1212c573b12e")
-    tables, enums, _ = asyncio.run(_schema_probe(postgres_url))
-    assert tables == []
-    assert enums == []
+    # try/finally: a mid-test failure must never leave the shared session container downgraded.
+    try:
+        command.downgrade(cfg, "1212c573b12e")
+        tables, enums, _ = asyncio.run(_schema_probe(postgres_url))
+        assert tables == []
+        assert enums == []
 
-    command.upgrade(cfg, "head")
-    tables, enums, rule_kinds = asyncio.run(_schema_probe(postgres_url))
-    assert sorted(tables) == sorted(_MONITORING_TABLES)
-    assert sorted(enums) == sorted(_MONITORING_ENUMS)
-    assert {AlertKind(k) for k in rule_kinds} == set(AlertKind)
+        command.upgrade(cfg, "head")
+        tables, enums, rule_kinds = asyncio.run(_schema_probe(postgres_url))
+        assert sorted(tables) == sorted(_MONITORING_TABLES)
+        assert sorted(enums) == sorted(_MONITORING_ENUMS)
+        assert {AlertKind(k) for k in rule_kinds} == set(AlertKind)
+    finally:
+        command.upgrade(cfg, "head")
