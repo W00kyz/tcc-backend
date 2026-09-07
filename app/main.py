@@ -18,6 +18,7 @@ from app.api.floors import router as floors_router
 from app.api.forms import router as forms_router
 from app.api.health import router as health_router
 from app.api.impediments import router as impediments_router
+from app.api.me import router as me_router
 from app.api.monitoring import router as monitoring_router
 from app.api.notifications import router as notifications_router
 from app.api.qr_codes import router as qr_codes_router
@@ -157,6 +158,7 @@ def create_app(
     app.include_router(settings_router)
     app.include_router(forms_router)
     app.include_router(impediments_router)
+    app.include_router(me_router)
     app.include_router(monitoring_router)
     app.include_router(notifications_router)
     app.include_router(worker_positions_router)
