@@ -47,7 +47,7 @@ def _report() -> ComplianceReport:
             field_worker_name="João Conceição",
             service_type_name=None,
             building_name="Bloco CN",
-            route_status="DONE",
+            route_status="Concluída",
         ),
         periods=rows,
         totals=totals,

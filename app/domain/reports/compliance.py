@@ -49,6 +49,17 @@ class ReportGranularity(enum.StrEnum):
     MONTHLY = "MONTHLY"
 
 
+# The pt-BR label for each route status — `filters_applied` is the human-readable struct
+# (spec §2 Ruling 8), so `route_status` carries the display label, not the raw enum value.
+# These strings must match the dashboard i18n (`routeStatus*` / `reportsRouteStatus*`).
+_ROUTE_STATUS_LABELS: dict[RouteStatus, str] = {
+    RouteStatus.PLANNED: "Planejada",
+    RouteStatus.IN_PROGRESS: "Em andamento",
+    RouteStatus.CANCELLED: "Cancelada",
+    RouteStatus.DONE: "Concluída",
+}
+
+
 # The 13 absolute indicators, in report order. Kept as a tuple so the totals row and the
 # zero-fill both iterate the exact same set instead of restating 13 field names.
 _METRIC_FIELDS: tuple[str, ...] = (
@@ -287,11 +298,14 @@ async def _resolve_filters_applied(db: AsyncSession, filters: ReportFilters) -> 
     if filters.building_id is not None:
         building = await db.get(Building, filters.building_id)
         building_name = building.name if building is not None else None
+    status_label: str | None = None
+    if filters.route_status is not None:
+        status_label = _ROUTE_STATUS_LABELS[RouteStatus(filters.route_status)]
     return FilterApplied(
         field_worker_name=worker_name,
         service_type_name=service_type_name,
         building_name=building_name,
-        route_status=filters.route_status,
+        route_status=status_label,
     )
 
 

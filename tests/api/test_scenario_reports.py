@@ -86,6 +86,10 @@ _IN_PROGRESS_ROUTE_INDEX = 21
 _MANUAL_COMPLETION_STOP = (1, 0)  # (índice da rota, índice do stop) — conclusão manual, sem foto
 _FLAGGED_STOP = (2, 0)  # execução com review_status PENDING_REVIEW
 _REASSIGNED_STOP = (0, 0)  # stop com >= 2 linhas em stop_assignments
+# Uma execução sem evidência e sem conclusão manual: sem essa linha discriminante todas as 42
+# execuções teriam evidência e `executions_with_evidence == executions_total`, mascarando uma
+# regressão no filtro de evidência que degradasse para "conta todas as execuções".
+_BARE_EXECUTION_STOP = (0, 1)
 _IMPEDIMENT_ROUTE_INDEX = 4
 _ALERT_ROUTE_INDEX = 6
 
@@ -169,6 +173,10 @@ def _build_plan() -> list[_RouteSpec]:
     )
     ri, si = _REASSIGNED_STOP
     plan[ri].stops[si].reassigned = True
+    ri, si = _BARE_EXECUTION_STOP
+    plan[ri].stops[si].execution = _ExecSpec(
+        has_evidence=False, has_manual_completion=False, flagged=False
+    )
     return plan
 
 

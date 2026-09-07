@@ -35,6 +35,7 @@ from app.domain.impediments.models import (
 )
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity
 from app.domain.reports.compliance import (
+    _ROUTE_STATUS_LABELS,
     ComplianceRow,
     ReportGranularity,
     build_compliance_report,
@@ -468,7 +469,13 @@ async def test_route_status_cancelled_filter(db_session: AsyncSession) -> None:
     )
     assert [r.period_start for r in report.periods] == [date(2026, 8, 28)]
     _assert_row(report.periods[0], "2026-08-28", date(2026, 8, 28), **_D2, completion_rate=0.0)
-    assert report.filters_applied.route_status == "CANCELLED"
+    # `filters_applied` is the human-readable struct (spec §2 Ruling 8) — pt-BR label, not enum.
+    assert report.filters_applied.route_status == "Cancelada"
+
+
+def test_route_status_labels_cover_every_member() -> None:
+    # A future RouteStatus member must fail loudly here rather than KeyError at request time.
+    assert set(_ROUTE_STATUS_LABELS) == set(RouteStatus)
 
 
 async def test_filters_applied_resolves_worker_name(db_session: AsyncSession) -> None:
