@@ -26,6 +26,7 @@ from app.api.service_points import router as service_points_router
 from app.api.service_types import router as service_types_router
 from app.api.settings import router as settings_router
 from app.api.users import router as users_router
+from app.api.worker_positions import router as worker_positions_router
 from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
 from app.core.object_store import MinioObjectStore, ObjectStore
@@ -155,6 +156,7 @@ def create_app(
     app.include_router(forms_router)
     app.include_router(impediments_router)
     app.include_router(monitoring_router)
+    app.include_router(worker_positions_router)
 
     return app
 

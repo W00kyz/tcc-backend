@@ -69,6 +69,9 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "PT", "
 # NoActiveRoute / RouteStopMissing are signal conditions the check-in and check-out routers
 # catch by name to raise their own HTTPException — same convention as execution/service.py.
 "app/api/_execution_common.py" = ["N818"]
+# PositionNotAccepted names the condition the worker-positions router catches by name to
+# answer 409 (the app's cue to stop reporting) — same convention as execution/service.py.
+"app/domain/monitoring/positions.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.13"
