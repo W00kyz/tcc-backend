@@ -20,6 +20,7 @@ from app.core.security import hash_password
 from app.db.session import get_db
 from app.domain.identity.models import User
 from app.domain.identity.service import authenticate_user, record_logout
+from app.domain.privacy.service import current_notice, has_consented, record_consent
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -33,6 +34,18 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    consent_required: bool
+
+
+class NoticeOut(BaseModel):
+    version: int
+    title: str
+    body_markdown: str
+
+
+class ConsentStatusOut(BaseModel):
+    consent_required: bool
+    notice: NoticeOut | None = None
 
 
 class RefreshRequest(BaseModel):
@@ -58,6 +71,8 @@ async def login(
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid e-mail or password.")
 
+    consent_required = not await has_consented(db, user_id=user.id)
+
     return TokenResponse(
         access_token=create_access_token(
             user_id=user.id,
@@ -68,6 +83,7 @@ async def login(
         refresh_token=create_refresh_token(
             user_id=user.id, secret=settings.jwt_secret_key, days=settings.jwt_refresh_token_days
         ),
+        consent_required=consent_required,
     )
 
 
@@ -109,6 +125,37 @@ async def logout(
 ) -> None:
     client_ip = request.client.host if request.client else "unknown"
     await record_logout(db, user=user, ip_address=client_ip)
+
+
+@router.post("/consent", response_model=ConsentStatusOut)
+async def accept_consent(
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ConsentStatusOut:
+    await record_consent(
+        db,
+        user_id=user.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    await db.commit()
+    return ConsentStatusOut(consent_required=False)
+
+
+@router.get("/consent-status", response_model=ConsentStatusOut)
+async def consent_status(
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ConsentStatusOut:
+    notice = await current_notice(db)
+    required = not await has_consented(db, user_id=user.id)
+    return ConsentStatusOut(
+        consent_required=required,
+        notice=NoticeOut(
+            version=notice.version, title=notice.title, body_markdown=notice.body_markdown
+        ),
+    )
 
 
 class PasswordResetRequest(BaseModel):
