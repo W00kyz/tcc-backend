@@ -37,6 +37,7 @@ from app.domain.execution.service import (
     start_route,
 )
 from app.domain.identity.models import User, UserRole
+from app.domain.monitoring.notifications import notify_route_assigned
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteType
 from app.domain.routing.osrm import OsrmUnavailable
 from app.domain.routing.service import (
@@ -150,6 +151,12 @@ async def create_route_endpoint(
             "stop_count": len(route.stops),
         },
     )
+    # RF49 — notify the assigned worker. In the same transaction as the route write (the
+    # brief's call: the Notification row is cheap and one transaction is simpler); the
+    # best-effort `push.send` is already isolated inside `notify_route_assigned`.
+    await notify_route_assigned(
+        db, route=route, kind="ROUTE_ASSIGNED", push=request.app.state.push_sender
+    )
     await db.commit()
     reloaded = await _reload(db, route.id)
     return await _to_route_out(db, reloaded)
@@ -195,6 +202,10 @@ async def create_occasional_routes(
                 "route_type": route.route_type.value,
                 "stop_count": len(route.stops),
             },
+        )
+        # RF49 — one ROUTE_ASSIGNED per created route (each route is one worker's copy).
+        await notify_route_assigned(
+            db, route=route, kind="ROUTE_ASSIGNED", push=request.app.state.push_sender
         )
     await db.commit()
     reloaded = [await _reload(db, route.id) for route in created]
@@ -326,6 +337,12 @@ async def patch_route(
         before=before,
         after=_route_snapshot(reloaded),
     )
+    # RF49 — always notify ROUTE_MODIFIED on a successful PATCH. A manager editing a route is
+    # a real event for the worker; distinguishing a "meaningful" change from a no-op echo is
+    # not worth the complexity for this etapa, and a pure-no-op PATCH is already rare.
+    await notify_route_assigned(
+        db, route=reloaded, kind="ROUTE_MODIFIED", push=request.app.state.push_sender
+    )
     await db.commit()
     return await _to_route_out(db, reloaded)
 
@@ -367,7 +384,7 @@ async def optimize_route_endpoint(
 
 @router.post("/{route_id}/reassign", response_model=RouteOut)
 async def reassign_route_endpoint(
-    route_id: UUID, body: ReassignBody, actor: _Manager, db: _Db
+    route_id: UUID, body: ReassignBody, request: Request, actor: _Manager, db: _Db
 ) -> RouteOut:
     route = await _load_route(db, route_id)
     if route is None:
@@ -396,6 +413,10 @@ async def reassign_route_endpoint(
         action="reassign",
         before=before,
         after={"field_worker_id": str(body.field_worker_id), "reason": body.reason},
+    )
+    # RF49 — the route's field_worker_id is already the new worker; notify them.
+    await notify_route_assigned(
+        db, route=reloaded, kind="ROUTE_ASSIGNED", push=request.app.state.push_sender
     )
     await db.commit()
     return await _to_route_out(db, reloaded)

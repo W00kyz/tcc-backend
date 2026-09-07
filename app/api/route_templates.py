@@ -21,6 +21,7 @@ from app.api.route_view import RouteOut, _reload, _to_route_out
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
 from app.domain.identity.models import User, UserRole
+from app.domain.monitoring.notifications import notify_route_assigned
 from app.domain.routing.models import RouteType
 from app.domain.routing.service import (
     TemplateHasNoWorker,
@@ -334,6 +335,10 @@ async def materialize_route_template(
             "route_date": body.route_date.isoformat(),
             "stop_count": len(route.stops),
         },
+    )
+    # RF49 — a materialised template is a freshly assigned route for its worker.
+    await notify_route_assigned(
+        db, route=route, kind="ROUTE_ASSIGNED", push=request.app.state.push_sender
     )
     await db.commit()
     reloaded = await _reload(db, route.id)

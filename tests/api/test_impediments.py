@@ -26,6 +26,7 @@ from app.domain.impediments.models import (
     ImpedimentScope,
     ImpedimentStatus,
 )
+from app.domain.monitoring.models import Notification
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus, RouteType
 from app.domain.routing.service import StopInput, create_route
 from app.main import create_app
@@ -444,6 +445,30 @@ async def test_reassign_moves_stop_and_resolves(
         .where(AuditTrail.entity_type == "impediment", AuditTrail.action == "reassign")
     )
     assert audit_count == 1
+
+
+async def test_reassign_notifies_the_target_route_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed(db_session)
+    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
+    token = _login(client, fx.manager.email)
+
+    response = client.post(
+        f"/impediments/{imp.id}/reassign",
+        json={"field_worker_id": str(fx.worker_b.id), "reason": "afastamento medico"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    notes = (
+        await db_session.scalars(
+            select(Notification).where(Notification.user_id == fx.worker_b_user.id)
+        )
+    ).all()
+    assert len(notes) == 1
+    assert notes[0].kind == "STOP_REASSIGNED"
+    assert notes[0].data["route_id"] == str(fx.target.id)
 
 
 async def test_reassign_already_resolved_is_409(

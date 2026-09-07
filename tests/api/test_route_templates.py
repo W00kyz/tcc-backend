@@ -18,6 +18,7 @@ from app.domain.catalog.models import (
     ServicePoint,
 )
 from app.domain.identity.models import User, UserRole
+from app.domain.monitoring.models import Notification
 from app.domain.routing.models import Route
 from app.main import create_app
 from fastapi.testclient import TestClient
@@ -391,6 +392,30 @@ async def test_materialize_builds_a_route_from_the_template(
     assert route is not None
     assert route.template_id is not None
     assert str(route.template_id) == created["id"]
+
+
+async def test_materialize_notifies_the_assigned_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, worker_user, workers, points = await _seed(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/route-templates", json=_template_payload(points, worker=workers[0]), headers=_auth(token)
+    ).json()
+
+    response = client.post(
+        f"/route-templates/{created['id']}/materialize",
+        json={"route_date": "2026-09-07"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201
+    notes = (
+        await db_session.scalars(select(Notification).where(Notification.user_id == worker_user.id))
+    ).all()
+    assert len(notes) == 1
+    assert notes[0].kind == "ROUTE_ASSIGNED"
+    assert notes[0].data["route_id"] == response.json()["id"]
 
 
 async def test_materialize_occasional_template_sets_route_type(

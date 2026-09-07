@@ -13,6 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api._execution_common import current_worker
@@ -40,7 +41,8 @@ from app.domain.impediments.service import (
     reassign_impediment,
 )
 from app.domain.impediments.service import StopNotReassignable as ImpedimentStopNotReassignable
-from app.domain.routing.models import Route, RouteStop
+from app.domain.monitoring.notifications import notify_route_assigned
+from app.domain.routing.models import Route, RouteStatus, RouteStop
 from app.domain.routing.service import (
     RouteNotEditable,
     StopNotOnRoute,
@@ -257,6 +259,27 @@ async def reassign(
             "reason": body.reason,
         },
     )
+    # RF49 — the affected stop(s) moved onto the target worker's route for the same date.
+    # `reassign_impediment` returns the impediment, not the routes, so re-resolve the target
+    # route the same way the service did (worker + date + PLANNED/IN_PROGRESS).
+    source_route = await db.get(Route, impediment.route_id)
+    if source_route is not None:
+        target_route = (
+            await db.scalars(
+                select(Route).where(
+                    Route.field_worker_id == body.field_worker_id,
+                    Route.route_date == source_route.route_date,
+                    Route.status.in_([RouteStatus.PLANNED, RouteStatus.IN_PROGRESS]),
+                )
+            )
+        ).first()
+        if target_route is not None:
+            await notify_route_assigned(
+                db,
+                route=target_route,
+                kind="STOP_REASSIGNED",
+                push=request.app.state.push_sender,
+            )
     await db.commit()
     await db.refresh(impediment)
     return _to_out(impediment)

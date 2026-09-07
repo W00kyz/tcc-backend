@@ -21,6 +21,7 @@ from app.domain.execution.models import Execution, ExecutionSource, ManualComple
 from app.domain.forms.models import QuestionType
 from app.domain.forms.service import add_question, get_or_create_form, publish_form
 from app.domain.identity.models import User, UserRole
+from app.domain.monitoring.models import Notification
 from app.domain.routing.models import (
     Route,
     RouteStatus,
@@ -30,6 +31,7 @@ from app.domain.routing.models import (
     StopAssignmentOutcome,
 )
 from app.main import create_app
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -534,6 +536,128 @@ async def test_create_route_writes_audit_trail(
         .where(AuditTrail.entity_type == "route", AuditTrail.action == "create")
     )
     assert count == 1
+
+
+class _ExplodingPushSender:
+    """An `app.state.push_sender` that always raises — proves the notification row survives a
+    push failure (spec §2 Ruling 3)."""
+
+    async def send(
+        self, *, user_id: object, title: str, body: str, data: dict[str, object]
+    ) -> None:
+        raise RuntimeError("FCM is down")
+
+
+async def _worker_notifications(db_session: AsyncSession, user_id: object) -> list[Notification]:
+    rows = await db_session.scalars(select(Notification).where(Notification.user_id == user_id))
+    return list(rows.all())
+
+
+async def test_create_route_notifies_the_assigned_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    )
+
+    assert response.status_code == 201
+    notes = await _worker_notifications(db_session, worker_user.id)
+    assert len(notes) == 1
+    assert notes[0].kind == "ROUTE_ASSIGNED"
+    assert notes[0].user_id == worker_user.id
+    assert notes[0].data["route_id"] == response.json()["id"]
+
+
+async def test_create_route_for_worker_without_login_sends_no_notification(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes", json=_create_route_payload(workers[1], [points[0]]), headers=_auth(token)
+    )
+
+    assert response.status_code == 201
+    assert (await db_session.scalars(select(Notification))).all() == []
+
+
+async def test_create_route_survives_a_failing_push_sender(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.state.push_sender = _ExplodingPushSender()
+    token = _login(client, manager.email)
+
+    response = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    )
+
+    assert response.status_code == 201
+    notes = await _worker_notifications(db_session, worker_user.id)
+    assert len(notes) == 1
+    assert notes[0].kind == "ROUTE_ASSIGNED"
+
+
+async def test_patch_route_notifies_the_worker_of_the_modification(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    ).json()
+
+    response = client.patch(
+        f"/routes/{created['id']}", json={"route_date": "2026-10-05"}, headers=_auth(token)
+    )
+
+    assert response.status_code == 200
+    notes = await _worker_notifications(db_session, worker_user.id)
+    kinds = sorted(note.kind for note in notes)
+    assert kinds == ["ROUTE_ASSIGNED", "ROUTE_MODIFIED"]
+
+
+async def test_reassign_route_notifies_the_new_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, _worker_user, workers, points = await _seed_actors_and_points(db_session)
+    new_user = User(
+        name="Pedro",
+        email="pedro@empresa.com",
+        password_hash=hash_password(_PASSWORD),
+        role=UserRole.FIELD_WORKER,
+    )
+    db_session.add(new_user)
+    await db_session.flush()
+    new_worker = FieldWorker(
+        full_name="Pedro Lima",
+        contractor_company_id=workers[0].contractor_company_id,
+        user_id=new_user.id,
+    )
+    db_session.add(new_worker)
+    await db_session.commit()
+    token = _login(client, manager.email)
+    created = client.post(
+        "/routes", json=_create_route_payload(workers[0], [points[0]]), headers=_auth(token)
+    ).json()
+
+    response = client.post(
+        f"/routes/{created['id']}/reassign",
+        json={"field_worker_id": str(new_worker.id), "reason": "coverage swap"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200
+    notes = await _worker_notifications(db_session, new_user.id)
+    assert len(notes) == 1
+    assert notes[0].kind == "ROUTE_ASSIGNED"
+    assert notes[0].data["route_id"] == created["id"]
 
 
 async def test_field_worker_cannot_create_route(
