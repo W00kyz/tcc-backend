@@ -129,3 +129,28 @@ async def test_update_settings_stamps_actor_and_timestamp(db_session: AsyncSessi
     assert row.check_radius_meters == 250
     assert row.updated_by == actor.id
     assert row.updated_at is not None
+
+
+async def test_update_settings_writes_only_the_passed_alert_field(
+    db_session: AsyncSession,
+) -> None:
+    actor = User(
+        name="admin",
+        email="admin@empresa.com",
+        password_hash=hash_password(_PASSWORD),
+        role=UserRole.ADMIN,
+    )
+    db_session.add(actor)
+    await db_session.flush()
+
+    row = await update_settings(db_session, actor_id=actor.id, late_stop_tolerance_min=20)
+    await db_session.commit()
+
+    assert row.late_stop_tolerance_min == 20
+    # The other five Etapa 9 defaults and the radius stay untouched.
+    assert row.check_radius_meters == 50
+    assert row.alert_scan_interval_seconds == 60
+    assert row.late_start_tolerance_min == 15
+    assert row.absence_tolerance_min == 30
+    assert row.no_evidence_grace_min == 30
+    assert row.position_report_interval_seconds == 60
