@@ -29,6 +29,7 @@ from app.core.config import Settings, get_settings
 from app.core.mail import Mailer, SmtpMailer
 from app.core.object_store import MinioObjectStore, ObjectStore
 from app.db.session import build_engine, build_session_factory
+from app.domain.monitoring.push import LoggingPushSender
 from app.domain.monitoring.scheduler import build_alert_scheduler, run_scan_once
 from app.domain.routing.osrm import HttpxOsrmClient, OsrmClient
 
@@ -128,6 +129,9 @@ def create_app(
     )
     app.state.osrm_client = resolved_osrm
     app.state.object_store = resolved_store
+    # Dev/CI push seam (spec §2 Ruling 3): logs, never hits the network. `notifications` is the
+    # canonical record; real FCM/APNs delivery is documented future work.
+    app.state.push_sender = LoggingPushSender()
 
     app.include_router(health_router)
     app.include_router(auth_router)
