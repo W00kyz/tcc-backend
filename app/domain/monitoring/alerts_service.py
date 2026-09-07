@@ -22,10 +22,6 @@ class AlertError(Exception):
     """Base class for the alert-lifecycle signal conditions the router catches by name."""
 
 
-class AlertNotFound(AlertError):
-    """No `alerts` row for the id the router was given — mapped to 404."""
-
-
 class AlertAlreadyResolved(AlertError):
     """The alert is RESOLVED and cannot be acknowledged again — mapped to 409."""
 

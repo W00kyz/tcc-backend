@@ -255,3 +255,28 @@ async def test_field_worker_forbidden(client: TestClient, db_session: AsyncSessi
     response = client.get("/monitoring/stream", headers={"Authorization": f"Bearer {token}"})
 
     assert response.status_code == 403
+
+
+async def test_manager_gets_an_event_stream_response(
+    client: TestClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Route-level smoke test: the mounted endpoint runs the manager through auth, releases its
+    auth DB session (F-1) and answers 200 with the SSE content type. The stream body is swapped
+    for a finite generator here — httpx's ASGITransport buffers the response and cannot drain an
+    open-ended one."""
+
+    async def _finite_stream(*_args: object, **_kwargs: object) -> AsyncGenerator[str]:
+        yield ": ready\n\n"
+
+    monkeypatch.setattr(monitoring, "board_event_stream", _finite_stream)
+
+    seed = await _seed_actors(db_session)
+    await db_session.commit()
+    token = client.post(
+        "/auth/login", json={"email": seed.manager.email, "password": _PASSWORD}
+    ).json()["access_token"]
+
+    response = client.get("/monitoring/stream", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")

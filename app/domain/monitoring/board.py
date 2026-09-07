@@ -73,7 +73,7 @@ class BoardSnapshot(BaseModel):
 
 
 async def build_board(db: AsyncSession, *, now: datetime) -> BoardSnapshot:
-    """Load routes+stops, board alerts and the latest GPS fix per worker — three queries, no
+    """Load routes+stops, board alerts and the latest GPS fix per worker — four queries, no
     N+1 — and fold them into a `BoardSnapshot`."""
     routes = await _load_routes(db, now)
     alerts = await _load_board_alerts(db, [route.id for route in routes])

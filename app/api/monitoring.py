@@ -12,7 +12,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.deps import require_role
@@ -99,9 +99,13 @@ async def board_event_stream(
 
 
 @router.get("/monitoring/stream")
-async def stream_board(request: Request, _actor: _Manager) -> StreamingResponse:
+async def stream_board(request: Request, _actor: _Manager, db: _Db) -> StreamingResponse:
     """RF41 real-time — the same `BoardSnapshot` as `GET /monitoring/board`, pushed as
     Server-Sent Events whenever its meaningful content changes (spec §2 Ruling 4, §4)."""
+    # Auth is done; release the pooled connection the `_Manager` dependency checked out so it
+    # is not held idle-in-transaction for the whole (potentially hours-long) streaming response.
+    # The stream itself opens its own short-lived sessions inside `board_event_stream`.
+    await db.close()
     return StreamingResponse(
         board_event_stream(request.app.state.session_factory, request.is_disconnected),
         media_type="text/event-stream",
@@ -141,7 +145,9 @@ class AlertRuleOut(BaseModel):
 
 class AlertRulePatch(BaseModel):
     enabled: bool | None = None
-    threshold_minutes: int | None = None
+    # Same bounds as the semantically-identical `SettingsUpdate` tolerance fields — a threshold
+    # in minutes, capped at a day.
+    threshold_minutes: int | None = Field(default=None, ge=0, le=1440)
 
 
 def _to_alert_out(alert: Alert) -> AlertOut:

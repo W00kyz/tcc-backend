@@ -64,6 +64,10 @@ async def run_alert_scan(
     Returns only the rows this pass actually inserted (the `ON CONFLICT (dedup_key) DO NOTHING`
     swallows violations that already have an open/handled alert), so the caller can fan them out
     to `notify_alert`. Safe to run at any time and any number of times — idempotent by design.
+
+    Relies on `build_session_factory` setting `expire_on_commit=False`: this function commits and
+    then reads `alert.severity` off the same ORM objects, which a plain `async_sessionmaker(engine)`
+    would turn into a lazy refresh and raise `MissingGreenlet`.
     """
     now = now or datetime.now(UTC)
 
@@ -166,9 +170,10 @@ async def _latest_execution_per_stop(
     rows = await db.scalars(
         select(Execution)
         .where(Execution.route_stop_id.in_(stop_ids))
-        .order_by(Execution.checked_in_at.asc())
+        .order_by(Execution.checked_in_at.asc(), Execution.id.asc())
     )
-    # asc order + last-write-wins leaves the newest execution per stop.
+    # asc order + last-write-wins leaves the newest execution per stop. `Execution.id` breaks a
+    # `checked_in_at` tie deterministically (plausible for an offline batch sync landing at once).
     return {execution.route_stop_id: execution for execution in rows}
 
 
@@ -255,7 +260,6 @@ async def _insert_new_alerts(db: AsyncSession, drafts: list[AlertDraft]) -> list
         .returning(Alert.id)
     )
     inserted_ids = list((await db.execute(stmt)).scalars())
-    await db.flush()
     if not inserted_ids:
         return []
     return list(await db.scalars(select(Alert).where(Alert.id.in_(inserted_ids))))

@@ -72,8 +72,8 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "PT", "
 # PositionNotAccepted names the condition the worker-positions router catches by name to
 # answer 409 (the app's cue to stop reporting) — same convention as execution/service.py.
 "app/domain/monitoring/positions.py" = ["N818"]
-# AlertNotFound / AlertAlreadyResolved name the alert-lifecycle conditions the monitoring
-# router catches by name to raise its HTTPException — same convention as execution/service.py.
+# AlertAlreadyResolved names the alert-lifecycle condition the monitoring router catches by
+# name to raise its HTTPException — same convention as execution/service.py.
 "app/domain/monitoring/alerts_service.py" = ["N818"]
 
 [tool.mypy]

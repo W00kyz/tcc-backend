@@ -1,7 +1,7 @@
 """Real-time monitoring: alerts, configurable alert rules, notifications and worker GPS
 positions (RF41-RF42, RF47-RF52, Etapa 9).
 
-The periodic alert scan (`app/domain/monitoring/alerts.py`, later task) turns route/stop
+The periodic alert scan (`app/domain/monitoring/scan.py`) turns route/stop
 state into `Alert` rows keyed by a deterministic `dedup_key` — a UNIQUE column so an
 `INSERT ... ON CONFLICT DO NOTHING` keeps a re-run of the scan from duplicating an open
 alert (spec §2 Ruling 1/2). `alert_rules` holds one row per rule kind with an on/off switch

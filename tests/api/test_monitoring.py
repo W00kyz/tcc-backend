@@ -497,3 +497,17 @@ async def test_patch_unknown_rule_kind_is_404(client: TestClient, db_session: As
     response = client.patch("/alert-rules/NOPE", json={"enabled": False}, headers=_auth(token))
 
     assert response.status_code == 404
+
+
+async def test_patch_alert_rule_rejects_a_negative_threshold(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    response = client.patch(
+        "/alert-rules/LATE_STOP", json={"threshold_minutes": -5}, headers=_auth(token)
+    )
+
+    assert response.status_code == 422

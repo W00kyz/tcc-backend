@@ -24,8 +24,9 @@ class Settings(BaseSettings):
     minio_bucket_evidence: str = "evidence"
     minio_secure: bool = False
     # Start the APScheduler interval job that runs the alert scan (spec §2 Ruling 1).
-    # Tests set this False so entering the app lifespan never starts a background scheduler.
-    alerts_scheduler_enabled: bool = True
+    # Defaults off so tests (and any plain `create_app()`) never start a background scheduler on
+    # lifespan entry; `infra/` sets it True for the real deployment.
+    alerts_scheduler_enabled: bool = False
 
 
 @lru_cache
