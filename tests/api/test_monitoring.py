@@ -10,6 +10,7 @@ import pytest
 from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
+from app.domain.audit.models import AuditTrail
 from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import (
@@ -23,6 +24,7 @@ from app.domain.routing.models import Route, RouteStatus, RouteStopStatus, Route
 from app.domain.routing.service import StopInput, create_route
 from app.main import create_app
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.object_store import FakeObjectStore
@@ -309,3 +311,189 @@ async def test_field_worker_forbidden(client: TestClient, db_session: AsyncSessi
     response = client.get("/monitoring/board", headers=_auth(token))
 
     assert response.status_code == 403
+
+
+# --- alert lifecycle (spec §2 Ruling 7) --------------------------------------------------
+
+
+async def _make_alert(
+    db: AsyncSession,
+    fx: _Fixture,
+    route: Route,
+    *,
+    kind: AlertKind = AlertKind.LATE_STOP,
+    status: AlertStatus = AlertStatus.OPEN,
+) -> Alert:
+    alert = Alert(
+        kind=kind,
+        severity=AlertSeverity.WARNING,
+        dedup_key=f"{kind.value}:{route.id}:{status.value}",
+        description="Ponto atrasado",
+        route_id=route.id,
+        route_stop_id=route.stops[0].id,
+        field_worker_id=fx.worker.id,
+        status=status,
+    )
+    db.add(alert)
+    await db.flush()
+    return alert
+
+
+async def test_get_alerts_filters_by_status_and_route(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    route_a = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    route_b = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    await _make_alert(db_session, fx, route_a, status=AlertStatus.OPEN)
+    await _make_alert(db_session, fx, route_a, status=AlertStatus.RESOLVED)
+    await _make_alert(db_session, fx, route_b, status=AlertStatus.OPEN)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    everything = client.get("/alerts", headers=_auth(token))
+    assert {row["status"] for row in everything.json()} == {"OPEN", "RESOLVED"}
+    assert len(everything.json()) == 3
+
+    open_only = client.get("/alerts?status=OPEN", headers=_auth(token))
+    assert [row["status"] for row in open_only.json()] == ["OPEN", "OPEN"]
+
+    by_route = client.get(f"/alerts?route_id={route_a.id}", headers=_auth(token))
+    assert {row["route_id"] for row in by_route.json()} == {str(route_a.id)}
+
+
+async def test_acknowledge_sets_status_and_actor_and_audits(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    alert = await _make_alert(db_session, fx, route)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    response = client.post(f"/alerts/{alert.id}/acknowledge", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ACKNOWLEDGED"
+    assert response.json()["acknowledged_by"] == str(fx.manager.id)
+    assert response.json()["acknowledged_at"] is not None
+
+    audit_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(AuditTrail.entity_type == "alert", AuditTrail.action == "acknowledge")
+    )
+    assert audit_count == 1
+
+
+async def test_resolve_from_open_and_from_acknowledged(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    open_alert = await _make_alert(db_session, fx, route, status=AlertStatus.OPEN)
+    ack_alert = await _make_alert(db_session, fx, route, status=AlertStatus.ACKNOWLEDGED)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    first = client.post(f"/alerts/{open_alert.id}/resolve", headers=_auth(token))
+    assert first.json()["status"] == "RESOLVED"
+    assert first.json()["resolved_by"] == str(fx.manager.id)
+
+    second = client.post(f"/alerts/{ack_alert.id}/resolve", headers=_auth(token))
+    assert second.json()["status"] == "RESOLVED"
+
+
+async def test_acknowledge_after_resolve_is_conflict(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    alert = await _make_alert(db_session, fx, route, status=AlertStatus.RESOLVED)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    response = client.post(f"/alerts/{alert.id}/acknowledge", headers=_auth(token))
+
+    assert response.status_code == 409
+
+
+async def test_acknowledge_unknown_alert_is_404(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    response = client.post(
+        "/alerts/00000000-0000-0000-0000-000000000000/acknowledge", headers=_auth(token)
+    )
+
+    assert response.status_code == 404
+
+
+async def test_alert_endpoints_forbid_field_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.worker_user.email)
+
+    assert client.get("/alerts", headers=_auth(token)).status_code == 403
+
+
+# --- configurable alert rules (spec §2 Ruling 8) ---------------------------------------
+
+
+async def test_get_alert_rules_returns_four_rows(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    response = client.get("/alert-rules", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    kinds = {row["rule_kind"] for row in response.json()}
+    assert kinds == {"LATE_START", "WORKER_ABSENT", "LATE_STOP", "NO_EVIDENCE"}
+    assert all(row["enabled"] for row in response.json())
+
+
+async def test_patch_alert_rule_persists_enabled_and_threshold(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    off = client.patch("/alert-rules/LATE_STOP", json={"enabled": False}, headers=_auth(token))
+    assert off.status_code == 200, off.text
+    assert off.json()["enabled"] is False
+
+    thr = client.patch(
+        "/alert-rules/LATE_STOP", json={"threshold_minutes": 5}, headers=_auth(token)
+    )
+    assert thr.json()["threshold_minutes"] == 5
+    # The earlier toggle is untouched by the partial patch.
+    assert thr.json()["enabled"] is False
+
+    rules = client.get("/alert-rules", headers=_auth(token)).json()
+    late_stop = next(row for row in rules if row["rule_kind"] == "LATE_STOP")
+    assert late_stop == {
+        "rule_kind": "LATE_STOP",
+        "enabled": False,
+        "threshold_minutes": 5,
+        "updated_at": late_stop["updated_at"],
+    }
+    assert late_stop["updated_at"] is not None
+
+
+async def test_patch_unknown_rule_kind_is_404(client: TestClient, db_session: AsyncSession) -> None:
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    response = client.patch("/alert-rules/NOPE", json={"enabled": False}, headers=_auth(token))
+
+    assert response.status_code == 404

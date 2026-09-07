@@ -43,7 +43,8 @@ async def test_get_settings_returns_default_50(
     response = client.get("/settings", headers=_auth(token))
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"check_radius_meters": 50, "updated_at": None}
+    assert response.json()["check_radius_meters"] == 50
+    assert response.json()["updated_at"] is None
 
 
 async def test_put_settings_admin_updates_and_audits(
@@ -70,6 +71,75 @@ async def test_put_settings_admin_updates_and_audits(
         )
     )
     assert audit_count == 1
+
+
+async def test_get_settings_includes_etapa_9_defaults(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "gerente@empresa.com", UserRole.MANAGER)
+    token = _login(client, "gerente@empresa.com")
+
+    body = client.get("/settings", headers=_auth(token)).json()
+
+    assert body["alert_scan_interval_seconds"] == 60
+    assert body["late_start_tolerance_min"] == 15
+    assert body["absence_tolerance_min"] == 30
+    assert body["late_stop_tolerance_min"] == 15
+    assert body["no_evidence_grace_min"] == 30
+    assert body["position_report_interval_seconds"] == 60
+
+
+async def test_put_settings_updates_etapa_9_fields_and_audits(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "admin@empresa.com", UserRole.ADMIN)
+    token = _login(client, "admin@empresa.com")
+
+    response = client.put(
+        "/settings",
+        json={"late_stop_tolerance_min": 25, "position_report_interval_seconds": 30},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["late_stop_tolerance_min"] == 25
+    assert response.json()["position_report_interval_seconds"] == 30
+    # Untouched fields keep their defaults (partial patch).
+    assert response.json()["check_radius_meters"] == 50
+    assert response.json()["absence_tolerance_min"] == 30
+
+    getr = client.get("/settings", headers=_auth(token)).json()
+    assert getr["late_stop_tolerance_min"] == 25
+
+    audit_count = await db_session.scalar(
+        select(func.count())
+        .select_from(AuditTrail)
+        .where(
+            AuditTrail.entity_type == "system_settings",
+            AuditTrail.action == "update_settings",
+        )
+    )
+    assert audit_count == 1
+
+
+async def test_put_settings_etapa_9_bounds_rejected_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "admin@empresa.com", UserRole.ADMIN)
+    token = _login(client, "admin@empresa.com")
+
+    assert (
+        client.put(
+            "/settings", json={"alert_scan_interval_seconds": 0}, headers=_auth(token)
+        ).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/settings", json={"late_start_tolerance_min": -1}, headers=_auth(token)
+        ).status_code
+        == 422
+    )
 
 
 async def test_put_settings_out_of_range_422(client: TestClient, db_session: AsyncSession) -> None:

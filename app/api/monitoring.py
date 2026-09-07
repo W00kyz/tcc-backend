@@ -8,15 +8,28 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.deps import require_role
 from app.db.session import get_db
+from app.domain.audit.service import record_audit_trail
 from app.domain.identity.models import User, UserRole
+from app.domain.monitoring.alerts_service import (
+    AlertAlreadyResolved,
+    acknowledge_alert,
+    get_alert_rule,
+    list_alert_rules,
+    list_alerts,
+    resolve_alert,
+    update_alert_rule,
+)
 from app.domain.monitoring.board import BoardSnapshot, build_board
+from app.domain.monitoring.models import Alert, AlertKind, AlertRule, AlertStatus
 
 router = APIRouter(tags=["monitoring"])
 
@@ -98,3 +111,177 @@ async def stream_board(request: Request, _actor: _Manager) -> StreamingResponse:
             "Connection": "keep-alive",
         },
     )
+
+
+# --- alert lifecycle (spec §2 Ruling 7) -----------------------------------------------------
+
+
+class AlertOut(BaseModel):
+    id: UUID
+    kind: AlertKind
+    severity: str
+    description: str
+    route_id: UUID
+    route_stop_id: UUID | None
+    field_worker_id: UUID | None
+    status: AlertStatus
+    acknowledged_by: UUID | None
+    acknowledged_at: datetime | None
+    resolved_by: UUID | None
+    resolved_at: datetime | None
+    created_at: datetime
+
+
+class AlertRuleOut(BaseModel):
+    rule_kind: AlertKind
+    enabled: bool
+    threshold_minutes: int | None
+    updated_at: datetime | None
+
+
+class AlertRulePatch(BaseModel):
+    enabled: bool | None = None
+    threshold_minutes: int | None = None
+
+
+def _to_alert_out(alert: Alert) -> AlertOut:
+    return AlertOut(
+        id=alert.id,
+        kind=alert.kind,
+        severity=alert.severity.value,
+        description=alert.description,
+        route_id=alert.route_id,
+        route_stop_id=alert.route_stop_id,
+        field_worker_id=alert.field_worker_id,
+        status=alert.status,
+        acknowledged_by=alert.acknowledged_by,
+        acknowledged_at=alert.acknowledged_at,
+        resolved_by=alert.resolved_by,
+        resolved_at=alert.resolved_at,
+        created_at=alert.created_at,
+    )
+
+
+def _to_rule_out(rule: AlertRule) -> AlertRuleOut:
+    return AlertRuleOut(
+        rule_kind=rule.rule_kind,
+        enabled=rule.enabled,
+        threshold_minutes=rule.threshold_minutes,
+        updated_at=rule.updated_at,
+    )
+
+
+async def _load_alert(db: AsyncSession, alert_id: UUID) -> Alert:
+    alert = await db.get(Alert, alert_id)
+    if alert is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Alert "{alert_id}" not found.')
+    return alert
+
+
+@router.get("/alerts", response_model=list[AlertOut])
+async def get_alerts(
+    _actor: _Manager,
+    db: _Db,
+    alert_status: Annotated[AlertStatus | None, Query(alias="status")] = None,
+    route_id: UUID | None = None,
+) -> list[AlertOut]:
+    """RF41 — the dashboard's alert list, optionally filtered by `status` and/or `route_id`."""
+    rows = await list_alerts(db, status=alert_status, route_id=route_id)
+    return [_to_alert_out(alert) for alert in rows]
+
+
+@router.post("/alerts/{alert_id}/acknowledge", response_model=AlertOut)
+async def acknowledge(alert_id: UUID, actor: _Manager, db: _Db) -> AlertOut:
+    """Cenário 5 step 7 — a manager takes an OPEN alert. Idempotent on an already
+    ACKNOWLEDGED alert; a RESOLVED alert answers 409."""
+    alert = await _load_alert(db, alert_id)
+    before = {"status": alert.status.value}
+    try:
+        alert = await acknowledge_alert(db, alert=alert, actor_id=actor.id)
+    except AlertAlreadyResolved as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="alert",
+        entity_id=alert.id,
+        action="acknowledge",
+        before=before,
+        after={"status": alert.status.value},
+    )
+    await db.commit()
+    await db.refresh(alert)
+    return _to_alert_out(alert)
+
+
+@router.post("/alerts/{alert_id}/resolve", response_model=AlertOut)
+async def resolve(alert_id: UUID, actor: _Manager, db: _Db) -> AlertOut:
+    """Cenário 5 step 8 — a manager closes an alert from OPEN or ACKNOWLEDGED (idempotent
+    on an already RESOLVED alert)."""
+    alert = await _load_alert(db, alert_id)
+    before = {"status": alert.status.value}
+    alert = await resolve_alert(db, alert=alert, actor_id=actor.id)
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="alert",
+        entity_id=alert.id,
+        action="resolve",
+        before=before,
+        after={"status": alert.status.value},
+    )
+    await db.commit()
+    await db.refresh(alert)
+    return _to_alert_out(alert)
+
+
+# --- configurable alert rules (spec §2 Ruling 8, RF50) ------------------------------------
+
+
+@router.get("/alert-rules", response_model=list[AlertRuleOut])
+async def get_alert_rules(_actor: _Manager, db: _Db) -> list[AlertRuleOut]:
+    return [_to_rule_out(rule) for rule in await list_alert_rules(db)]
+
+
+@router.patch("/alert-rules/{rule_kind}", response_model=AlertRuleOut)
+async def patch_alert_rule(
+    rule_kind: str, body: AlertRulePatch, actor: _Manager, db: _Db
+) -> AlertRuleOut:
+    """Toggle a rule on/off or override its threshold (RF50). An unknown `rule_kind` answers
+    404 (the path is a free string, not the path enum, so the check is ours to make)."""
+    try:
+        kind = AlertKind(rule_kind)
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f'Alert rule "{rule_kind}" not found.'
+        ) from exc
+    rule = await get_alert_rule(db, kind)
+    if rule is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Alert rule "{rule_kind}" not found.')
+    before = {"enabled": rule.enabled, "threshold_minutes": rule.threshold_minutes}
+    rule = await update_alert_rule(
+        db,
+        rule=rule,
+        enabled=body.enabled,
+        threshold_minutes=body.threshold_minutes,
+        actor_id=actor.id,
+    )
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="alert_rule",
+        entity_id=_RULE_AUDIT_IDS[rule.rule_kind],
+        action="update_alert_rule",
+        before=before,
+        after={"enabled": rule.enabled, "threshold_minutes": rule.threshold_minutes},
+    )
+    await db.commit()
+    await db.refresh(rule)
+    return _to_rule_out(rule)
+
+
+# `alert_rules` is keyed by the enum, not a UUID; the audit trail's `entity_id` is a non-null
+# UUID column, so map each rule kind to a fixed sentinel (same trick as the settings row).
+_RULE_AUDIT_IDS: dict[AlertKind, UUID] = {
+    kind: UUID(int=index + 1) for index, kind in enumerate(AlertKind)
+}
