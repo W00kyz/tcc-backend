@@ -27,6 +27,9 @@ class SystemSettings(Base):
     late_stop_tolerance_min: Mapped[int] = mapped_column(Integer, default=15)
     no_evidence_grace_min: Mapped[int] = mapped_column(Integer, default=30)
     position_report_interval_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    # Etapa 11 (RNF10): retention windows for personal data. 0 = keep forever.
+    worker_position_retention_days: Mapped[int] = mapped_column(Integer, default=90)
+    evidence_retention_days: Mapped[int] = mapped_column(Integer, default=365)
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )

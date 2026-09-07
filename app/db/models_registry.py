@@ -8,6 +8,7 @@ from app.domain.forms import models as forms_models  # noqa: F401
 from app.domain.identity import models as identity_models  # noqa: F401
 from app.domain.impediments import models as impediments_models  # noqa: F401
 from app.domain.monitoring import models as monitoring_models  # noqa: F401
+from app.domain.privacy import models as privacy_models  # noqa: F401
 from app.domain.qr import models as qr_models  # noqa: F401
 from app.domain.routing import models as routing_models  # noqa: F401
 from app.domain.routing import templates as routing_templates  # noqa: F401

@@ -149,13 +149,17 @@ async def _schema_probe(url: str) -> tuple[list[str], list[str], list[str]]:
 
 
 def test_migration_round_trips_clean_and_seeds_alert_rules(postgres_url: str) -> None:
-    """downgrade -1 leaves no orphaned table or enum; the re-upgrade re-seeds the 4 rules.
+    """Downgrading past the Etapa 9 migration leaves no orphaned table or enum; the re-upgrade
+    re-seeds the 4 rules.
+
+    Targets the Etapa 9 down_revision by id rather than "-1": Etapa 11 (revision 3cf7fec14642)
+    now sits on top of monitoring, so "-1" would only reverse the LGPD migration.
 
     A plain (sync) test on purpose: alembic's env.py calls asyncio.run(), which would blow up
     inside an already-running event loop."""
     cfg = _alembic_config(postgres_url)
 
-    command.downgrade(cfg, "-1")
+    command.downgrade(cfg, "1212c573b12e")
     tables, enums, _ = asyncio.run(_schema_probe(postgres_url))
     assert tables == []
     assert enums == []
