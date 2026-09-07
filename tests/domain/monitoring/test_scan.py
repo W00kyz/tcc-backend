@@ -5,6 +5,7 @@ threshold override from `alert_rules`."""
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from app.core.security import hash_password
 from app.domain.catalog.models import (
     Building,
@@ -20,9 +21,16 @@ from app.domain.execution.models import (
     ExecutionSource,
 )
 from app.domain.identity.models import User, UserRole
-from app.domain.monitoring.models import AlertKind, AlertRule, AlertStatus
+from app.domain.monitoring.models import (
+    Alert,
+    AlertKind,
+    AlertRule,
+    AlertStatus,
+    Notification,
+)
 from app.domain.monitoring.scan import run_alert_scan
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _NOW = datetime.now(UTC)
@@ -113,6 +121,108 @@ async def _execution(
     db.add(execution)
     await db.flush()
     return execution
+
+
+async def _managers(db: AsyncSession, count: int = 2) -> list[uuid.UUID]:
+    """Seed `count` MANAGER/ADMIN users — the recipients of a WARNING/CRITICAL alert."""
+    roles = [UserRole.MANAGER, UserRole.ADMIN]
+    users = [
+        User(
+            name=f"Gestor {i}",
+            email=f"gestor-{uuid.uuid4()}@empresa.com",
+            password_hash=hash_password("senha-forte-o-suficiente"),
+            role=roles[i % len(roles)],
+        )
+        for i in range(count)
+    ]
+    db.add_all(users)
+    await db.flush()
+    return [u.id for u in users]
+
+
+async def _late_stop_scenario(db: AsyncSession) -> None:
+    worker_id, point_id = await _base_graph(db)
+    route = await _route(db, worker_id, status=RouteStatus.IN_PROGRESS)
+    await _stop(
+        db,
+        route,
+        point_id,
+        status=RouteStopStatus.PENDING,
+        expected_arrival_to=_NOW - timedelta(minutes=45),
+    )
+
+
+async def _notifications(db: AsyncSession) -> list[Notification]:
+    return list(await db.scalars(select(Notification)))
+
+
+async def _raise(*_: object, **__: object) -> list[Notification]:
+    raise RuntimeError("notify is broken")
+
+
+async def test_warning_alert_notifies_every_manager(db_session: AsyncSession) -> None:
+    manager_ids = await _managers(db_session, count=3)
+    await _late_stop_scenario(db_session)
+    await db_session.commit()
+
+    created = await run_alert_scan(db_session, now=_NOW)
+
+    assert len(created) == 1
+    notifications = await _notifications(db_session)
+    assert {n.user_id for n in notifications} == set(manager_ids)
+    assert all(n.kind == "ALERT" for n in notifications)
+    assert all(n.data["alert_id"] == str(created[0].id) for n in notifications)
+
+
+async def test_info_alert_does_not_notify(db_session: AsyncSession) -> None:
+    await _managers(db_session)
+    worker_id, point_id = await _base_graph(db_session)
+    route = await _route(db_session, worker_id, status=RouteStatus.IN_PROGRESS)
+    stop = await _stop(db_session, route, point_id, status=RouteStopStatus.DONE)
+    await _execution(
+        db_session,
+        stop,
+        worker_id,
+        source=ExecutionSource.APP,
+        checked_out_at=_NOW - timedelta(minutes=90),
+    )
+    await db_session.commit()
+
+    created = await run_alert_scan(db_session, now=_NOW)
+
+    assert [a.kind for a in created] == [AlertKind.NO_EVIDENCE]
+    assert await _notifications(db_session) == []
+
+
+async def test_second_scan_creates_no_new_notifications(db_session: AsyncSession) -> None:
+    await _managers(db_session, count=2)
+    await _late_stop_scenario(db_session)
+    await db_session.commit()
+
+    await run_alert_scan(db_session, now=_NOW)
+    first_count = len(await _notifications(db_session))
+    assert await run_alert_scan(db_session, now=_NOW) == []
+    assert len(await _notifications(db_session)) == first_count == 2
+
+
+async def test_notify_failure_does_not_lose_the_alerts(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _managers(db_session)
+    await _late_stop_scenario(db_session)
+    await db_session.commit()
+    monkeypatch.setattr("app.domain.monitoring.scan.notify_alert", _raise)
+
+    created = await run_alert_scan(db_session, now=_NOW)
+
+    # The scan swallows the broken notify and still returns the alerts...
+    assert len(created) == 1
+    created_ids = [a.id for a in created]
+    # ...and they are committed: after dropping the identity map the row is still there.
+    db_session.expunge_all()
+    persisted = list(await db_session.scalars(select(Alert)))
+    assert [a.id for a in persisted] == created_ids
+    assert await _notifications(db_session) == []
 
 
 async def test_late_stop_creates_one_open_alert(db_session: AsyncSession) -> None:

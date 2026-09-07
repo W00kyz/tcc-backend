@@ -11,6 +11,7 @@ Example:
     new_alerts = await run_alert_scan(db)  # -> list[Alert] actually inserted this pass
 """
 
+import logging
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -21,7 +22,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.domain.execution.models import EvidenceItem, Execution, ManualCompletion
-from app.domain.monitoring.models import Alert, AlertKind, AlertRule, AlertStatus
+from app.domain.monitoring.models import (
+    Alert,
+    AlertKind,
+    AlertRule,
+    AlertSeverity,
+    AlertStatus,
+)
+from app.domain.monitoring.notifications import notify_alert
+from app.domain.monitoring.push import LoggingPushSender, PushSender
 from app.domain.monitoring.rules import (
     AlertDraft,
     AlertThresholds,
@@ -36,10 +45,20 @@ from app.domain.routing.models import Route, RouteStatus, RouteStop
 from app.domain.settings.models import SystemSettings
 from app.domain.settings.service import get_settings_row
 
+logger = logging.getLogger(__name__)
+
 _SCANNED_STATUSES = (RouteStatus.PLANNED, RouteStatus.IN_PROGRESS)
 
+# Below WARNING nobody is paged — an INFO alert is recorded but not fanned out (spec §2 Ruling 6).
+_NOTIFIABLE_SEVERITIES = (AlertSeverity.WARNING, AlertSeverity.CRITICAL)
 
-async def run_alert_scan(db: AsyncSession, *, now: datetime | None = None) -> list[Alert]:
+
+async def run_alert_scan(
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    push: PushSender | None = None,
+) -> list[Alert]:
     """Load current state, run the 4 alert rules, batch-insert new `Alert` rows, COMMIT.
 
     Returns only the rows this pass actually inserted (the `ON CONFLICT (dedup_key) DO NOTHING`
@@ -63,10 +82,26 @@ async def run_alert_scan(db: AsyncSession, *, now: datetime | None = None) -> li
     inserted = await _insert_new_alerts(db, drafts)
     await db.commit()
 
-    # TODO(Task 11): for each `inserted` alert with severity WARNING/CRITICAL, call
-    # notify_alert(db, alert) — the notification seam (Ruling 3) lands in Task 5 / closes in
-    # Task 11. Until then a new alert is recorded but nobody is pushed.
+    # The alerts are already committed above. Notifications are a separate best-effort batch:
+    # a notify/push failure must never lose an alert, so it gets its own commit and a guard.
+    await _notify_new_alerts(db, inserted, push or LoggingPushSender())
     return inserted
+
+
+async def _notify_new_alerts(db: AsyncSession, inserted: list[Alert], push: PushSender) -> None:
+    """Fan every WARNING/CRITICAL alert out to `notify_alert` (one `Notification` per
+    MANAGER/ADMIN + best-effort push), then commit the notification rows. Any failure is
+    logged and swallowed — the alerts are already committed and must survive it."""
+    to_notify = [a for a in inserted if a.severity in _NOTIFIABLE_SEVERITIES]
+    if not to_notify:
+        return
+    try:
+        for alert in to_notify:
+            await notify_alert(db, alert=alert, push=push)
+        await db.commit()
+    except Exception:
+        logger.exception("alert notification failed", extra={"event": "alert_notify_failed"})
+        await db.rollback()
 
 
 async def _load_routes(db: AsyncSession, now: datetime) -> Sequence[Route]:

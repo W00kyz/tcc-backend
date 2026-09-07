@@ -29,6 +29,8 @@ async def run_scan_once(session_factory: async_sessionmaker[AsyncSession]) -> No
     """
     try:
         async with session_factory() as session:
+            # No `push` argument: the scheduler has no app state, so `run_alert_scan` falls back
+            # to its own `LoggingPushSender`. Real FCM/APNs wiring is documented future work.
             await run_alert_scan(session)
     except Exception:
         logger.exception("alert scan failed", extra={"event": "alert_scan_failed"})
