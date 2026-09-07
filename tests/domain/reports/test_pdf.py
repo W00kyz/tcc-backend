@@ -7,7 +7,7 @@ from app.domain.reports.compliance import (
     FilterApplied,
     ReportGranularity,
 )
-from app.domain.reports.pdf import render_compliance_pdf
+from app.domain.reports.pdf import _PRINTABLE_WIDTH_MM, _TABLE_WIDTH_MM, render_compliance_pdf
 
 _METRIC_FIELDS = (
     "routes_total",
@@ -82,5 +82,17 @@ def test_render_compliance_pdf_accepts_ptbr_accented_filter_name() -> None:
     rows = [_row("2026-W31", date(2026, 8, 3), 1)]
 
     result = render_compliance_pdf(_report(rows, worker="João Conceição"))
+
+    assert result[:4] == b"%PDF"
+
+
+def test_table_fits_within_printable_width() -> None:
+    assert _TABLE_WIDTH_MM <= _PRINTABLE_WIDTH_MM
+
+
+def test_render_compliance_pdf_sanitizes_non_latin1_filter_name() -> None:
+    rows = [_row("2026-W31", date(2026, 8, 3), 1)]
+
+    result = render_compliance_pdf(_report(rows, worker="Nguyễn Vũ"))
 
     assert result[:4] == b"%PDF"

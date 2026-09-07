@@ -54,9 +54,19 @@ _METRIC_FIELDS: tuple[str, ...] = (
 
 _PRINTABLE_WIDTH_MM = 277.0  # A4 landscape (297mm) minus 10mm margins each side
 _PERIOD_COL_MM = 30.0
-_METRIC_COL_MM = (_PRINTABLE_WIDTH_MM - _PERIOD_COL_MM) / len(_METRIC_HEADERS)
+# Every row draws len(_METRIC_HEADERS) metric cells plus the trailing "% concl." cell, so the
+# even split must be over that count + 1 — dividing by len(_METRIC_HEADERS) alone overflows the
+# sheet and clips the "% concl." column off the right margin.
+_METRIC_COL_MM = (_PRINTABLE_WIDTH_MM - _PERIOD_COL_MM) / (len(_METRIC_HEADERS) + 1)
+_TABLE_WIDTH_MM = _PERIOD_COL_MM + _METRIC_COL_MM * (len(_METRIC_HEADERS) + 1)
 _ROW_HEIGHT_MM = 5.0
 _PAGE_BREAK_Y_MM = 180.0
+
+
+def _latin1(text: str) -> str:
+    """Degrade any glyph outside Latin-1 to `?` so a free-form DB name (a building or worker
+    with e.g. `ễ`, `ł`, a curly apostrophe) can't crash the core-Helvetica PDF export."""
+    return text.encode("latin-1", "replace").decode("latin-1")
 
 
 def _format_rate(rate: float) -> str:
@@ -70,11 +80,11 @@ def _metadata_lines(report: ComplianceReport) -> list[str]:
     ]
     applied = report.filters_applied
     if applied.field_worker_name is not None:
-        lines.append(f"Profissional: {applied.field_worker_name}")
+        lines.append(f"Profissional: {_latin1(applied.field_worker_name)}")
     if applied.service_type_name is not None:
-        lines.append(f"Tipo de serviço: {applied.service_type_name}")
+        lines.append(f"Tipo de serviço: {_latin1(applied.service_type_name)}")
     if applied.building_name is not None:
-        lines.append(f"Prédio: {applied.building_name}")
+        lines.append(f"Prédio: {_latin1(applied.building_name)}")
     if applied.route_status is not None:
         lines.append(f"Status da rota: {applied.route_status}")
     lines.append(f"Gerado em: {report.generated_at:%d/%m/%Y %H:%M}")
