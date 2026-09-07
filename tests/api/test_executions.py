@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.domain.audit.models import AuditTrail
-from app.domain.catalog.models import FieldWorker
+from app.domain.catalog.models import FieldWorker, ServiceType
 from app.domain.execution.models import Execution, ExecutionReviewStatus, ExecutionSource
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import StopAssignment
@@ -358,6 +358,48 @@ async def test_resolve_review_missing_404(
     )
 
     assert response.status_code == 404, response.text
+
+
+async def test_list_executions_filter_by_service_type(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(
+        db_session,
+        test_settings,
+        point_specs=[("Sala 101", -7.2, -35.9), ("Sala 102", -7.2, -35.9)],
+    )
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+
+    windows = ServiceType(name="Limpeza de vidros", average_duration_minutes=30)
+    floors = ServiceType(name="Limpeza de pisos", average_duration_minutes=45)
+    db_session.add_all([windows, floors])
+    await db_session.flush()
+    seeded.stops[0].service_type_id = windows.id
+    seeded.stops[1].service_type_id = floors.id
+    await _seed_extra_executions(
+        db_session, route_stop_id=seeded.stops[0].id, worker_id=seeded.worker.id, count=1
+    )
+    await _seed_extra_executions(
+        db_session, route_stop_id=seeded.stops[1].id, worker_id=seeded.worker.id, count=1
+    )
+
+    headers = {"Authorization": f"Bearer {_manager_token(client)}"}
+    both = client.get("/executions", headers=headers)
+    only_windows = client.get(
+        "/executions", params={"service_type_id": str(windows.id)}, headers=headers
+    )
+    unknown = client.get(
+        "/executions", params={"service_type_id": str(uuid.uuid4())}, headers=headers
+    )
+
+    assert both.status_code == 200, both.text
+    assert both.json()["total"] == 2
+    assert only_windows.status_code == 200, only_windows.text
+    windows_body = only_windows.json()
+    assert windows_body["total"] == 1
+    assert windows_body["items"][0]["service_point_name"] == "Sala 101"
+    assert unknown.status_code == 200, unknown.text
+    assert unknown.json()["items"] == []
 
 
 async def test_field_worker_forbidden_on_history_403(

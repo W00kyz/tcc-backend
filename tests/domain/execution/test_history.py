@@ -343,6 +343,59 @@ async def test_filter_by_route_stop_status(db_session: AsyncSession) -> None:
     assert progress_total == 0
 
 
+async def test_filter_by_service_type(db_session: AsyncSession) -> None:
+    company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
+    building = Building(name="Bloco A", campus_area="CCT")
+    db_session.add_all([company, building])
+    await db_session.flush()
+    _, point = await _floor_with_point(db_session, building.id, "Térreo", "Sala A")
+    worker = FieldWorker(full_name="Ana", contractor_company_id=company.id)
+    windows = ServiceType(name="Limpeza de vidros", average_duration_minutes=30)
+    floors = ServiceType(name="Limpeza de pisos", average_duration_minutes=45)
+    db_session.add_all([worker, windows, floors])
+    await db_session.flush()
+    route = Route(field_worker_id=worker.id, route_date=_NOW.date(), status=RouteStatus.IN_PROGRESS)
+    db_session.add(route)
+    await db_session.flush()
+
+    exec_windows, stop_windows = await _execution(
+        db_session,
+        worker_id=worker.id,
+        route_id=route.id,
+        point_id=point,
+        checked_in_at=_NOW,
+        source=ExecutionSource.APP,
+        review_status=ExecutionReviewStatus.NONE,
+    )
+    _, stop_floors = await _execution(
+        db_session,
+        worker_id=worker.id,
+        route_id=route.id,
+        point_id=point,
+        checked_in_at=_NOW - timedelta(hours=1),
+        source=ExecutionSource.APP,
+        review_status=ExecutionReviewStatus.NONE,
+    )
+    for stop_id, service_type_id in ((stop_windows, windows.id), (stop_floors, floors.id)):
+        stop = await db_session.get(RouteStop, stop_id)
+        assert stop is not None
+        stop.service_type_id = service_type_id
+    await db_session.commit()
+
+    scoped, scoped_total = await list_executions(
+        db_session, ExecutionFilters(service_type_id=windows.id), page=1, page_size=50
+    )
+    _, all_total = await list_executions(db_session, ExecutionFilters(), page=1, page_size=50)
+    _, unknown_total = await list_executions(
+        db_session, ExecutionFilters(service_type_id=uuid.uuid4()), page=1, page_size=50
+    )
+
+    assert all_total == 2
+    assert scoped_total == 1
+    assert scoped[0].execution_id == exec_windows
+    assert unknown_total == 0
+
+
 async def test_pagination_caps_the_page_and_keeps_total(db_session: AsyncSession) -> None:
     await _seed_world(db_session)
 

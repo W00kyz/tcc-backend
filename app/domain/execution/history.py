@@ -54,6 +54,7 @@ class ExecutionFilters:
     date_to: date | None = None
     field_worker_id: UUID | None = None
     service_point_id: UUID | None = None
+    service_type_id: UUID | None = None
     building_id: UUID | None = None
     review_status: str | None = None
     geo_validation: str | None = None
@@ -195,6 +196,8 @@ def _id_conditions(f: ExecutionFilters) -> list[ColumnElement[bool]]:
         conditions.append(Execution.field_worker_id == f.field_worker_id)
     if f.service_point_id is not None:
         conditions.append(RouteStop.service_point_id == f.service_point_id)
+    if f.service_type_id is not None:
+        conditions.append(RouteStop.service_type_id == f.service_type_id)
     if f.building_id is not None:
         conditions.append(Floor.building_id == f.building_id)
     return conditions

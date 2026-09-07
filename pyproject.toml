@@ -19,6 +19,7 @@ dependencies = [
     "qrcode==8.2",
     "pillow==12.3.0",
     "fpdf2==2.8.8",
+    "xlsxwriter==3.2.9",
     "httpx2==2.12.0",
     "minio==7.2.20",
     "python-multipart==0.0.32",
