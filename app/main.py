@@ -35,7 +35,11 @@ from app.core.mail import Mailer, SmtpMailer
 from app.core.object_store import MinioObjectStore, ObjectStore
 from app.db.session import build_engine, build_session_factory
 from app.domain.monitoring.push import LoggingPushSender
-from app.domain.monitoring.scheduler import build_alert_scheduler, run_scan_once
+from app.domain.monitoring.scheduler import (
+    build_scheduler,
+    run_retention_purge_once,
+    run_scan_once,
+)
 from app.domain.routing.osrm import HttpxOsrmClient, OsrmClient
 
 
@@ -102,12 +106,20 @@ def create_app(
         # The alert scan runs on a background interval (spec §2 Ruling 1). AsyncIOScheduler needs
         # a running loop; the lifespan runs inside one, so start() works here. The job opens its
         # own session — the scheduler has no request scope.
-        if settings.alerts_scheduler_enabled:
+        # One scheduler carries whichever background jobs are enabled (spec §2 Ruling 1, RNF10):
+        # the alert scan on a fixed interval and the retention purge daily at 03:00.
+        if settings.alerts_scheduler_enabled or settings.retention_purge_enabled:
 
             async def _scan_job() -> None:
                 await run_scan_once(_app.state.session_factory)
 
-            _app.state.alert_scheduler = build_alert_scheduler(_scan_job)
+            async def _purge_job() -> None:
+                await run_retention_purge_once(_app.state.session_factory, settings)
+
+            _app.state.alert_scheduler = build_scheduler(
+                scan_job=_scan_job if settings.alerts_scheduler_enabled else None,
+                purge_job=_purge_job if settings.retention_purge_enabled else None,
+            )
 
         yield
 

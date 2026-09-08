@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # Defaults off so tests (and any plain `create_app()`) never start a background scheduler on
     # lifespan entry; `infra/` sets it True for the real deployment.
     alerts_scheduler_enabled: bool = False
+    # Start the APScheduler cron job that runs the daily retention purge (spec §D, RNF10).
+    # Defaults off so tests (and any plain `create_app()`) never start a background scheduler on
+    # lifespan entry; `infra/` sets it True for the real deployment.
+    retention_purge_enabled: bool = False
 
 
 @lru_cache
