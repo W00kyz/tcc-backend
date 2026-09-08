@@ -90,8 +90,3 @@ def build_scheduler(
         )
     scheduler.start()
     return scheduler
-
-
-def build_alert_scheduler(scan_job: Callable[[], Awaitable[None]]) -> AsyncIOScheduler:
-    """Backwards-compatible shim: a started scheduler running only the alert-scan job."""
-    return build_scheduler(scan_job=scan_job)

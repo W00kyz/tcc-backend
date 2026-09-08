@@ -8,7 +8,7 @@ import pytest
 from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.domain.monitoring import scheduler as scheduler_module
-from app.domain.monitoring.scheduler import run_scan_once
+from app.domain.monitoring.scheduler import build_scheduler, run_scan_once
 from app.main import create_app
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -37,6 +37,31 @@ def test_scheduler_starts_with_one_job_when_enabled(test_settings: Settings) -> 
         assert jobs[0].id == "alert_scan"
     # Lifespan exit shuts it down.
     assert app.state.alert_scheduler.running is False
+
+
+@pytest.mark.parametrize(
+    ("alerts", "retention", "expected"),
+    [
+        (False, False, set()),
+        (True, False, {"alert_scan"}),
+        (False, True, {"retention_purge"}),
+        (True, True, {"alert_scan", "retention_purge"}),
+    ],
+)
+async def test_build_scheduler_registers_jobs_per_flag(
+    alerts: bool, retention: bool, expected: set[str]
+) -> None:
+    async def noop() -> None:
+        return None
+
+    scheduler = build_scheduler(
+        scan_job=noop if alerts else None,
+        purge_job=noop if retention else None,
+    )
+    try:
+        assert {job.id for job in scheduler.get_jobs()} == expected
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 async def test_run_scan_once_swallows_and_logs_scan_failure(
