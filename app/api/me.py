@@ -41,7 +41,7 @@ class ProfileOut(_Model):
     created_at: datetime
 
 
-class FieldWorkerOut(_Model):
+class MyFieldWorkerOut(_Model):
     id: uuid.UUID
     full_name: str
     contractor_company_id: uuid.UUID
@@ -77,7 +77,7 @@ class NotificationsSummaryOut(_Model):
 
 class PersonalDataOut(_Model):
     profile: ProfileOut
-    field_worker: FieldWorkerOut | None
+    field_worker: MyFieldWorkerOut | None
     consent_history: list[ConsentEntryOut]
     auth_events: list[AuthEventOut]
     executions_summary: TimeSpanOut
