@@ -8,6 +8,7 @@ from app.core.security import hash_password
 from app.domain.catalog.models import ContractorCompany, FieldWorker
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import WorkerPosition
+from app.domain.privacy.models import ConsentRecord, PrivacyNotice
 from app.domain.routing.models import Route, RouteStatus
 from fastapi.testclient import TestClient
 from httpx2 import Response
@@ -31,6 +32,7 @@ async def _seed(
     email: str = "joao@empresa.com",
     status: RouteStatus = RouteStatus.IN_PROGRESS,
     route_worker_email: str | None = None,
+    consented: bool = True,
 ) -> SeededWorker:
     """One field worker with a route in `status`. `route_worker_email` points the route at a
     different worker when set (the caller is still `email`)."""
@@ -68,8 +70,37 @@ async def _seed(
 
     route = Route(field_worker_id=route_worker_id, route_date=date.today(), status=status)
     db_session.add(route)
+    await db_session.flush()
+
+    notice = await _reseed_current_notice(db_session)
+    if consented:
+        db_session.add(
+            ConsentRecord(
+                user_id=user.id,
+                privacy_notice_id=notice.id,
+                accepted_at=datetime.now(UTC),
+            )
+        )
+
     await db_session.commit()
     return SeededWorker(worker=worker, route=route)
+
+
+async def _reseed_current_notice(db_session: AsyncSession) -> PrivacyNotice:
+    """Truncation between tests may drop the migration-seeded current notice (RNF10)."""
+    existing = (await db_session.execute(select(PrivacyNotice))).scalars().first()
+    if existing is not None:
+        return existing
+    notice = PrivacyNotice(
+        version=1,
+        title="Aviso de Privacidade",
+        body_markdown="# Aviso\nTratamos seus dados conforme a LGPD.",
+        published_at=datetime.now(UTC),
+        is_current=True,
+    )
+    db_session.add(notice)
+    await db_session.flush()
+    return notice
 
 
 async def _add_manager(db_session: AsyncSession, email: str) -> None:
@@ -190,3 +221,30 @@ async def test_accuracy_omitted_stored_null_201(
     assert response.json()["accuracy_m"] is None
     row = (await db_session.execute(select(WorkerPosition))).scalar_one()
     assert row.accuracy_m is None
+
+
+async def test_worker_without_consent_403(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed(db_session, consented=False)
+    token = _login(client)
+
+    response = _post(client, token, route_id=str(seeded.route.id))
+
+    assert response.status_code == 403, response.text
+    assert (await db_session.execute(select(WorkerPosition))).scalars().first() is None
+
+
+async def test_worker_records_position_after_consent_201(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed(db_session, consented=False)
+    token = _login(client)
+
+    assert _post(client, token, route_id=str(seeded.route.id)).status_code == 403
+
+    consent = client.post("/auth/consent", headers={"Authorization": f"Bearer {token}"})
+    assert consent.status_code in (200, 201, 204), consent.text
+
+    response = _post(client, token, route_id=str(seeded.route.id))
+    assert response.status_code == 201, response.text

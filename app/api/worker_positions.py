@@ -19,6 +19,7 @@ from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.positions import PositionNotAccepted, record_position
+from app.domain.privacy.service import has_consented
 
 router = APIRouter(prefix="/worker-positions", tags=["monitoring"])
 
@@ -50,6 +51,14 @@ async def create_worker_position(
     worker = await current_worker(db, user)
     if worker is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has no field worker profile.")
+
+    # RNF10: no location data is accepted until the worker has accepted the current privacy notice.
+    if not await has_consented(db, user_id=user.id):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Consent to the current privacy notice is required before location data can be "
+            "collected.",
+        )
 
     try:
         position = await record_position(
