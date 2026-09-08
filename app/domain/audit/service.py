@@ -29,3 +29,26 @@ async def record_audit_trail(
     db.add(entry)
     await db.flush()
     return entry
+
+
+async def record_personal_data_access(
+    db: AsyncSession,
+    *,
+    actor_id: uuid.UUID,
+    subject_user_id: uuid.UUID,
+    context: str,
+) -> None:
+    """RNF12 — one audit row when a manager/admin reads another person's personal data.
+
+    Example: ``await record_personal_data_access(db, actor_id=caller.id,
+    subject_user_id=worker.user_id, context="execution_history")``.
+    """
+    await record_audit_trail(
+        db,
+        actor_id=actor_id,
+        entity_type="personal_data",
+        entity_id=subject_user_id,
+        action="PERSONAL_DATA_ACCESS",
+        before=None,
+        after={"context": context},
+    )

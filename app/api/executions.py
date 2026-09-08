@@ -16,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_role
 from app.db.session import get_db
-from app.domain.audit.service import record_audit_trail
+from app.domain.audit.service import record_audit_trail, record_personal_data_access
+from app.domain.catalog.models import FieldWorker
 from app.domain.execution.history import (
     ExecutionDetailRow,
     ExecutionFilters,
@@ -248,6 +249,20 @@ async def list_execution_history(
         rows, total = await list_executions(db, filters, page=page, page_size=page_size)
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    # RNF12: filtering the history by a field worker is a targeted read of that person's
+    # data by a manager/admin (this router is manager-only). An unfiltered list is not.
+    if field_worker_id is not None:
+        worker = await db.get(FieldWorker, field_worker_id)
+        if worker is not None and worker.user_id is not None:
+            await record_personal_data_access(
+                db,
+                actor_id=actor.id,
+                subject_user_id=worker.user_id,
+                context="execution_history",
+            )
+            await db.commit()
+
     return PagedExecutions(
         items=[_to_item(row) for row in rows], total=total, page=page, page_size=page_size
     )

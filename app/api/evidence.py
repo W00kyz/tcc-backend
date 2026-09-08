@@ -3,8 +3,9 @@ and managers (or the owning worker) list them and fetch photo bytes through this
 instead of a public MinIO URL.
 
 Transaction discipline: `evidence_service` flushes and this router owns `db.commit()`
-(the `execution/service.py` self-committing exception does not extend to evidence). No
-audit trail — evidence is field-worker content, not a manager action.
+(the `execution/service.py` self-committing exception does not extend to evidence). The
+only audit row here is RNF12: a manager/admin reading another person's evidence records a
+`PERSONAL_DATA_ACCESS` entry (see `_authorize_read`).
 """
 
 from datetime import datetime
@@ -30,6 +31,8 @@ from app.api._execution_common import current_worker
 from app.api.deps import require_role
 from app.core.object_store import ObjectStore
 from app.db.session import get_db
+from app.domain.audit.service import record_personal_data_access
+from app.domain.catalog.models import FieldWorker
 from app.domain.execution.evidence_service import (
     EvidenceContentMissingError,
     EvidenceIntegrityError,
@@ -114,6 +117,17 @@ async def _require_owning_worker(db: AsyncSession, user: User, execution: Execut
 async def _authorize_read(db: AsyncSession, user: User, execution: Execution) -> None:
     """Managers and admins always; a field worker only for their own execution."""
     if user.role in (UserRole.MANAGER, UserRole.ADMIN):
+        # RNF12: a manager/admin viewing another person's evidence is a third-party read of
+        # that field worker's personal data. The owning worker's own access below is not.
+        worker = await db.get(FieldWorker, execution.field_worker_id)
+        if worker is not None and worker.user_id is not None:
+            await record_personal_data_access(
+                db,
+                actor_id=user.id,
+                subject_user_id=worker.user_id,
+                context="evidence_view",
+            )
+            await db.commit()
         return
     await _require_owning_worker(db, user, execution)
 
