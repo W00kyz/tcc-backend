@@ -101,3 +101,31 @@ async def test_creating_a_floor_for_an_unknown_building_returns_404(
     )
 
     assert response.status_code == 404
+
+
+async def test_floors_keep_registration_order_after_an_edit(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    # Regression: without ORDER BY, PATCHing a row let Postgres return it last (heap order),
+    # so the dashboard's floor tabs reshuffled after a rename.
+    manager = User(
+        name="Larissa",
+        email="larissa@pu.ufcg.edu.br",
+        password_hash=hash_password("senha-forte-o-suficiente"),
+        role=UserRole.MANAGER,
+    )
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add_all([manager, building])
+    await db_session.commit()
+    auth = {"Authorization": f"Bearer {_login(client, manager.email)}"}
+    ids = []
+    for label in ["Térreo", "1º Andar", "2º Andar"]:
+        created = client.post(
+            "/floors", json={"building_id": str(building.id), "label": label}, headers=auth
+        )
+        ids.append(created.json()["id"])
+
+    client.patch(f"/floors/{ids[0]}", json={"label": "Subsolo"}, headers=auth)
+    listing = client.get(f"/floors?building_id={building.id}", headers=auth)
+
+    assert [floor["id"] for floor in listing.json()] == ids

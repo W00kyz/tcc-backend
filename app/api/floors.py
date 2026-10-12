@@ -45,7 +45,9 @@ async def list_floors(
     db: Annotated[AsyncSession, Depends(get_db)],
     building_id: UUID | None = None,
 ) -> list[FloorOut]:
-    query = select(Floor)
+    # Registration order (id breaks ties): without it, Postgres returns an edited row last and
+    # the dashboard's floor tabs reshuffle after a rename.
+    query = select(Floor).order_by(Floor.created_at, Floor.id)
     if building_id is not None:
         query = query.where(Floor.building_id == building_id)
     floors = (await db.scalars(query)).all()

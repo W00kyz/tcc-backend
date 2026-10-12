@@ -4,9 +4,10 @@ app/api/*.py, one router per table here — this module stays models-only."""
 import enum
 import uuid
 from datetime import date
+from typing import Any
 
-from sqlalchemy import Enum, Float, ForeignKey, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import BigInteger, Enum, Float, ForeignKey, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -66,6 +67,14 @@ class Building(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(200))
     campus_area: Mapped[str] = mapped_column(String(200))
+    # GeoJSON Polygon outline drawn on the dashboard map. JSONB, not PostGIS geometry: the
+    # outline is only drawn, never queried spatially (spec 2026-10-11-predios-no-mapa).
+    # Validated by app/domain/catalog/footprint.py before being stored.
+    footprint: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Where the outline came from ("osm" today) and its OSM way id, so it can be
+    # traced back to the source and reimported.
+    footprint_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    osm_way_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class Floor(UUIDPrimaryKeyMixin, TimestampMixin, Base):
