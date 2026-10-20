@@ -24,6 +24,7 @@ from app.domain.execution.models import (
     Execution,
     QrScan,
 )
+from app.domain.forms.models import Form, FormQuestion, FormVersion
 from app.domain.impediments.models import Impediment
 from app.domain.monitoring.models import Alert, Notification, WorkerPosition
 from app.domain.qr.models import QrCode
@@ -104,6 +105,34 @@ async def _delete_executions(db: AsyncSession, execution_ids: Ids) -> list[str]:
         await db.execute(delete(model).where(model.execution_id.in_(execution_ids)))
     await db.execute(delete(Execution).where(Execution.id.in_(execution_ids)))
     return photo_keys
+
+
+async def service_type_has_history(db: AsyncSession, service_type_id: uuid.UUID) -> bool:
+    """True when a route stop was made for the type or an execution answered one of its form
+    versions: removing the type would orphan that history.
+
+    Example: ``if await service_type_has_history(db, service_type.id): ...``
+    """
+    version_ids = select(FormVersion.id).join(Form).where(Form.service_type_id == service_type_id)
+    stop = await db.scalar(
+        select(RouteStop.id).where(RouteStop.service_type_id == service_type_id).limit(1)
+    )
+    execution = await db.scalar(
+        select(Execution.id).where(Execution.form_version_id.in_(version_ids)).limit(1)
+    )
+    return stop is not None or execution is not None
+
+
+async def delete_form_of_type(db: AsyncSession, service_type_id: uuid.UUID) -> None:
+    """Drop the form built for a type (versions and questions with it), which has no history.
+
+    Example: ``await delete_form_of_type(db, service_type.id)``
+    """
+    form_ids = select(Form.id).where(Form.service_type_id == service_type_id)
+    version_ids = select(FormVersion.id).where(FormVersion.form_id.in_(form_ids))
+    await db.execute(delete(FormQuestion).where(FormQuestion.form_version_id.in_(version_ids)))
+    await db.execute(delete(FormVersion).where(FormVersion.form_id.in_(form_ids)))
+    await db.execute(delete(Form).where(Form.service_type_id == service_type_id))
 
 
 async def _delete_stops(db: AsyncSession, stop_ids: Ids) -> list[str]:

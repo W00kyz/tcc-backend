@@ -1,3 +1,5 @@
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.security import hash_password
@@ -8,9 +10,16 @@ from app.domain.catalog.models import (
     ServicePoint,
     ServiceType,
 )
+from app.domain.execution.models import Execution, ExecutionSource
+from app.domain.forms.models import Form, FormQuestion, FormVersion, QuestionType
+from app.domain.forms.service import add_question, get_or_create_form
 from app.domain.identity.models import User, UserRole
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.clock import today_on_campus
+from tests.support.factories import make_route, make_worker
 
 
 def _login(client: TestClient, email: str) -> str:
@@ -263,3 +272,123 @@ async def test_unknown_type_id_returns_404(client: TestClient, db_session: Async
     )
 
     assert response.status_code == 404
+
+
+async def _count(db_session: AsyncSession, model: type) -> int:
+    return int(await db_session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+async def _unanswered_form(db_session: AsyncSession, service_type: ServiceType) -> Form:
+    form = await get_or_create_form(db_session, service_type_id=service_type.id)
+    await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="Limpou?",
+        question_type=QuestionType.BOOLEAN,
+        required=True,
+        options=[],
+    )
+    await db_session.commit()
+    return form
+
+
+async def test_removing_a_type_with_only_an_unanswered_form_deletes_both(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    company, service_type = await _company_with_type(db_session, cnpj="1", type_name="Limpeza")
+    await _unanswered_form(db_session, service_type)
+
+    response = client.patch(
+        f"/contractor-companies/{company.id}", json=_body(cnpj="1"), headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["service_types"] == []
+    assert [
+        await _count(db_session, m) for m in (ServiceType, Form, FormVersion, FormQuestion)
+    ] == [
+        0,
+        0,
+        0,
+        0,
+    ]
+
+
+async def test_removing_a_type_with_a_route_stop_is_blocked(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    company, service_type = await _company_with_type(db_session, cnpj="1", type_name="Limpeza")
+    await _point_of_type(db_session, service_type)
+    point = await db_session.scalar(select(ServicePoint))
+    assert point is not None
+    worker = await make_worker(db_session, company=company)
+    route = await make_route(db_session, worker=worker, day=today_on_campus(), points=[point])
+    route.stops[0].service_type_id = service_type.id
+    # the point no longer uses the type: only the stop on record does
+    point.service_type_id = None
+    await db_session.commit()
+
+    response = client.patch(
+        f"/contractor-companies/{company.id}",
+        json={"name": "Renomeada", "cnpj": "1", "service_types": []},
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["service_type_id"]) == (
+        "SERVICE_TYPE_HAS_HISTORY",
+        str(service_type.id),
+    )
+    after = client.get("/contractor-companies", headers=headers).json()[0]
+    assert after["name"] == "Empresa 1"
+    assert [t["name"] for t in after["service_types"]] == ["Limpeza"]
+
+
+async def test_removing_a_type_with_an_answered_form_is_blocked(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    company, service_type = await _company_with_type(db_session, cnpj="1", type_name="Limpeza")
+    form = await _unanswered_form(db_session, service_type)
+    await _point_of_type(db_session, service_type)
+    point = await db_session.scalar(select(ServicePoint))
+    assert point is not None
+    worker = await make_worker(db_session, company=company)
+    route = await make_route(db_session, worker=worker, day=today_on_campus(), points=[point])
+    now = datetime.now(UTC)
+    db_session.add(
+        Execution(
+            route_stop_id=route.stops[0].id,
+            field_worker_id=worker.id,
+            form_version_id=form.versions[0].id,
+            checked_in_at=now,
+            synced_at=now,
+            source=ExecutionSource.APP,
+            idempotency_key=uuid.uuid4(),
+        )
+    )
+    # neither a point nor a stop references the type any more: only the answered form does
+    point.service_type_id = None
+    await db_session.commit()
+
+    response = client.patch(
+        f"/contractor-companies/{company.id}", json=_body(cnpj="1"), headers=headers
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["service_type_id"]) == (
+        "SERVICE_TYPE_HAS_HISTORY",
+        str(service_type.id),
+    )
+    assert [
+        await _count(db_session, m) for m in (ServiceType, Form, FormVersion, FormQuestion)
+    ] == [
+        1,
+        1,
+        1,
+        1,
+    ]

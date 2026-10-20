@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
+from app.domain.catalog.deletion import delete_form_of_type, service_type_has_history
 from app.domain.catalog.models import ContractorCompany, ServicePoint, ServiceType
 from app.domain.identity.models import User, UserRole
 
@@ -113,14 +114,16 @@ async def _reconcile_service_types(
                 service_type_id=str(service_type_id),
                 points=points,
             )
+        if await service_type_has_history(db, service_type_id):
+            raise _conflict(
+                "SERVICE_TYPE_HAS_HISTORY",
+                f'Service type "{service_type.name}" has routes or executions on record.',
+                service_type_id=str(service_type_id),
+            )
+        await delete_form_of_type(db, service_type_id)
         company.service_types.remove(service_type)
         await db.delete(service_type)
-    try:
-        await db.flush()
-    except IntegrityError as exc:  # e.g. the type still has a form
-        raise _conflict(
-            "SERVICE_TYPE_IN_USE", "A removed service type is still referenced.", points=0
-        ) from exc
+    await db.flush()
 
     for row in rows:
         if row.id is None:
