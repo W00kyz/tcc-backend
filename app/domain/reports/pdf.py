@@ -2,16 +2,18 @@
 
 Pure function: `ComplianceReport -> bytes`. No DB, no I/O beyond fpdf2's in-memory buffer.
 
-Landscape A4 because the table is 15 columns (a "Período" column + the 13 absolute indicators
+Landscape A4 because the table is 12 columns (a "Período" column + the 10 point-day indicators
 + a "% concl." column) and will not fit portrait at a readable size. The built-in "Helvetica"
 core font is Latin-1 only (fpdf2's `core_fonts_encoding`); pt-BR accented letters (á, ç, ã, õ)
 are in Latin-1 so filter names render fine, but the em-dash and other non-Latin-1 glyphs are
 not — every literal here stays ASCII-punctuation only.
 """
 
+from dataclasses import fields
+
 from fpdf import FPDF
 
-from app.domain.reports.compliance import ComplianceReport, ReportGranularity
+from app.domain.reports.compliance import ComplianceCounts, ComplianceReport, ReportGranularity
 
 _GRANULARITY_LABELS: dict[ReportGranularity, str] = {
     ReportGranularity.DAILY: "Diário",
@@ -19,38 +21,22 @@ _GRANULARITY_LABELS: dict[ReportGranularity, str] = {
     ReportGranularity.MONTHLY: "Mensal",
 }
 
-# Abbreviated headers — 15 columns on landscape A4 is tight, so the metric headers are short.
-# Order matches `_METRIC_FIELDS` in compliance.py plus the leading period and trailing rate.
+# Abbreviated headers — 12 columns on landscape A4 is tight, so the metric headers are short.
+# Order matches `_METRIC_FIELDS` (the fields of `ComplianceCounts`) plus the leading period and
+# trailing rate.
 _METRIC_HEADERS: tuple[str, ...] = (
-    "Rotas",
-    "Iniciadas",
-    "Concluídas",
-    "Canceladas",
     "Pontos",
     "Feitos",
-    "Pendentes",
-    "Reatrib.",
-    "Execuções",
-    "C/ evid.",
-    "Sinalizadas",
-    "Impedim.",
-    "Alertas",
+    "P/ recurso",
+    "Não atend.",
+    "Liberados",
+    "Impedidos",
+    "Lib. resto",
+    "Lib. campus",
+    "Lib. sinal",
+    "Lib. fim dia",
 )
-_METRIC_FIELDS: tuple[str, ...] = (
-    "routes_total",
-    "routes_started",
-    "routes_completed",
-    "routes_cancelled",
-    "stops_total",
-    "stops_done",
-    "stops_pending",
-    "stops_reassigned",
-    "executions_total",
-    "executions_with_evidence",
-    "executions_flagged",
-    "impediments_total",
-    "alerts_total",
-)
+_METRIC_FIELDS: tuple[str, ...] = tuple(field.name for field in fields(ComplianceCounts))
 
 _PRINTABLE_WIDTH_MM = 277.0  # A4 landscape (297mm) minus 10mm margins each side
 _PERIOD_COL_MM = 30.0
@@ -81,12 +67,12 @@ def _metadata_lines(report: ComplianceReport) -> list[str]:
     applied = report.filters_applied
     if applied.field_worker_name is not None:
         lines.append(f"Profissional: {_latin1(applied.field_worker_name)}")
+    if applied.company_name is not None:
+        lines.append(f"Empresa: {_latin1(applied.company_name)}")
     if applied.service_type_name is not None:
         lines.append(f"Tipo de serviço: {_latin1(applied.service_type_name)}")
     if applied.building_name is not None:
         lines.append(f"Prédio: {_latin1(applied.building_name)}")
-    if applied.route_status is not None:
-        lines.append(f"Status da rota: {applied.route_status}")
     lines.append(f"Gerado em: {report.generated_at:%d/%m/%Y %H:%M}")
     return lines
 
@@ -119,7 +105,7 @@ def render_compliance_pdf(report: ComplianceReport) -> bytes:
     pdf.add_page()
 
     pdf.set_font("Helvetica", style="B", size=14)
-    pdf.cell(0, 8, "Relatório de Conformidade de Rotas", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, "Relatório de Conformidade dos Pontos de Serviço", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
 
     pdf.set_font("Helvetica", size=8)

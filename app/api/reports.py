@@ -5,9 +5,9 @@ Rulings 5, 6). One JSON endpoint plus two export endpoints, all three sharing
 
 The three endpoints take the same query axis. `_parse_report_params` is the single place that
 turns the raw params into a validated `(ReportGranularity, ReportFilters)` pair — it enforces
-`date_to >= date_from` and the 366-day span cap (spec §2 Ruling 5) and rejects an unknown
-`route_status`, all as `422`. `granularity` is declared as the enum in each signature so FastAPI
-coerces it and answers `422` on a bad value without our help.
+`date_to >= date_from` and the 366-day span cap (spec §2 Ruling 5), both as `422`.
+`granularity` is declared as the enum in each signature so FastAPI coerces it and answers `422`
+on a bad value without our help.
 """
 
 from datetime import date, datetime
@@ -30,7 +30,6 @@ from app.domain.reports.compliance import (
 from app.domain.reports.filters import ReportFilters
 from app.domain.reports.pdf import render_compliance_pdf
 from app.domain.reports.xlsx import render_compliance_xlsx
-from app.domain.routing.models import RouteStatus
 
 reports_router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -49,54 +48,36 @@ class FilterAppliedOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     field_worker_name: str | None
+    company_name: str | None
     service_type_name: str | None
     building_name: str | None
-    route_status: str | None
-
-
-class ComplianceRowOut(BaseModel):
-    """Mirror of `ComplianceRow` — one granularity bucket with the 13 absolute indicators plus
-    the derived `completion_rate`."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    period_label: str
-    period_start: date
-    routes_total: int
-    routes_started: int
-    routes_completed: int
-    routes_cancelled: int
-    stops_total: int
-    stops_done: int
-    stops_pending: int
-    stops_reassigned: int
-    executions_total: int
-    executions_with_evidence: int
-    executions_flagged: int
-    impediments_total: int
-    alerts_total: int
-    completion_rate: float
 
 
 class ComplianceTotalsOut(BaseModel):
-    """Mirror of `ComplianceTotals` — the same shape as a row without the period identity."""
+    """Mirror of `ComplianceCounts` — the point-day indicators (spec 2026-10-20-alocacao-
+    automatica §8.7) plus the derived `completion_rate`. `points_done` includes the ones done by
+    appeal; `points_impeded` is the release counter of the IMPEDIMENT reason."""
 
     model_config = ConfigDict(from_attributes=True)
 
-    routes_total: int
-    routes_started: int
-    routes_completed: int
-    routes_cancelled: int
-    stops_total: int
-    stops_done: int
-    stops_pending: int
-    stops_reassigned: int
-    executions_total: int
-    executions_with_evidence: int
-    executions_flagged: int
-    impediments_total: int
-    alerts_total: int
+    points_total: int
+    points_done: int
+    points_done_by_appeal: int
+    points_unserved: int
+    points_released: int
+    points_impeded: int
+    released_route_remainder: int
+    released_left_campus: int
+    released_location_silence: int
+    released_end_of_day: int
     completion_rate: float
+
+
+class ComplianceRowOut(ComplianceTotalsOut):
+    """Mirror of `ComplianceRow` — one granularity bucket: its identity plus the indicators."""
+
+    period_label: str
+    period_start: date
 
 
 class ComplianceReportOut(BaseModel):
@@ -121,12 +102,12 @@ def _parse_report_params(
     date_from: date,
     date_to: date,
     field_worker_id: Annotated[UUID | None, Query()] = None,
+    company_id: Annotated[UUID | None, Query()] = None,
     service_type_id: Annotated[UUID | None, Query()] = None,
     building_id: Annotated[UUID | None, Query()] = None,
-    route_status: Annotated[str | None, Query()] = None,
 ) -> tuple[ReportGranularity, ReportFilters]:
     """Validate the shared query axis and build the `ReportFilters`. Raises `HTTPException(422)`
-    on an inverted range, a span over `_MAX_SPAN_DAYS`, or an unknown `route_status`."""
+    on an inverted range or a span over `_MAX_SPAN_DAYS`."""
     if date_to < date_from:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -138,28 +119,18 @@ def _parse_report_params(
             f"range {date_from}..{date_to} spans more than {_MAX_SPAN_DAYS} days; "
             f"expected a range of at most {_MAX_SPAN_DAYS} days.",
         )
-    if route_status is not None:
-        try:
-            RouteStatus(route_status)
-        except ValueError as exc:
-            valid = ", ".join(s.value for s in RouteStatus)
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f'route_status "{route_status}" is not a valid route status; '
-                f"expected one of {valid}.",
-            ) from exc
     filters = ReportFilters(
         date_from=date_from,
         date_to=date_to,
         field_worker_id=field_worker_id,
+        company_id=company_id,
         service_type_id=service_type_id,
         building_id=building_id,
-        route_status=route_status,
     )
     return granularity, filters
 
 
-# The seven query params are identical across the three endpoints; declaring them once here and
+# The query params are identical across the three endpoints; declaring them once here and
 # spreading via `Depends` keeps the signatures honest and the OpenAPI schema consistent.
 _ReportParams = Annotated[tuple[ReportGranularity, ReportFilters], Depends(_parse_report_params)]
 
@@ -168,7 +139,7 @@ _ReportParams = Annotated[tuple[ReportGranularity, ReportFilters], Depends(_pars
 async def get_compliance_report(
     params: _ReportParams, _actor: _Manager, db: _Db
 ) -> ComplianceReportOut:
-    """RF45 — the route-compliance read model as JSON: the granularity buckets with the 13
+    """RF45 — the compliance read model as JSON: the granularity buckets with the point-day
     indicators plus `completion_rate`, a totals row, and the resolved `filters_applied`."""
     granularity, filters = params
     report = await build_compliance_report(db, granularity=granularity, filters=filters)

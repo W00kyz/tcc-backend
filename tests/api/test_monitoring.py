@@ -27,7 +27,7 @@ from app.domain.monitoring.models import (
     AlertStatus,
     WorkerPosition,
 )
-from app.domain.routing.models import Route, RouteStatus, RouteStopStatus
+from app.domain.routing.models import Route, RouteStatus
 from app.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -199,19 +199,6 @@ async def test_board_shows_open_routes_only(client: TestClient, db_session: Asyn
     body = _get_board(client, token)
 
     assert [r["route_id"] for r in body["routes"]] == [str(paused.id), str(in_progress.id)]
-
-
-async def test_stop_counts_reflect_done_stops(client: TestClient, db_session: AsyncSession) -> None:
-    fx = await _seed_actors(db_session)
-    route = await _make_route(db_session, fx, point_count=3, status=RouteStatus.IN_PROGRESS)
-    route.stops[0].status = RouteStopStatus.DONE
-    await db_session.commit()
-    token = _login(client, fx.manager.email)
-
-    body = _get_board(client, token)
-
-    assert body["routes"][0]["stop_total"] == 3
-    assert body["routes"][0]["stop_done"] == 1
 
 
 # --- worker positions -------------------------------------------------------------------

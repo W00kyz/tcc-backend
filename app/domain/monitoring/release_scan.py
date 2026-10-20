@@ -11,25 +11,19 @@ its own short-lived session — and then notifies the managers best-effort.
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import ColumnElement, exists, func, or_, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.campus_clock import campus_today
-from app.domain.appeals.models import Appeal, AppealStatus
 from app.domain.catalog.models import ContractorCompany, ServicePoint, ServiceType
 from app.domain.monitoring.alerts_service import alert_rule_enabled
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity, WorkerPosition
 from app.domain.monitoring.push import LoggingPushSender, PushSender
 from app.domain.monitoring.rules import AlertDraft
 from app.domain.monitoring.scan import insert_new_alerts, notify_new_alerts
-from app.domain.routing.models import (
-    ReleaseReason,
-    Route,
-    RouteStatus,
-    RouteStop,
-    RouteStopStatus,
-)
+from app.domain.reports.point_days import served_on
+from app.domain.routing.models import ReleaseReason, Route, RouteStatus, RouteStop
 from app.domain.routing.release import (
     LIVE_STOP_STATUSES,
     last_activity_at,
@@ -206,24 +200,6 @@ async def _close_the_day(db: AsyncSession, *, today: date, now: datetime) -> lis
     ]
 
 
-def _served_on(day: date) -> ColumnElement[bool]:
-    """Whether the point (correlated on `ServicePoint`) was served on `day` (spec §8.7): it has
-    a DONE stop that day, or an accepted appeal on one of its stops of that day. A released
-    point done later by somebody else counts as served once."""
-    done = exists().where(
-        RouteStop.service_point_id == ServicePoint.id,
-        RouteStop.service_date == day,
-        RouteStop.status == RouteStopStatus.DONE,
-    )
-    appealed = exists().where(
-        Appeal.route_stop_id == RouteStop.id,
-        Appeal.status == AppealStatus.ACCEPTED,
-        RouteStop.service_point_id == ServicePoint.id,
-        RouteStop.service_date == day,
-    )
-    return or_(done, appealed)
-
-
 async def _unserved_per_type(db: AsyncSession, day: date) -> list[tuple[str, str, int]]:
     """(service type, company, points not served on `day`) for every type with any, by type
     name. Only typed points of a company count — an untyped point is in nobody's pool."""
@@ -231,7 +207,7 @@ async def _unserved_per_type(db: AsyncSession, day: date) -> list[tuple[str, str
         select(ServiceType.name, ContractorCompany.name, func.count(ServicePoint.id))
         .join(ServiceType, ServicePoint.service_type_id == ServiceType.id)
         .join(ContractorCompany, ServiceType.contractor_company_id == ContractorCompany.id)
-        .where(~_served_on(day))
+        .where(~served_on(day))
         .group_by(ServiceType.name, ContractorCompany.name)
         .order_by(ServiceType.name)
     )

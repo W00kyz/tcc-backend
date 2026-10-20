@@ -1,44 +1,41 @@
+from dataclasses import fields
 from datetime import UTC, date, datetime
 
 from app.domain.reports.compliance import (
+    ComplianceCounts,
     ComplianceReport,
     ComplianceRow,
-    ComplianceTotals,
     FilterApplied,
     ReportGranularity,
 )
-from app.domain.reports.pdf import _PRINTABLE_WIDTH_MM, _TABLE_WIDTH_MM, render_compliance_pdf
+from app.domain.reports.pdf import (
+    _METRIC_HEADERS,
+    _PRINTABLE_WIDTH_MM,
+    _TABLE_WIDTH_MM,
+    render_compliance_pdf,
+)
 
 _METRIC_FIELDS = (
-    "routes_total",
-    "routes_started",
-    "routes_completed",
-    "routes_cancelled",
-    "stops_total",
-    "stops_done",
-    "stops_pending",
-    "stops_reassigned",
-    "executions_total",
-    "executions_with_evidence",
-    "executions_flagged",
-    "impediments_total",
-    "alerts_total",
+    "points_total",
+    "points_done",
+    "points_done_by_appeal",
+    "points_unserved",
+    "points_released",
+    "points_impeded",
+    "released_route_remainder",
+    "released_left_campus",
+    "released_location_silence",
+    "released_end_of_day",
 )
 
 
 def _row(label: str, start: date, base: int) -> ComplianceRow:
     metrics = {field: base + offset for offset, field in enumerate(_METRIC_FIELDS)}
-    return ComplianceRow(
-        period_label=label,
-        period_start=start,
-        completion_rate=0.873,
-        **metrics,
-    )
+    return ComplianceRow(period_label=label, period_start=start, **metrics)
 
 
-def _totals(count: int) -> ComplianceTotals:
-    metrics = dict.fromkeys(_METRIC_FIELDS, count)
-    return ComplianceTotals(completion_rate=0.912, **metrics)
+def _totals(count: int) -> ComplianceCounts:
+    return ComplianceCounts(**dict.fromkeys(_METRIC_FIELDS, count))
 
 
 def _report(rows: list[ComplianceRow], *, worker: str | None = "Ana Lima") -> ComplianceReport:
@@ -48,9 +45,9 @@ def _report(rows: list[ComplianceRow], *, worker: str | None = "Ana Lima") -> Co
         date_to=date(2026, 8, 31),
         filters_applied=FilterApplied(
             field_worker_name=worker,
+            company_name="Limpa Tudo",
             service_type_name="Limpeza",
             building_name=None,
-            route_status=None,
         ),
         periods=rows,
         totals=_totals(len(rows)),
@@ -96,3 +93,7 @@ def test_render_compliance_pdf_sanitizes_non_latin1_filter_name() -> None:
     result = render_compliance_pdf(_report(rows, worker="Nguyễn Vũ"))
 
     assert result[:4] == b"%PDF"
+
+
+def test_one_header_per_indicator() -> None:
+    assert len(_METRIC_HEADERS) == len(fields(ComplianceCounts)) == len(_METRIC_FIELDS)

@@ -1,15 +1,15 @@
 """Cenário de relatórios ponta a ponta — relatório mensal de conformidade + exportação
-(requisitos §7 RF43-RF46, design §2 Ruling 9 e §7).
+(requisitos §7 RF43-RF46, design §2 Ruling 9 e §7), na base ponto-dia de serviço (spec
+2026-10-20-alocacao-automatica §8.7).
 
-O deliverable da Etapa 10: um mês real de rotas acumuladas (uma por dia útil de setembro/2026)
-com stops, execuções (a maioria com evidência, uma sinalizada para revisão), um impedimento e um
-alerta é consolidado por `GET /reports/compliance` nas três
-granularidades e exportado em PDF e XLSX. Cada hop roda contra o Postgres/PostGIS real via uma
-requisição HTTP de verdade (`TestClient`), autenticada como gestora.
+O deliverable da Etapa 10: um mês real de trabalho acumulado (três pontos tipados, todo dia útil
+de setembro/2026) com pontos feitos, liberados por vários motivos, impedidos e um recurso aceito
+é consolidado por `GET /reports/compliance` nas três granularidades e exportado em PDF e XLSX.
+Cada hop roda contra o Postgres/PostGIS real via uma requisição HTTP de verdade (`TestClient`),
+autenticada como gestora.
 
 O que fica pinado aqui:
-- os 13 indicadores + `completion_rate` de um bucket MENSAL (rotas canceladas e pontos
-  reatribuídos ficam em 0 desde a alocação automática), conferidos contra valores
+- os indicadores + `completion_rate` de um bucket MENSAL, conferidos contra valores
   recomputados no teste a partir das constantes do seed (`_PLAN`), nunca lidos de volta da
   resposta;
 - a linha de TOTAIS igual ao único bucket mensal;
@@ -17,17 +17,17 @@ O que fica pinado aqui:
   que setembro/2026 abrange — 2026-W36..W40);
 - o PDF (`%PDF`, > 1 KB, `application/pdf`, `Content-Disposition` de anexo) e o XLSX (`PK`,
   contém `xl/worksheets/sheet1.xml`, content-type de planilha);
-- o filtro `field_worker_id` estreitando as métricas para as rotas de um profissional.
+- o filtro `field_worker_id` estreitando para os pontos-dia que um profissional teve no lote.
 
 O que fica como passo manual do autor (mesmo tratamento de `test_scenario_5_alerts.py`):
 - baixar os dois arquivos pelo painel com dados reais do piloto e conferir o layout num leitor
   de PDF / editor de planilha de verdade.
 
-Estratégia de seed: **inserção direta** via os modelos de domínio. Montar um mês de rotas pelos
-serviços reais (alocação + check-in/check-out por HTTP) seria dezenas de requisições e um
-fixture gigante para zero cobertura extra do read model — que é o alvo. As rotas, stops,
-execuções, evidências, impedimento e alerta são inseridos direto; o único
-caminho por serviço real exercitado aqui é o endpoint `/reports/compliance` sob teste.
+Estratégia de seed: **inserção direta** via os modelos de domínio. Montar um mês pelos serviços
+reais (alocação + check-in/check-out por HTTP) seria dezenas de requisições e um fixture gigante
+para zero cobertura extra do read model — que é o alvo. Rotas, paradas e recursos são inseridos
+direto; o único caminho por serviço real exercitado aqui é o endpoint `/reports/compliance` sob
+teste.
 
 Marcado `slow`, fora do run padrão (`-m "not slow"` no `addopts`); selecionar com
 `uv run pytest -m slow`.
@@ -36,78 +36,50 @@ Marcado `slow`, fora do run padrão (`-m "not slow"` no `addopts`); selecionar c
 import io
 import uuid
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from app.core.security import hash_password
-from app.domain.catalog.models import (
-    Building,
-    ContractorCompany,
-    Floor,
-    ServicePoint,
-    ServiceType,
-)
-from app.domain.execution.models import (
-    EvidenceItem,
-    EvidenceKind,
-    Execution,
-    ExecutionReviewStatus,
-    ExecutionSource,
-)
+from app.domain.appeals.models import Appeal, AppealReason, AppealStatus
 from app.domain.identity.models import User, UserRole
-from app.domain.impediments.models import Impediment, ImpedimentReason, ImpedimentScope
-from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from app.domain.routing.models import ReleaseReason, RouteStopStatus
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_worker
+from tests.support.factories import make_points, make_route, make_service_type, make_worker
 
 pytestmark = pytest.mark.asyncio
 
 _PASSWORD = "senha-forte-o-suficiente"
 _MANAGER_EMAIL = "gestora@pu.ufcg.edu.br"
-_WORKER_EMAIL = "operario@empresa.com"
 _MONTH_FROM = date(2026, 9, 1)
 _MONTH_TO = date(2026, 9, 30)
+_POINTS = 3
 
 # --- Seed constants — the whole scenario is derived from these so the assertions can recompute
 # every expected metric instead of trusting the response. -----------------------------------
-_WORKER_B_ROUTE_INDEXES = frozenset({3, 11, 19})  # rotas do segundo profissional
-_PAUSED_ROUTE_INDEXES = frozenset({7, 14})  # pontos liberados, nunca iniciadas
-_IN_PROGRESS_ROUTE_INDEX = 21
-_FLAGGED_STOP = (2, 0)  # (índice da rota, índice do stop) — review_status PENDING_REVIEW
-# Uma execução sem evidência: sem essa linha discriminante todas as
-# execuções teriam evidência e `executions_with_evidence == executions_total`, mascarando uma
-# regressão no filtro de evidência que degradasse para "conta todas as execuções".
-_BARE_EXECUTION_STOP = (0, 1)
-_IMPEDIMENT_ROUTE_INDEX = 4
-_ALERT_ROUTE_INDEX = 6
+_WORKER_B_DAY_INDEXES = frozenset({3, 11, 19})  # dias do segundo profissional
+_APPEALED_DAY_INDEX = 5  # P1 liberado por silêncio, recurso aceito
+_IMPEDED_DAY_INDEX = 4  # P2 impedido
+_END_OF_DAY_INDEX = 9  # P2 ainda no lote quando o expediente acabou
 
 
 @dataclass(frozen=True)
-class _ExecSpec:
-    has_evidence: bool
-    flagged: bool
-
-
-@dataclass
 class _StopSpec:
+    point: int
     status: RouteStopStatus
-    execution: _ExecSpec | None
+    reason: ReleaseReason | None = None
+    appealed: bool = False
 
 
-@dataclass
-class _RouteSpec:
+@dataclass(frozen=True)
+class _DaySpec:
     index: int
-    route_date: date
+    day: date
     worker: str  # "a" | "b"
-    status: RouteStatus
-    stops: list[_StopSpec] = field(default_factory=list)
-    has_impediment: bool = False
-    has_alert: bool = False
+    stops: tuple[_StopSpec, ...]
 
 
 def _weekdays(month_from: date, month_to: date) -> list[date]:
@@ -119,78 +91,56 @@ def _weekdays(month_from: date, month_to: date) -> list[date]:
     ]
 
 
-def _build_plan() -> list[_RouteSpec]:
-    """One route per weekday of September 2026, varied so no metric is trivially uniform."""
-    plan: list[_RouteSpec] = []
-    for i, route_date in enumerate(_weekdays(_MONTH_FROM, _MONTH_TO)):
-        if i in _PAUSED_ROUTE_INDEXES:
-            status = RouteStatus.PAUSED
-        elif i == _IN_PROGRESS_ROUTE_INDEX:
-            status = RouteStatus.IN_PROGRESS
-        else:
-            status = RouteStatus.DONE
-        worker = "b" if i in _WORKER_B_ROUTE_INDEXES else "a"
-        n_stops = 2 + (i % 2)  # 2 ou 3 stops
-        stops: list[_StopSpec] = []
-        for s in range(n_stops):
-            is_last = s == n_stops - 1
-            pending = is_last and i % 3 == 0
-            stop_status = RouteStopStatus.PENDING if pending else RouteStopStatus.DONE
-            has_execution = stop_status is RouteStopStatus.DONE and status in (
-                RouteStatus.DONE,
-                RouteStatus.IN_PROGRESS,
-            )
-            spec = _ExecSpec(has_evidence=True, flagged=False)
-            stops.append(_StopSpec(stop_status, spec if has_execution else None))
-        plan.append(
-            _RouteSpec(
-                index=i,
-                route_date=route_date,
-                worker=worker,
-                status=status,
-                stops=stops,
-                has_impediment=i == _IMPEDIMENT_ROUTE_INDEX,
-                has_alert=i == _ALERT_ROUTE_INDEX,
-            )
-        )
+def _day_stops(i: int) -> tuple[_StopSpec, ...]:
+    """P0 feito todo dia; P1 feito nos dias pares e liberado (saiu do campus) nos ímpares, menos
+    o do recurso; P2 fica no pool, menos no dia do impedimento e no do fim do expediente."""
+    done, released = RouteStopStatus.DONE, RouteStopStatus.RELEASED
+    stops = [_StopSpec(0, done)]
+    if i == _APPEALED_DAY_INDEX:
+        stops.append(_StopSpec(1, released, ReleaseReason.LOCATION_SILENCE, appealed=True))
+    elif i % 2:
+        stops.append(_StopSpec(1, released, ReleaseReason.LEFT_CAMPUS))
+    else:
+        stops.append(_StopSpec(1, done))
+    if i == _IMPEDED_DAY_INDEX:
+        stops.append(_StopSpec(2, released, ReleaseReason.IMPEDIMENT))
+    if i == _END_OF_DAY_INDEX:
+        stops.append(_StopSpec(2, released, ReleaseReason.END_OF_DAY))
+    return tuple(stops)
 
-    ri, si = _FLAGGED_STOP
-    plan[ri].stops[si].execution = _ExecSpec(has_evidence=True, flagged=True)
-    ri, si = _BARE_EXECUTION_STOP
-    plan[ri].stops[si].execution = _ExecSpec(has_evidence=False, flagged=False)
-    return plan
+
+def _build_plan() -> list[_DaySpec]:
+    """One route per weekday of September 2026, varied so no metric is trivially uniform."""
+    return [
+        _DaySpec(i, day, "b" if i in _WORKER_B_DAY_INDEXES else "a", _day_stops(i))
+        for i, day in enumerate(_weekdays(_MONTH_FROM, _MONTH_TO))
+    ]
 
 
 _PLAN = _build_plan()
 
 
 # --- Expected metrics, recomputed straight from `_PLAN` -------------------------------------
-def _executions(plan: list[_RouteSpec]) -> list[_ExecSpec]:
-    return [st.execution for r in plan for st in r.stops if st.execution is not None]
+def _expected_metrics(plan: list[_DaySpec]) -> dict[str, int | float]:
+    stops = [stop for day in plan for stop in day.stops]
+    total = len(plan) * _POINTS
+    done = sum(1 for st in stops if st.status is RouteStopStatus.DONE or st.appealed)
 
+    def released(reason: ReleaseReason) -> int:
+        return sum(1 for st in stops if st.reason is reason)
 
-def _expected_metrics(plan: list[_RouteSpec]) -> dict[str, int | float]:
-    all_stops = [st for r in plan for st in r.stops]
-    execs = _executions(plan)
-    stops_total = len(all_stops)
-    stops_done = sum(1 for st in all_stops if st.status is RouteStopStatus.DONE)
     return {
-        "routes_total": len(plan),
-        "routes_started": sum(
-            1 for r in plan if r.status in (RouteStatus.IN_PROGRESS, RouteStatus.DONE)
-        ),
-        "routes_completed": sum(1 for r in plan if r.status is RouteStatus.DONE),
-        "routes_cancelled": 0,
-        "stops_total": stops_total,
-        "stops_done": stops_done,
-        "stops_pending": sum(1 for st in all_stops if st.status is RouteStopStatus.PENDING),
-        "stops_reassigned": 0,
-        "executions_total": len(execs),
-        "executions_with_evidence": sum(1 for e in execs if e.has_evidence),
-        "executions_flagged": sum(1 for e in execs if e.flagged),
-        "impediments_total": sum(1 for r in plan if r.has_impediment),
-        "alerts_total": sum(1 for r in plan if r.has_alert),
-        "completion_rate": stops_done / stops_total if stops_total else 0.0,
+        "points_total": total,
+        "points_done": done,
+        "points_done_by_appeal": sum(1 for st in stops if st.appealed),
+        "points_unserved": total - done,
+        "points_released": sum(1 for st in stops if st.reason is not None),
+        "points_impeded": released(ReleaseReason.IMPEDIMENT),
+        "released_route_remainder": released(ReleaseReason.ROUTE_REMAINDER),
+        "released_left_campus": released(ReleaseReason.LEFT_CAMPUS),
+        "released_location_silence": released(ReleaseReason.LOCATION_SILENCE),
+        "released_end_of_day": released(ReleaseReason.END_OF_DAY),
+        "completion_rate": done / total,
     }
 
 
@@ -198,144 +148,58 @@ _METRIC_KEYS = tuple(_expected_metrics(_PLAN))
 
 
 class _Seed:
-    worker_a_id: uuid.UUID
-    worker_a_name: str
     worker_b_id: uuid.UUID
     worker_b_name: str
 
 
 async def _seed(db: AsyncSession) -> _Seed:
     seed = _Seed()
-    manager = User(
-        name="Gestora PU",
-        email=_MANAGER_EMAIL,
-        password_hash=hash_password(_PASSWORD),
-        role=UserRole.MANAGER,
-    )
-    worker_user = User(
-        name="Operario",
-        email=_WORKER_EMAIL,
-        password_hash=hash_password(_PASSWORD),
-        role=UserRole.FIELD_WORKER,
-    )
-    company = ContractorCompany(name="Limpa Tudo", cnpj=str(uuid.uuid4().int)[:14])
-    building = Building(name="Bloco CI", campus_area="CCT")
-    service_type = ServiceType(name="Varricao", average_duration_minutes=30)
-    db.add_all([manager, worker_user, company, building, service_type])
-    await db.flush()
-    floor = Floor(building_id=building.id, label="Terreo")
-    db.add(floor)
-    await db.flush()
-    # A point is live on one stop per day: each stop of a route visits its own point.
-    points = [
-        ServicePoint(
-            floor_id=floor.id, name=f"Sala 10{i}", description="x", latitude=-7.2, longitude=-35.9
+    db.add(
+        User(
+            name="Gestora PU",
+            email=_MANAGER_EMAIL,
+            password_hash=hash_password(_PASSWORD),
+            role=UserRole.MANAGER,
         )
-        for i in range(3)
-    ]
-    worker_a = await make_worker(db, company=company, full_name="Ana Costa")
-    worker_b = await make_worker(db, company=company, full_name="Bruno Dias")
-    db.add_all([*points, worker_a, worker_b])
-    await db.flush()
-    seed.worker_a_id, seed.worker_a_name = worker_a.id, worker_a.full_name
-    seed.worker_b_id, seed.worker_b_name = worker_b.id, worker_b.full_name
-    worker_ids = {"a": worker_a.id, "b": worker_b.id}
+    )
+    service_type = await make_service_type(db, company_name="Limpa Tudo", type_name="Varricao")
+    company = service_type.contractor_company
+    assert company is not None
+    points = await make_points(
+        db, service_type=service_type, names=[f"Sala 10{i}" for i in range(_POINTS)]
+    )
+    for point in points:
+        point.created_at = datetime(2026, 1, 5, 12, tzinfo=UTC)
+    workers = {
+        "a": await make_worker(db, company=company, full_name="Ana Costa"),
+        "b": await make_worker(db, company=company, full_name="Bruno Dias"),
+    }
+    seed.worker_b_id, seed.worker_b_name = workers["b"].id, workers["b"].full_name
 
     for spec in _PLAN:
-        started_at = (
-            datetime(
-                spec.route_date.year, spec.route_date.month, spec.route_date.day, 8, tzinfo=UTC
-            )
-            if spec.status in (RouteStatus.IN_PROGRESS, RouteStatus.DONE)
-            else None
+        route = await make_route(
+            db,
+            worker=workers[spec.worker],
+            day=spec.day,
+            points=[points[stop.point] for stop in spec.stops],
         )
-        route = Route(
-            field_worker_id=worker_ids[spec.worker],
-            route_date=spec.route_date,
-            status=spec.status,
-            started_at=started_at,
-        )
-        db.add(route)
-        await db.flush()
-
-        first_stop_id: uuid.UUID | None = None
-        for order_index, stop_spec in enumerate(spec.stops):
-            stop = RouteStop(
-                route_id=route.id,
-                service_point_id=points[order_index].id,
-                service_type_id=service_type.id,
-                order_index=order_index,
-                batch_number=1,
-                service_date=spec.route_date,
-                status=stop_spec.status,
-            )
-            db.add(stop)
-            await db.flush()
-            if first_stop_id is None:
-                first_stop_id = stop.id
-
-            exec_spec = stop_spec.execution
-            if exec_spec is None:
-                continue
-            checked_in = datetime(
-                spec.route_date.year, spec.route_date.month, spec.route_date.day, 9, tzinfo=UTC
-            )
-            execution = Execution(
-                route_stop_id=stop.id,
-                field_worker_id=worker_ids[spec.worker],
-                checked_in_at=checked_in,
-                checked_out_at=checked_in + timedelta(minutes=20),
-                synced_at=checked_in + timedelta(minutes=25),
-                source=ExecutionSource.APP,
-                idempotency_key=uuid.uuid4(),
-                review_status=(
-                    ExecutionReviewStatus.PENDING_REVIEW
-                    if exec_spec.flagged
-                    else ExecutionReviewStatus.NONE
-                ),
-            )
-            db.add(execution)
-            await db.flush()
-            if exec_spec.has_evidence:
+        for stop, stop_spec in zip(route.stops, spec.stops, strict=True):
+            stop.status = stop_spec.status
+            if stop_spec.reason is not None:
+                stop.release_reason = stop_spec.reason
+                stop.released_at = datetime(
+                    spec.day.year, spec.day.month, spec.day.day, 15, tzinfo=UTC
+                )
+            if stop_spec.appealed:
                 db.add(
-                    EvidenceItem(
-                        execution_id=execution.id,
-                        kind=EvidenceKind.NOTE,
-                        text_body="servico concluido",
-                        captured_at=checked_in + timedelta(minutes=18),
+                    Appeal(
+                        route_stop_id=stop.id,
+                        field_worker_id=workers[spec.worker].id,
+                        reason=AppealReason.NO_SIGNAL,
+                        status=AppealStatus.ACCEPTED,
+                        idempotency_key=uuid.uuid4(),
                     )
                 )
-
-        if spec.has_impediment:
-            db.add(
-                Impediment(
-                    route_id=route.id,
-                    route_stop_id=first_stop_id,
-                    scope=ImpedimentScope.STOP,
-                    reason=ImpedimentReason.ACCESS_BLOCKED,
-                    note="portao trancado",
-                    reported_by=worker_ids[spec.worker],
-                    reported_at=datetime(
-                        spec.route_date.year,
-                        spec.route_date.month,
-                        spec.route_date.day,
-                        10,
-                        tzinfo=UTC,
-                    ),
-                )
-            )
-        if spec.has_alert:
-            db.add(
-                Alert(
-                    kind=AlertKind.NO_EVIDENCE,
-                    severity=AlertSeverity.INFO,
-                    dedup_key=f"SEED:{route.id}",
-                    description="execucao sem evidencia",
-                    route_id=route.id,
-                    route_stop_id=first_stop_id,
-                    field_worker_id=worker_ids[spec.worker],
-                )
-            )
 
     await db.commit()
     return seed
@@ -411,8 +275,8 @@ async def test_monthly_compliance_report_and_exports_end_to_end(
     assert [p["period_start"] for p in weekly_periods] == sorted(
         p["period_start"] for p in weekly_periods
     )
-    # Every weekly routes_total sums back to the month total.
-    assert sum(p["routes_total"] for p in weekly_periods) == expected["routes_total"]
+    # Every weekly points_total sums back to the month total.
+    assert sum(p["points_total"] for p in weekly_periods) == expected["points_total"]
 
     # --- PDF export ------------------------------------------------------------------------
     pdf = _compliance(client, token, "/reports/compliance.pdf", granularity="MONTHLY")
@@ -435,15 +299,15 @@ async def test_monthly_compliance_report_and_exports_end_to_end(
     with zipfile.ZipFile(io.BytesIO(xlsx.content)) as workbook:
         assert "xl/worksheets/sheet1.xml" in workbook.namelist()
 
-    # --- Filter: narrow to one worker's routes -------------------------------------------
-    worker_b_routes = sum(1 for r in _PLAN if r.worker == "b")
-    assert worker_b_routes == 3
+    # --- Filter: narrow to the point-days one worker held ---------------------------------
+    worker_b_point_days = sum(len(d.stops) for d in _PLAN if d.worker == "b")
+    assert worker_b_point_days == 6
     filtered = _compliance(
         client, token, granularity="MONTHLY", field_worker_id=str(seed.worker_b_id)
     )
     assert filtered.status_code == 200, filtered.text
     filtered_body = filtered.json()
     assert len(filtered_body["periods"]) == 1
-    assert filtered_body["periods"][0]["routes_total"] == worker_b_routes
-    assert filtered_body["totals"]["routes_total"] == worker_b_routes
+    assert filtered_body["periods"][0]["points_total"] == worker_b_point_days
+    assert filtered_body["totals"]["points_total"] == worker_b_point_days
     assert filtered_body["filters_applied"]["field_worker_name"] == seed.worker_b_name

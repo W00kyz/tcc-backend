@@ -1,460 +1,281 @@
-"""RF45 — `build_compliance_report` against the real testcontainer.
+"""RF45 — `build_compliance_report` on the point-by-day model (spec 2026-10-20-alocacao-automatica
+§8.7) against the real testcontainer.
 
-A single fixed scenario of 4 routes spanning two ISO weeks across the Aug/Sep 2026 boundary, so
-DAILY, WEEKLY and MONTHLY each produce more than one bucket. Every one of the 13 indicators plus
-`completion_rate` is asserted per bucket and in the totals row against hand-computed constants,
-for each granularity, plus the filter-narrowing and edge cases.
+One fixed scenario over seven service days from Thu 2026-08-27 to Fri 2026-09-04 — two ISO weeks
+and two months, so DAILY, WEEKLY and MONTHLY each produce more than one bucket. Three typed
+points: P1 (Limpeza, Bloco 1) and P2 (Jardinagem, Bloco 2) exist all along, P3 (Limpeza, Bloco 1)
+from Wed 09-02. Every indicator is asserted per bucket and in the totals row against
+hand-computed constants, plus the filters and the resolved `filters_applied`.
 """
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
 import pytest
-from app.domain.catalog.models import (
-    Building,
-    ContractorCompany,
-    Floor,
-    ServicePoint,
-    ServiceType,
-)
-from app.domain.execution.models import (
-    EvidenceItem,
-    EvidenceKind,
-    Execution,
-    ExecutionReviewStatus,
-    ExecutionSource,
-)
-from app.domain.impediments.models import (
-    Impediment,
-    ImpedimentReason,
-    ImpedimentScope,
-)
-from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity
+from app.domain.appeals.models import Appeal, AppealReason, AppealStatus
+from app.domain.catalog.models import Building, FieldWorker, Floor, ServicePoint
 from app.domain.reports.compliance import (
-    _ROUTE_STATUS_LABELS,
+    ComplianceReport,
     ComplianceRow,
     ReportGranularity,
     build_compliance_report,
 )
 from app.domain.reports.filters import ReportFilters
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from app.domain.routing.models import ReleaseReason, RouteStop, RouteStopStatus
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_worker
+from tests.support.factories import make_points, make_route, make_service_type, make_worker
 
 pytestmark = pytest.mark.asyncio
 
+_FROM = date(2026, 8, 27)
+_TO = date(2026, 9, 4)
+_LONG_AGO = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)
+
 _METRICS = (
-    "routes_total",
-    "routes_started",
-    "routes_completed",
-    "routes_cancelled",
-    "stops_total",
-    "stops_done",
-    "stops_pending",
-    "stops_reassigned",
-    "executions_total",
-    "executions_with_evidence",
-    "executions_flagged",
-    "impediments_total",
-    "alerts_total",
+    "points_total",
+    "points_done",
+    "points_done_by_appeal",
+    "points_unserved",
+    "points_released",
+    "points_impeded",
+    "released_route_remainder",
+    "released_left_campus",
+    "released_location_silence",
+    "released_end_of_day",
 )
 
 
+@dataclass
 class _Ids:
-    def __init__(self) -> None:
-        self.worker: uuid.UUID
-        self.building_1: uuid.UUID
-        self.building_2: uuid.UUID
-        self.service_type_1: uuid.UUID
-        self.service_type_2: uuid.UUID
+    walter: uuid.UUID
+    cleaning_company: uuid.UUID
+    cleaning_type: uuid.UUID
+    building_1: uuid.UUID
+    building_1_name: str
+
+
+async def _stop(
+    db: AsyncSession,
+    worker: FieldWorker,
+    day: date,
+    point: ServicePoint,
+    *,
+    status: RouteStopStatus,
+    reason: ReleaseReason | None = None,
+) -> RouteStop:
+    route = await make_route(db, worker=worker, day=day, points=[point])
+    stop = route.stops[0]
+    stop.status = status
+    if reason is not None:
+        stop.release_reason = reason
+        stop.released_at = datetime(day.year, day.month, day.day, 15, 0, tzinfo=UTC)
+    return stop
 
 
 async def _seed(db: AsyncSession) -> _Ids:
-    ids = _Ids()
-    company = ContractorCompany(name="Limpa Tudo", cnpj=str(uuid.uuid4().int)[:14])
-    b1 = Building(name="Bloco CI", campus_area="CCT")
-    b2 = Building(name="Bloco CN", campus_area="CCT")
-    s1 = ServiceType(name="Varrição", average_duration_minutes=30)
-    s2 = ServiceType(name="Coleta", average_duration_minutes=20)
-    db.add_all([company, b1, b2, s1, s2])
-    await db.flush()
-    f1 = Floor(building_id=b1.id, label="Térreo")
-    f2 = Floor(building_id=b2.id, label="Térreo")
-    db.add_all([f1, f2])
-    await db.flush()
-    p1 = ServicePoint(
-        floor_id=f1.id, name="Sala 101", description="x", latitude=-7.2, longitude=-35.9
+    cleaning = await make_service_type(db, company_name="Limpa Tudo", type_name="Limpeza")
+    garden = await make_service_type(db, company_name="Verde", type_name="Jardinagem")
+    p1, p3 = await make_points(db, service_type=cleaning, names=["P1", "P3"])
+    (p2,) = await make_points(db, service_type=garden, names=["P2"])
+    for point in (p1, p2):
+        point.created_at = _LONG_AGO
+    p3.created_at = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+    assert cleaning.contractor_company is not None
+    assert garden.contractor_company is not None
+    walter = await make_worker(db, company=cleaning.contractor_company, full_name="Walter")
+    xavier = await make_worker(db, company=garden.contractor_company, full_name="Xavier")
+    yuri = await make_worker(db, company=cleaning.contractor_company, full_name="Yuri")
+    released, done = RouteStopStatus.RELEASED, RouteStopStatus.DONE
+
+    # 08-27: Yuri leaves the campus with P1, Walter does it.
+    await _stop(db, yuri, date(2026, 8, 27), p1, status=released, reason=ReleaseReason.LEFT_CAMPUS)
+    await _stop(db, walter, date(2026, 8, 27), p1, status=done)
+    # 08-28: Xavier reports P2 impeded.
+    await _stop(db, xavier, date(2026, 8, 28), p2, status=released, reason=ReleaseReason.IMPEDIMENT)
+    # 09-01: Walter goes silent with P1 and wins the appeal.
+    appealed = await _stop(
+        db, walter, date(2026, 9, 1), p1, status=released, reason=ReleaseReason.LOCATION_SILENCE
     )
-    p2 = ServicePoint(
-        floor_id=f2.id, name="Sala 201", description="x", latitude=-7.2, longitude=-35.9
-    )
-    worker = await make_worker(db, company=company, full_name="João da Silva")
-    db.add_all([p1, p2, worker])
-    await db.flush()
-
-    ids.worker = worker.id
-    ids.building_1 = b1.id
-    ids.building_2 = b2.id
-    ids.service_type_1 = s1.id
-    ids.service_type_2 = s2.id
-
-    def _clock(day: date) -> datetime:
-        return datetime(day.year, day.month, day.day, 10, 0, tzinfo=UTC)
-
-    async def _stop(
-        route: Route,
-        point_id: uuid.UUID,
-        service_type_id: uuid.UUID,
-        status: RouteStopStatus,
-        order_index: int,
-    ) -> RouteStop:
-        stop = RouteStop(
-            route_id=route.id,
-            service_point_id=point_id,
-            service_type_id=service_type_id,
-            order_index=order_index,
-            batch_number=1,
-            service_date=route.route_date,
-            status=status,
-        )
-        db.add(stop)
-        await db.flush()
-        return stop
-
-    async def _execution(
-        stop: RouteStop, day: date, review_status: ExecutionReviewStatus
-    ) -> Execution:
-        execution = Execution(
-            route_stop_id=stop.id,
-            field_worker_id=worker.id,
-            checked_in_at=_clock(day),
-            synced_at=_clock(day),
-            source=ExecutionSource.APP,
+    db.add(
+        Appeal(
+            route_stop_id=appealed.id,
+            field_worker_id=walter.id,
+            reason=AppealReason.NO_SIGNAL,
+            status=AppealStatus.ACCEPTED,
             idempotency_key=uuid.uuid4(),
-            review_status=review_status,
-        )
-        db.add(execution)
-        await db.flush()
-        return execution
-
-    # R1 — 2026-08-27 (Thu), DONE, started.
-    r1 = Route(
-        field_worker_id=worker.id,
-        route_date=date(2026, 8, 27),
-        status=RouteStatus.DONE,
-        started_at=_clock(date(2026, 8, 27)),
-    )
-    db.add(r1)
-    await db.flush()
-    r1_s1 = await _stop(r1, p1.id, s1.id, RouteStopStatus.DONE, 0)
-    await _stop(r1, p2.id, s2.id, RouteStopStatus.PENDING, 1)
-    e1 = await _execution(r1_s1, date(2026, 8, 27), ExecutionReviewStatus.NONE)
-    db.add(
-        EvidenceItem(
-            execution_id=e1.id,
-            kind=EvidenceKind.NOTE,
-            text_body="feito",
-            captured_at=_clock(date(2026, 8, 27)),
         )
     )
-    await _execution(r1_s1, date(2026, 8, 27), ExecutionReviewStatus.PENDING_REVIEW)
-    db.add(
-        Impediment(
-            route_id=r1.id,
-            scope=ImpedimentScope.ROUTE_REMAINDER,
-            reason=ImpedimentReason.OTHER,
-            reported_by=worker.id,
-            reported_at=_clock(date(2026, 8, 27)),
-        )
+    # 09-03: Walter stops for the day holding P3, Yuri does it.
+    await _stop(
+        db, walter, date(2026, 9, 3), p3, status=released, reason=ReleaseReason.ROUTE_REMAINDER
     )
-    db.add(
-        Alert(
-            kind=AlertKind.NO_EVIDENCE,
-            severity=AlertSeverity.INFO,
-            dedup_key=f"k-{uuid.uuid4()}",
-            description="atraso",
-            route_id=r1.id,
-        )
-    )
-
-    # R2 — 2026-08-28 (Fri), PAUSED, never started. One PENDING stop in building 2 / type 1.
-    r2 = Route(
-        field_worker_id=worker.id,
-        route_date=date(2026, 8, 28),
-        status=RouteStatus.PAUSED,
-    )
-    db.add(r2)
-    await db.flush()
-    await _stop(r2, p2.id, s1.id, RouteStopStatus.PENDING, 0)
-
-    # R3 — 2026-09-03 (Thu), PAUSED, never started, no stops → routes but zero stops.
-    r3 = Route(
-        field_worker_id=worker.id,
-        route_date=date(2026, 9, 3),
-        status=RouteStatus.PAUSED,
-    )
-    db.add(r3)
-    await db.flush()
-
-    # R4 — 2026-09-04 (Fri), IN_PROGRESS, not started (status alone counts as started).
-    r4 = Route(
-        field_worker_id=worker.id,
-        route_date=date(2026, 9, 4),
-        status=RouteStatus.IN_PROGRESS,
-    )
-    db.add(r4)
-    await db.flush()
-    r4_s1 = await _stop(r4, p2.id, s2.id, RouteStopStatus.DONE, 0)
-    await _stop(r4, p1.id, s1.id, RouteStopStatus.IN_PROGRESS, 1)
-    await _execution(r4_s1, date(2026, 9, 4), ExecutionReviewStatus.NONE)  # no evidence
-    db.add(
-        Alert(
-            kind=AlertKind.NO_EVIDENCE,
-            severity=AlertSeverity.INFO,
-            dedup_key=f"k-{uuid.uuid4()}",
-            description="atraso",
-            route_id=r4.id,
-        )
-    )
+    await _stop(db, yuri, date(2026, 9, 3), p3, status=done)
+    # 09-04: the day ends with P2 still in Xavier's batch.
+    await _stop(db, xavier, date(2026, 9, 4), p2, status=released, reason=ReleaseReason.END_OF_DAY)
     await db.commit()
-    return ids
+
+    floor = await db.get(Floor, p1.floor_id)
+    assert floor is not None
+    building = await db.get(Building, floor.building_id)
+    assert building is not None
+    return _Ids(
+        walter=walter.id,
+        cleaning_company=cleaning.contractor_company.id,
+        cleaning_type=cleaning.id,
+        building_1=building.id,
+        building_1_name=building.name,
+    )
 
 
-def _assert_row(
-    row: ComplianceRow, period_label: str, period_start: date, **expected: object
-) -> None:
-    assert row.period_label == period_label
-    assert row.period_start == period_start
-    for name, value in expected.items():
-        assert getattr(row, name) == value, name
+def _metrics(**nonzero: int) -> dict[str, int]:
+    return {name: nonzero.get(name, 0) for name in _METRICS}
 
 
-def _full_range() -> ReportFilters:
-    return ReportFilters(date_from=date(2026, 8, 1), date_to=date(2026, 9, 30))
+# Hand-computed constants, one per service day -------------------------------------------------
+
+_DAYS = {
+    date(2026, 8, 27): _metrics(
+        points_total=2, points_done=1, points_unserved=1, points_released=1, released_left_campus=1
+    ),
+    date(2026, 8, 28): _metrics(
+        points_total=2, points_unserved=2, points_released=1, points_impeded=1
+    ),
+    date(2026, 8, 31): _metrics(points_total=2, points_unserved=2),
+    date(2026, 9, 1): _metrics(
+        points_total=2,
+        points_done=1,
+        points_done_by_appeal=1,
+        points_unserved=1,
+        points_released=1,
+        released_location_silence=1,
+    ),
+    date(2026, 9, 2): _metrics(points_total=3, points_unserved=3),
+    date(2026, 9, 3): _metrics(
+        points_total=3,
+        points_done=1,
+        points_unserved=2,
+        points_released=1,
+        released_route_remainder=1,
+    ),
+    date(2026, 9, 4): _metrics(
+        points_total=3, points_unserved=3, points_released=1, released_end_of_day=1
+    ),
+}
 
 
-# Hand-computed constants ----------------------------------------------------------------------
-
-_D1 = dict(  # noqa: C408 - a literal metric table reads better as kwargs
-    routes_total=1,
-    routes_started=1,
-    routes_completed=1,
-    routes_cancelled=0,
-    stops_total=2,
-    stops_done=1,
-    stops_pending=1,
-    stops_reassigned=0,
-    executions_total=2,
-    executions_with_evidence=1,
-    executions_flagged=1,
-    impediments_total=1,
-    alerts_total=1,
-)
-_D2 = dict(  # noqa: C408
-    routes_total=1,
-    routes_started=0,
-    routes_completed=0,
-    routes_cancelled=0,
-    stops_total=1,
-    stops_done=0,
-    stops_pending=1,
-    stops_reassigned=0,
-    executions_total=0,
-    executions_with_evidence=0,
-    executions_flagged=0,
-    impediments_total=0,
-    alerts_total=0,
-)
-_D3 = dict(  # noqa: C408
-    routes_total=1,
-    routes_started=0,
-    routes_completed=0,
-    routes_cancelled=0,
-    stops_total=0,
-    stops_done=0,
-    stops_pending=0,
-    stops_reassigned=0,
-    executions_total=0,
-    executions_with_evidence=0,
-    executions_flagged=0,
-    impediments_total=0,
-    alerts_total=0,
-)
-_D4 = dict(  # noqa: C408
-    routes_total=1,
-    routes_started=1,
-    routes_completed=0,
-    routes_cancelled=0,
-    stops_total=2,
-    stops_done=1,
-    stops_pending=0,
-    stops_reassigned=0,
-    executions_total=1,
-    executions_with_evidence=0,
-    executions_flagged=0,
-    impediments_total=0,
-    alerts_total=1,
-)
+def _merge(*days: date) -> dict[str, int]:
+    return {name: sum(_DAYS[day][name] for day in days) for name in _METRICS}
 
 
-def _merge(*rows: dict[str, int]) -> dict[str, int]:
-    return {name: sum(row[name] for row in rows) for name in _METRICS}
+def _assert_row(row: ComplianceRow, label: str, start: date, expected: dict[str, int]) -> None:
+    assert (row.period_label, row.period_start) == (label, start)
+    assert {name: getattr(row, name) for name in _METRICS} == expected
+    assert row.completion_rate == pytest.approx(expected["points_done"] / expected["points_total"])
+
+
+async def _report(
+    db: AsyncSession, granularity: ReportGranularity, **filters: uuid.UUID
+) -> ComplianceReport:
+    return await build_compliance_report(
+        db,
+        granularity=granularity,
+        filters=ReportFilters(date_from=_FROM, date_to=_TO, **filters),
+    )
 
 
 async def test_daily_metrics(db_session: AsyncSession) -> None:
     await _seed(db_session)
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.DAILY, filters=_full_range()
-    )
-    assert [r.period_start for r in report.periods] == [
-        date(2026, 8, 27),
-        date(2026, 8, 28),
-        date(2026, 9, 3),
-        date(2026, 9, 4),
-    ]
-    _assert_row(report.periods[0], "2026-08-27", date(2026, 8, 27), **_D1, completion_rate=0.5)
-    _assert_row(report.periods[1], "2026-08-28", date(2026, 8, 28), **_D2, completion_rate=0.0)
-    _assert_row(report.periods[2], "2026-09-03", date(2026, 9, 3), **_D3, completion_rate=0.0)
-    _assert_row(report.periods[3], "2026-09-04", date(2026, 9, 4), **_D4, completion_rate=0.5)
 
-    totals = _merge(_D1, _D2, _D3, _D4)
-    for name in _METRICS:
-        assert getattr(report.totals, name) == totals[name], name
-    assert report.totals.completion_rate == pytest.approx(2 / 5)
+    report = await _report(db_session, ReportGranularity.DAILY)
+
+    assert len(report.periods) == len(_DAYS)
+    for row, (day, expected) in zip(report.periods, _DAYS.items(), strict=True):
+        _assert_row(row, day.isoformat(), day, expected)
+    totals = {name: getattr(report.totals, name) for name in _METRICS}
+    assert totals == _merge(*_DAYS)
+    assert totals["points_total"] == 17
+    assert report.totals.completion_rate == pytest.approx(3 / 17)
 
 
 async def test_weekly_metrics(db_session: AsyncSession) -> None:
     await _seed(db_session)
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.WEEKLY, filters=_full_range()
-    )
-    assert [r.period_start for r in report.periods] == [date(2026, 8, 24), date(2026, 8, 31)]
+
+    report = await _report(db_session, ReportGranularity.WEEKLY)
+
+    week_35, week_36 = report.periods
     _assert_row(
-        report.periods[0],
-        "2026-W35",
-        date(2026, 8, 24),
-        **_merge(_D1, _D2),
-        completion_rate=pytest.approx(1 / 3),
+        week_35, "2026-W35", date(2026, 8, 24), _merge(date(2026, 8, 27), date(2026, 8, 28))
     )
     _assert_row(
-        report.periods[1],
+        week_36,
         "2026-W36",
         date(2026, 8, 31),
-        **_merge(_D3, _D4),
-        completion_rate=0.5,
+        _merge(*(day for day in _DAYS if day >= date(2026, 8, 31))),
     )
-    assert report.totals.completion_rate == pytest.approx(2 / 5)
 
 
 async def test_monthly_metrics(db_session: AsyncSession) -> None:
     await _seed(db_session)
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.MONTHLY, filters=_full_range()
-    )
-    assert [r.period_start for r in report.periods] == [date(2026, 8, 1), date(2026, 9, 1)]
-    _assert_row(
-        report.periods[0],
-        "2026-08",
-        date(2026, 8, 1),
-        **_merge(_D1, _D2),
-        completion_rate=pytest.approx(1 / 3),
-    )
-    _assert_row(
-        report.periods[1],
-        "2026-09",
-        date(2026, 9, 1),
-        **_merge(_D3, _D4),
-        completion_rate=0.5,
-    )
+
+    report = await _report(db_session, ReportGranularity.MONTHLY)
+
+    august, september = report.periods
+    _assert_row(august, "2026-08", date(2026, 8, 1), _merge(*(d for d in _DAYS if d.month == 8)))
+    _assert_row(september, "2026-09", date(2026, 9, 1), _merge(*(d for d in _DAYS if d.month == 9)))
 
 
-async def test_completion_rate_zero_for_period_with_routes_but_no_stops(
-    db_session: AsyncSession,
-) -> None:
+async def test_days_without_typed_points_are_absent(db_session: AsyncSession) -> None:
     await _seed(db_session)
+
     report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.DAILY, filters=_full_range()
+        db_session,
+        granularity=ReportGranularity.DAILY,
+        filters=ReportFilters(date_from=date(2025, 12, 1), date_to=date(2025, 12, 31)),
     )
-    sep_3 = next(r for r in report.periods if r.period_start == date(2026, 9, 3))
-    assert sep_3.routes_total == 1
-    assert sep_3.stops_total == 0
-    assert sep_3.completion_rate == 0.0
+
+    assert report.periods == []
+    assert report.totals.points_total == 0
+    assert report.totals.completion_rate == 0.0
 
 
-async def test_empty_periods_are_absent(db_session: AsyncSession) -> None:
-    await _seed(db_session)
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.DAILY, filters=_full_range()
-    )
-    days = {r.period_start for r in report.periods}
-    assert date(2026, 8, 29) not in days
-    assert date(2026, 9, 1) not in days
-    assert len(report.periods) == 4
-
-
-async def test_service_type_filter_narrows_scope(db_session: AsyncSession) -> None:
+async def test_company_filter_narrows_to_its_points(db_session: AsyncSession) -> None:
     ids = await _seed(db_session)
-    filters = ReportFilters(
-        date_from=date(2026, 8, 1),
-        date_to=date(2026, 9, 30),
-        service_type_id=ids.service_type_2,
-    )
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.DAILY, filters=filters
-    )
-    # Only R1 (08-27) and R4 (09-04) have a stop of type 2 — R2/R3 drop out entirely.
-    assert [r.period_start for r in report.periods] == [date(2026, 8, 27), date(2026, 9, 4)]
-    _assert_row(report.periods[0], "2026-08-27", date(2026, 8, 27), **_D1, completion_rate=0.5)
-    _assert_row(report.periods[1], "2026-09-04", date(2026, 9, 4), **_D4, completion_rate=0.5)
-    assert report.filters_applied.service_type_name == "Coleta"
+
+    report = await _report(db_session, ReportGranularity.MONTHLY, company_id=ids.cleaning_company)
+
+    # P1 on seven days, P3 on three.
+    assert report.totals.points_total == 10
+    assert report.totals.points_done == 3
+    assert report.totals.points_impeded == 0
+    assert report.filters_applied.company_name == "Limpa Tudo"
 
 
-async def test_building_filter_narrows_scope(db_session: AsyncSession) -> None:
+async def test_service_type_and_building_filters(db_session: AsyncSession) -> None:
     ids = await _seed(db_session)
-    filters = ReportFilters(
-        date_from=date(2026, 8, 1),
-        date_to=date(2026, 9, 30),
-        building_id=ids.building_1,
+
+    by_type = await _report(
+        db_session, ReportGranularity.MONTHLY, service_type_id=ids.cleaning_type
     )
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.DAILY, filters=filters
-    )
-    # Building 1 is only touched by R1 (stop 1) and R4 (stop 2).
-    assert [r.period_start for r in report.periods] == [date(2026, 8, 27), date(2026, 9, 4)]
-    assert report.filters_applied.building_name == "Bloco CI"
+    by_building = await _report(db_session, ReportGranularity.MONTHLY, building_id=ids.building_1)
+
+    assert by_type.totals == by_building.totals
+    assert by_type.totals.points_total == 10
+    assert by_type.filters_applied.service_type_name == "Limpeza"
+    assert by_building.filters_applied.building_name == ids.building_1_name
 
 
-async def test_route_status_paused_filter(db_session: AsyncSession) -> None:
-    await _seed(db_session)
-    filters = ReportFilters(
-        date_from=date(2026, 8, 1),
-        date_to=date(2026, 9, 30),
-        route_status=RouteStatus.PAUSED.value,
-    )
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.DAILY, filters=filters
-    )
-    assert [r.period_start for r in report.periods] == [date(2026, 8, 28), date(2026, 9, 3)]
-    _assert_row(report.periods[0], "2026-08-28", date(2026, 8, 28), **_D2, completion_rate=0.0)
-    # `filters_applied` is the human-readable struct (spec §2 Ruling 8) — pt-BR label, not enum.
-    assert report.filters_applied.route_status == "Pausada"
-
-
-def test_route_status_labels_cover_every_member() -> None:
-    # A future RouteStatus member must fail loudly here rather than KeyError at request time.
-    assert set(_ROUTE_STATUS_LABELS) == set(RouteStatus)
-
-
-async def test_filters_applied_resolves_worker_name(db_session: AsyncSession) -> None:
+async def test_worker_filter_keeps_the_point_days_they_held(db_session: AsyncSession) -> None:
     ids = await _seed(db_session)
-    filters = ReportFilters(
-        date_from=date(2026, 8, 1),
-        date_to=date(2026, 9, 30),
-        field_worker_id=ids.worker,
-    )
-    report = await build_compliance_report(
-        db_session, granularity=ReportGranularity.MONTHLY, filters=filters
-    )
-    assert report.filters_applied.field_worker_name == "João da Silva"
-    assert report.filters_applied.service_type_name is None
+
+    report = await _report(db_session, ReportGranularity.MONTHLY, field_worker_id=ids.walter)
+
+    # P1 on 08-27 (done) and 09-01 (appeal), P3 on 09-03 (released, done by Yuri): each
+    # point-day keeps its one outcome, whoever served it.
+    assert report.totals.points_total == 3
+    assert report.totals.points_done == 3
+    assert report.totals.points_done_by_appeal == 1
+    assert report.totals.points_released == 3
+    assert report.filters_applied.field_worker_name == "Walter"
+    assert report.filters_applied.company_name is None

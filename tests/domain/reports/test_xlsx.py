@@ -3,34 +3,31 @@ import zipfile
 from datetime import UTC, date, datetime
 
 from app.domain.reports.compliance import (
+    ComplianceCounts,
     ComplianceReport,
     ComplianceRow,
-    ComplianceTotals,
     FilterApplied,
     ReportGranularity,
 )
 from app.domain.reports.xlsx import render_compliance_xlsx
 
 _METRIC_FIELDS = (
-    "routes_total",
-    "routes_started",
-    "routes_completed",
-    "routes_cancelled",
-    "stops_total",
-    "stops_done",
-    "stops_pending",
-    "stops_reassigned",
-    "executions_total",
-    "executions_with_evidence",
-    "executions_flagged",
-    "impediments_total",
-    "alerts_total",
+    "points_total",
+    "points_done",
+    "points_done_by_appeal",
+    "points_unserved",
+    "points_released",
+    "points_impeded",
+    "released_route_remainder",
+    "released_left_campus",
+    "released_location_silence",
+    "released_end_of_day",
 )
 
 
 def _row(label: str, start: date, base: int) -> ComplianceRow:
     metrics = {field: base + offset for offset, field in enumerate(_METRIC_FIELDS)}
-    return ComplianceRow(period_label=label, period_start=start, completion_rate=0.5, **metrics)
+    return ComplianceRow(period_label=label, period_start=start, **metrics)
 
 
 def _report() -> ComplianceReport:
@@ -38,16 +35,16 @@ def _report() -> ComplianceReport:
         _row("2026-08", date(2026, 8, 1), 2),
         _row("2026-09", date(2026, 9, 1), 6),
     ]
-    totals = ComplianceTotals(completion_rate=0.75, **dict.fromkeys(_METRIC_FIELDS, 8))
+    totals = ComplianceCounts(**dict.fromkeys(_METRIC_FIELDS, 8))
     return ComplianceReport(
         granularity=ReportGranularity.MONTHLY,
         date_from=date(2026, 8, 1),
         date_to=date(2026, 9, 30),
         filters_applied=FilterApplied(
             field_worker_name="João Conceição",
+            company_name=None,
             service_type_name=None,
             building_name="Bloco CN",
-            route_status="Concluída",
         ),
         periods=rows,
         totals=totals,
@@ -63,3 +60,14 @@ def test_render_compliance_xlsx_returns_xlsx_zip() -> None:
 
     with zipfile.ZipFile(io.BytesIO(result)) as archive:
         assert "xl/worksheets/sheet1.xml" in archive.namelist()
+
+
+def test_xlsx_headers_name_the_point_by_day_indicators() -> None:
+    with zipfile.ZipFile(io.BytesIO(render_compliance_xlsx(_report()))) as archive:
+        strings = archive.read("xl/sharedStrings.xml").decode()
+
+    for header in ("Pontos não atendidos", "Feitos por recurso", "Impedidos", "fim do expediente"):
+        assert header in strings, header
+    assert "reatribu" not in strings
+    assert "Status da rota" not in strings
+    assert "Empresa: " not in strings  # no company filter in this report
