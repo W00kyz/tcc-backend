@@ -2,8 +2,8 @@
 
 Pure function: `ComplianceReport -> bytes`. No DB, no I/O beyond fpdf2's in-memory buffer.
 
-Landscape A4 because the table is 12 columns (a "Período" column + the 10 point-day indicators
-+ a "% concl." column) and will not fit portrait at a readable size. The built-in "Helvetica"
+Landscape A4 because the table is 16 columns (a "Período" column + the 14 indicators + a
+"% concl." column) and will not fit portrait at a readable size. The built-in "Helvetica"
 core font is Latin-1 only (fpdf2's `core_fonts_encoding`); pt-BR accented letters (á, ç, ã, õ)
 are in Latin-1 so filter names render fine, but the em-dash and other non-Latin-1 glyphs are
 not — every literal here stays ASCII-punctuation only.
@@ -21,7 +21,7 @@ _GRANULARITY_LABELS: dict[ReportGranularity, str] = {
     ReportGranularity.MONTHLY: "Mensal",
 }
 
-# Abbreviated headers — 12 columns on landscape A4 is tight, so the metric headers are short.
+# Abbreviated headers — 16 columns on landscape A4 is tight, so the metric headers are short.
 # Order matches `_METRIC_FIELDS` (the fields of `ComplianceCounts`) plus the leading period and
 # trailing rate.
 _METRIC_HEADERS: tuple[str, ...] = (
@@ -35,6 +35,10 @@ _METRIC_HEADERS: tuple[str, ...] = (
     "Lib. campus",
     "Lib. sinal",
     "Lib. fim dia",
+    "Execuções",
+    "C/ evid.",
+    "Sinalizadas",
+    "Alertas",
 )
 _METRIC_FIELDS: tuple[str, ...] = tuple(field.name for field in fields(ComplianceCounts))
 
@@ -73,6 +77,8 @@ def _metadata_lines(report: ComplianceReport) -> list[str]:
         lines.append(f"Tipo de serviço: {_latin1(applied.service_type_name)}")
     if applied.building_name is not None:
         lines.append(f"Prédio: {_latin1(applied.building_name)}")
+    if applied.outcome is not None:
+        lines.append(f"Situação: {applied.outcome}")
     lines.append(f"Gerado em: {report.generated_at:%d/%m/%Y %H:%M}")
     return lines
 

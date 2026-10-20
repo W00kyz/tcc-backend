@@ -15,18 +15,7 @@ from app.domain.reports.pdf import (
     render_compliance_pdf,
 )
 
-_METRIC_FIELDS = (
-    "points_total",
-    "points_done",
-    "points_done_by_appeal",
-    "points_unserved",
-    "points_released",
-    "points_impeded",
-    "released_route_remainder",
-    "released_left_campus",
-    "released_location_silence",
-    "released_end_of_day",
-)
+_METRIC_FIELDS = tuple(field.name for field in fields(ComplianceCounts))
 
 
 def _row(label: str, start: date, base: int) -> ComplianceRow:
@@ -48,6 +37,7 @@ def _report(rows: list[ComplianceRow], *, worker: str | None = "Ana Lima") -> Co
             company_name="Limpa Tudo",
             service_type_name="Limpeza",
             building_name=None,
+            outcome=None,
         ),
         periods=rows,
         totals=_totals(len(rows)),

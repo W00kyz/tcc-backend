@@ -29,6 +29,7 @@ from app.domain.reports.compliance import (
 )
 from app.domain.reports.filters import ReportFilters
 from app.domain.reports.pdf import render_compliance_pdf
+from app.domain.reports.point_days import PointDayOutcome
 from app.domain.reports.xlsx import render_compliance_xlsx
 
 reports_router = APIRouter(prefix="/reports", tags=["reports"])
@@ -51,12 +52,14 @@ class FilterAppliedOut(BaseModel):
     company_name: str | None
     service_type_name: str | None
     building_name: str | None
+    outcome: str | None  # the pt-BR label of the outcome filter
 
 
 class ComplianceTotalsOut(BaseModel):
     """Mirror of `ComplianceCounts` — the point-day indicators (spec 2026-10-20-alocacao-
-    automatica §8.7) plus the derived `completion_rate`. `points_done` includes the ones done by
-    appeal; `points_impeded` is the release counter of the IMPEDIMENT reason."""
+    automatica §8.7), the linked executions and alerts, and the derived `completion_rate`.
+    `points_done` includes the ones done by appeal; `points_impeded` is the release counter of
+    the IMPEDIMENT reason."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -70,6 +73,10 @@ class ComplianceTotalsOut(BaseModel):
     released_left_campus: int
     released_location_silence: int
     released_end_of_day: int
+    executions_total: int
+    executions_with_evidence: int
+    executions_flagged: int
+    alerts_total: int
     completion_rate: float
 
 
@@ -105,9 +112,11 @@ def _parse_report_params(
     company_id: Annotated[UUID | None, Query()] = None,
     service_type_id: Annotated[UUID | None, Query()] = None,
     building_id: Annotated[UUID | None, Query()] = None,
+    outcome: Annotated[PointDayOutcome | None, Query()] = None,
 ) -> tuple[ReportGranularity, ReportFilters]:
     """Validate the shared query axis and build the `ReportFilters`. Raises `HTTPException(422)`
-    on an inverted range or a span over `_MAX_SPAN_DAYS`."""
+    on an inverted range or a span over `_MAX_SPAN_DAYS`; FastAPI answers 422 on an unknown
+    `outcome` (the RF44 status axis, spec 2026-10-20-alocacao-automatica §8.7)."""
     if date_to < date_from:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -126,6 +135,7 @@ def _parse_report_params(
         company_id=company_id,
         service_type_id=service_type_id,
         building_id=building_id,
+        outcome=outcome,
     )
     return granularity, filters
 

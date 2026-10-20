@@ -2,8 +2,9 @@
 counting on the point-by-day model (spec 2026-10-20-alocacao-automatica §8.7).
 
 A tiny fixed scenario: two typed points over the 22 service days of September 2026; worker A
-does one of them on Thu 09-03, worker B leaves the campus holding it on Fri 09-04, so the
-`field_worker_id` filter has something to narrow. The JSON endpoint's shape and a couple of
+does one of them on Thu 09-03, worker B leaves the campus holding it on Fri 09-04, and A wins an
+appeal on the other one on Tue 09-08 — so the `field_worker_id` and `outcome` filters have
+something to narrow. The JSON endpoint's shape and a couple of
 metric values are asserted against the seed; the exports are checked for their content type,
 attachment disposition and magic bytes; and every param-validation branch plus the role gate is
 exercised.
@@ -14,6 +15,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 from app.core.security import hash_password
+from app.domain.appeals.models import Appeal, AppealReason, AppealStatus
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import ReleaseReason, RouteStopStatus
 from fastapi.testclient import TestClient
@@ -64,6 +66,20 @@ async def _seed(db: AsyncSession) -> _Seed:
     released.stops[0].status = RouteStopStatus.RELEASED
     released.stops[0].release_reason = ReleaseReason.LEFT_CAMPUS
     released.stops[0].released_at = datetime(2026, 9, 4, 15, 0, tzinfo=UTC)
+    # Tue 09-08: A goes silent holding the other point and wins the appeal.
+    appealed = await make_route(db, worker=worker_a, day=date(2026, 9, 8), points=[points[1]])
+    appealed.stops[0].status = RouteStopStatus.RELEASED
+    appealed.stops[0].release_reason = ReleaseReason.LOCATION_SILENCE
+    appealed.stops[0].released_at = datetime(2026, 9, 8, 15, 0, tzinfo=UTC)
+    db.add(
+        Appeal(
+            route_stop_id=appealed.stops[0].id,
+            field_worker_id=worker_a.id,
+            reason=AppealReason.APP_CLOSED,
+            status=AppealStatus.ACCEPTED,
+            idempotency_key=uuid.uuid4(),
+        )
+    )
     await db.commit()
     return seed
 
@@ -101,12 +117,52 @@ async def test_compliance_json_happy_path(client: TestClient, db_session: AsyncS
     assert len(starts) == _SERVICE_DAYS
     assert "2026-09-05" not in starts  # a Saturday
     assert body["totals"]["points_total"] == 2 * _SERVICE_DAYS
-    assert body["totals"]["points_done"] == 1
-    assert body["totals"]["points_unserved"] == 2 * _SERVICE_DAYS - 1
-    assert body["totals"]["points_released"] == 1
+    assert body["totals"]["points_done"] == 2
+    assert body["totals"]["points_done_by_appeal"] == 1
+    assert body["totals"]["points_unserved"] == 2 * _SERVICE_DAYS - 2
+    assert body["totals"]["points_released"] == 2
     assert body["totals"]["released_left_campus"] == 1
-    assert body["totals"]["completion_rate"] == 1 / (2 * _SERVICE_DAYS)
+    assert body["totals"]["executions_total"] == 0
+    assert body["totals"]["alerts_total"] == 0
+    assert body["totals"]["completion_rate"] == 2 / (2 * _SERVICE_DAYS)
     assert not {"routes_total", "stops_reassigned", "routes_cancelled"} & body["totals"].keys()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "label", "days"),
+    [
+        ("DONE", "Feito", ["2026-09-03"]),
+        ("DONE_BY_APPEAL", "Feito por recurso", ["2026-09-08"]),
+        ("UNSERVED", "Não atendido", None),
+    ],
+)
+async def test_outcome_filter_narrows_to_one_outcome(
+    client: TestClient,
+    db_session: AsyncSession,
+    outcome: str,
+    label: str,
+    days: list[str] | None,
+) -> None:
+    await _seed(db_session)
+    token = _login(client, _MANAGER_EMAIL)
+
+    response = _get(client, token, "/reports/compliance", outcome=outcome)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    expected_total = len(days) if days is not None else 2 * _SERVICE_DAYS - 2
+    assert body["totals"]["points_total"] == expected_total
+    if days is not None:
+        assert [p["period_start"] for p in body["periods"]] == days
+    assert body["filters_applied"]["outcome"] == label
+
+
+async def test_bad_outcome_is_422(client: TestClient, db_session: AsyncSession) -> None:
+    await _seed(db_session)
+    token = _login(client, _MANAGER_EMAIL)
+    for path in ("/reports/compliance", "/reports/compliance.pdf", "/reports/compliance.xlsx"):
+        response = _get(client, token, path, outcome="BOGUS")
+        assert response.status_code == 422, (path, response.text)
 
 
 async def test_field_worker_filter_narrows_metrics(
@@ -136,7 +192,7 @@ async def test_company_filter_echoes_its_name(client: TestClient, db_session: As
     body = response.json()
     assert body["totals"]["points_total"] == 2 * _SERVICE_DAYS
     assert body["filters_applied"]["company_name"] == "Limpa Tudo"
-    assert "route_status" not in body["filters_applied"]
+    assert body["filters_applied"]["outcome"] is None
 
 
 async def test_inverted_range_is_422(client: TestClient, db_session: AsyncSession) -> None:

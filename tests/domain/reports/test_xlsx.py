@@ -1,5 +1,6 @@
 import io
 import zipfile
+from dataclasses import fields
 from datetime import UTC, date, datetime
 
 from app.domain.reports.compliance import (
@@ -11,18 +12,7 @@ from app.domain.reports.compliance import (
 )
 from app.domain.reports.xlsx import render_compliance_xlsx
 
-_METRIC_FIELDS = (
-    "points_total",
-    "points_done",
-    "points_done_by_appeal",
-    "points_unserved",
-    "points_released",
-    "points_impeded",
-    "released_route_remainder",
-    "released_left_campus",
-    "released_location_silence",
-    "released_end_of_day",
-)
+_METRIC_FIELDS = tuple(field.name for field in fields(ComplianceCounts))
 
 
 def _row(label: str, start: date, base: int) -> ComplianceRow:
@@ -45,6 +35,7 @@ def _report() -> ComplianceReport:
             company_name=None,
             service_type_name=None,
             building_name="Bloco CN",
+            outcome="Não atendido",
         ),
         periods=rows,
         totals=totals,
@@ -66,7 +57,15 @@ def test_xlsx_headers_name_the_point_by_day_indicators() -> None:
     with zipfile.ZipFile(io.BytesIO(render_compliance_xlsx(_report()))) as archive:
         strings = archive.read("xl/sharedStrings.xml").decode()
 
-    for header in ("Pontos não atendidos", "Feitos por recurso", "Impedidos", "fim do expediente"):
+    for header in (
+        "Pontos não atendidos",
+        "Feitos por recurso",
+        "Impedidos",
+        "fim do expediente",
+        "Execuções com evidência",
+        "Alertas",
+        "Situação: Não atendido",
+    ):
         assert header in strings, header
     assert "reatribu" not in strings
     assert "Status da rota" not in strings

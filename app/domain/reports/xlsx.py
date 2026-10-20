@@ -33,11 +33,15 @@ _HEADERS: tuple[str, ...] = (
     "Liberados: saiu do campus",
     "Liberados: sem localização",
     "Liberados: fim do expediente",
+    "Execuções",
+    "Execuções com evidência",
+    "Execuções sinalizadas",
+    "Alertas",
     "% de conclusão",
 )
 # The fields of `ComplianceCounts`, in the order of the headers between "Período" and the rate.
 _METRIC_FIELDS: tuple[str, ...] = tuple(field.name for field in fields(ComplianceCounts))
-_LAST_COL = len(_HEADERS) - 1  # 11
+_LAST_COL = len(_HEADERS) - 1  # 15
 
 
 def _metadata_line(report: ComplianceReport) -> str:
@@ -54,6 +58,8 @@ def _metadata_line(report: ComplianceReport) -> str:
         parts.append(f"Tipo de serviço: {applied.service_type_name}")
     if applied.building_name is not None:
         parts.append(f"Prédio: {applied.building_name}")
+    if applied.outcome is not None:
+        parts.append(f"Situação: {applied.outcome}")
     parts.append(f"Gerado em: {report.generated_at:%d/%m/%Y %H:%M}")
     return " | ".join(parts)
 
