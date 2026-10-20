@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.domain.catalog.models import Building, FieldWorker, Floor, ServicePoint
 from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution, ExecutionSource
 from app.domain.identity.models import User, UserRole
+from app.domain.routing.models import ReleaseReason
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy import select
@@ -20,6 +21,7 @@ from tests.api.test_checkins import (
     _add_user,
     _login,
     _post,
+    _release_stop,
     _seed_route,
 )
 from tests.support.clock import today_on_campus
@@ -477,3 +479,23 @@ async def test_listed_evidence_carries_its_idempotency_key(
     )
 
     assert [item["idempotency_key"] for item in listing.json()] == [key]
+
+
+async def test_upload_for_a_released_stop_is_409(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # Photos taken offline for a stop released before they synced: the stop is in the pool
+    # now, so they are refused with the same answer as the check-out (spec §7.5).
+    token, execution_id = await _seed_execution(client, db_session, test_settings)
+    execution = await db_session.get(Execution, uuid.UUID(execution_id))
+    assert execution is not None
+    await _release_stop(db_session, execution.route_stop_id, ReleaseReason.LOCATION_SILENCE)
+
+    photo = _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA)
+    note = _upload_note(client, token, execution_id, "Banheiro limpo")
+
+    for response in (photo, note):
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "STOP_RELEASED"
+        assert response.json()["detail"]["appealable"] is True
+    assert await db_session.scalar(select(EvidenceItem.id)) is None

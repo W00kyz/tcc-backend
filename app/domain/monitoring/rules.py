@@ -24,7 +24,8 @@ class AlertDraft:
     severity: AlertSeverity
     dedup_key: str
     description: str
-    route_id: uuid.UUID
+    # None for a day-level alert that belongs to no route (POINTS_UNSERVED).
+    route_id: uuid.UUID | None
     route_stop_id: uuid.UUID | None = None
     field_worker_id: uuid.UUID | None = None
 

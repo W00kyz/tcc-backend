@@ -79,19 +79,23 @@ async def run_alert_scan(
 
     drafts = rule_no_evidence(snapshots, thresholds, now, enabled)
 
-    inserted = await _insert_new_alerts(db, drafts)
+    inserted = await insert_new_alerts(db, drafts)
     await db.commit()
 
     # The alerts are already committed above. Notifications are a separate best-effort batch:
     # a notify/push failure must never lose an alert, so it gets its own commit and a guard.
-    await _notify_new_alerts(db, inserted, push or LoggingPushSender())
+    await notify_new_alerts(db, inserted, push or LoggingPushSender())
     return inserted
 
 
-async def _notify_new_alerts(db: AsyncSession, inserted: list[Alert], push: PushSender) -> None:
+async def notify_new_alerts(db: AsyncSession, inserted: list[Alert], push: PushSender) -> None:
     """Fan every WARNING/CRITICAL alert out to `notify_alert` (one `Notification` per
     MANAGER/ADMIN + best-effort push), then commit the notification rows. Any failure is
-    logged and swallowed — the alerts are already committed and must survive it."""
+    logged and swallowed — the alerts are already committed and must survive it. Shared with
+    the release scan.
+
+        await notify_new_alerts(db, inserted, LoggingPushSender())
+    """
     to_notify = [a for a in inserted if a.severity in _NOTIFIABLE_SEVERITIES]
     if not to_notify:
         return
@@ -197,7 +201,12 @@ def _is_enabled(rules_by_kind: dict[AlertKind, AlertRule], kind: AlertKind) -> b
     return rule.enabled if rule is not None else True
 
 
-async def _insert_new_alerts(db: AsyncSession, drafts: list[AlertDraft]) -> list[Alert]:
+async def insert_new_alerts(db: AsyncSession, drafts: list[AlertDraft]) -> list[Alert]:
+    """Batch-insert `drafts` as OPEN alerts, skipping any whose `dedup_key` already exists, and
+    return the rows actually inserted. Flushes, never commits — shared with the release scan.
+
+        inserted = await insert_new_alerts(db, drafts)
+    """
     if not drafts:
         return []
     values = [

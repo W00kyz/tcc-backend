@@ -27,8 +27,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api._execution_common import current_worker
-from app.api.deps import ApprovedWorker, require_role
+from app.api._execution_common import current_worker, stop_released_conflict
+from app.api.deps import ApprovedWorker, Now, require_role
 from app.core.object_store import ObjectStore
 from app.db.session import get_db
 from app.domain.audit.service import record_personal_data_access
@@ -43,6 +43,7 @@ from app.domain.execution.evidence_service import (
     load_content,
 )
 from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution
+from app.domain.execution.service import StopReleased, ensure_stop_not_released
 from app.domain.identity.models import User, UserRole
 
 router = APIRouter(tags=["evidence"])
@@ -107,6 +108,14 @@ async def _load_execution(db: AsyncSession, execution_id: UUID) -> Execution:
     return execution
 
 
+async def _refuse_released_stop(db: AsyncSession, execution: Execution, now: datetime) -> None:
+    """Evidence synced after its stop went back to the pool gets the late check-out's 409."""
+    try:
+        await ensure_stop_not_released(db, execution=execution, now=now)
+    except StopReleased as exc:
+        raise stop_released_conflict(exc) from exc
+
+
 def _require_owner(worker: FieldWorker | None, execution: Execution) -> None:
     """The caller must be the field worker who owns `execution`."""
     if worker is None or worker.id != execution.field_worker_id:
@@ -144,6 +153,7 @@ async def upload_photo(
     response: Response,
     worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
+    now: Now,
     file: Annotated[UploadFile, File()],
     sha256: Annotated[str, Form()],
     captured_at: Annotated[datetime, Form()],
@@ -151,6 +161,7 @@ async def upload_photo(
 ) -> EvidenceItemOut:
     execution = await _load_execution(db, execution_id)
     _require_owner(worker, execution)
+    await _refuse_released_stop(db, execution, now)
 
     # Read one byte past the ceiling — enough to know it is over the limit without
     # buffering an arbitrarily large upload into memory.
@@ -197,9 +208,11 @@ async def upload_note(
     response: Response,
     worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
+    now: Now,
 ) -> EvidenceItemOut:
     execution = await _load_execution(db, execution_id)
     _require_owner(worker, execution)
+    await _refuse_released_stop(db, execution, now)
 
     if not body.text_body.strip():
         raise HTTPException(

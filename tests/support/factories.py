@@ -15,9 +15,18 @@ from app.domain.catalog.models import (
     FieldWorkerStatus,
     Floor,
     ServicePoint,
+    ServiceType,
+)
+from app.domain.execution.models import (
+    Execution,
+    ExecutionSource,
+    GeoValidation,
+    QrScan,
+    QrScanKind,
 )
 from app.domain.identity.models import User, UserRole
 from app.domain.privacy.models import PrivacyNotice
+from app.domain.qr.models import QrCode
 from app.domain.routing.models import Route, RouteStatus, RouteStop
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +34,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tests.support.clock import today_on_campus
 
 _PASSWORD = "senha-forte-o-suficiente"
+# Inside the default campus rectangle (system_settings.campus_*).
+ON_CAMPUS = (-7.2150, -35.9100)
 
 
 async def seed_privacy_notice(db: AsyncSession, *, version: int = 1) -> PrivacyNotice:
@@ -152,3 +163,95 @@ async def seed_route_with_one_stop(
     route = await make_route(db_session, worker=worker, day=today_on_campus(), points=[point])
     await db_session.commit()
     return route.stops[0], worker
+
+
+async def make_service_type(
+    db: AsyncSession, *, company_name: str = "Limpa Tudo", type_name: str = "Limpeza"
+) -> ServiceType:
+    """A contractor company owning one service type — what puts points in its workers' pool.
+    Flushes, never commits; `service_type.contractor_company` comes back set.
+
+        service_type = await make_service_type(db, company_name="Verde", type_name="Jardinagem")
+    """
+    company = ContractorCompany(name=company_name, cnpj=str(uuid.uuid4().int)[:14])
+    service_type = ServiceType(
+        name=type_name, average_duration_minutes=30, contractor_company=company
+    )
+    db.add_all([company, service_type])
+    await db.flush()
+    return service_type
+
+
+async def make_points(
+    db: AsyncSession,
+    *,
+    service_type: ServiceType | None,
+    names: Sequence[str],
+    at: tuple[float, float] = ON_CAMPUS,
+) -> list[ServicePoint]:
+    """One building at `at` (lat, lng) with a single floor holding one point per name, all of
+    `service_type`. Flushes, never commits.
+
+        points = await make_points(db, service_type=service_type, names=["Sala 1", "Sala 2"])
+    """
+    building = Building(name=f"Bloco {uuid.uuid4().hex[:6]}", campus_area="CCT")
+    db.add(building)
+    await db.flush()
+    floor = Floor(building_id=building.id, label="Térreo")
+    db.add(floor)
+    await db.flush()
+    points = [
+        ServicePoint(
+            floor_id=floor.id,
+            name=name,
+            description="Sala",
+            latitude=at[0],
+            longitude=at[1],
+            service_type_id=service_type.id if service_type is not None else None,
+        )
+        for name in names
+    ]
+    db.add_all(points)
+    await db.flush()
+    return points
+
+
+async def make_check_in(
+    db: AsyncSession, *, stop: RouteStop, worker: FieldWorker, scanned_at: datetime
+) -> Execution:
+    """An open app execution on `stop` with its CHECK_IN scan at `scanned_at`, read from a QR
+    code of the stop's floor. Leaves the stop's status alone. Flushes, never commits.
+
+        execution = await make_check_in(db, stop=stop, worker=worker, scanned_at=now)
+    """
+    point = await db.get(ServicePoint, stop.service_point_id)
+    assert point is not None
+    qr_code = QrCode(
+        floor_id=point.floor_id,
+        public_code=f"qr-{uuid.uuid4()}",
+        secret=b"sig",
+        version=1,
+    )
+    execution = Execution(
+        route_stop_id=stop.id,
+        field_worker_id=worker.id,
+        checked_in_at=scanned_at,
+        synced_at=scanned_at,
+        source=ExecutionSource.APP,
+        idempotency_key=uuid.uuid4(),
+    )
+    db.add_all([qr_code, execution])
+    await db.flush()
+    db.add(
+        QrScan(
+            execution_id=execution.id,
+            qr_code_id=qr_code.id,
+            kind=QrScanKind.CHECK_IN,
+            scanned_at=scanned_at,
+            received_at=scanned_at,
+            geo_validation=GeoValidation.VALIDATED,
+            service_point_id=point.id,
+        )
+    )
+    await db.flush()
+    return execution

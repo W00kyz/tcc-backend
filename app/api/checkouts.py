@@ -21,6 +21,7 @@ from app.api._execution_common import (
     NoActiveRoute,
     RouteStopMissing,
     resolve_route,
+    stop_released_conflict,
 )
 from app.api.checkins import CandidateOut
 from app.api.deps import ApprovedWorker, CampusToday
@@ -34,6 +35,7 @@ from app.domain.execution.service import (
     QrRevoked,
     QrSignatureInvalid,
     StopNotAssignedToWorker,
+    StopReleased,
     check_out,
 )
 from app.domain.execution.validation import ChosenStopNotOnFloor
@@ -147,6 +149,8 @@ async def create_check_out(
         )
     except AmbiguousRoom as exc:
         raise _ambiguous_conflict(exc) from exc
+    except StopReleased as exc:
+        raise stop_released_conflict(exc) from exc
     except tuple(_DOMAIN_ERROR_STATUS) as exc:
         raise HTTPException(_DOMAIN_ERROR_STATUS[type(exc)], str(exc)) from exc
 

@@ -1,6 +1,7 @@
-"""Etapa 8 — the impediment surface: a field worker reports an impediment against their
-route or one of its stops (RF16-RF17) and a manager reads the PENDING queue. Reassigning or
-dismissing by hand went with manual planning (spec 2026-10-20-alocacao-automatica §2.1).
+"""The impediment surface (RF16-RF17, spec 2026-10-20-alocacao-automatica §7.1, §8.4): a field
+worker reports an impediment against their route or one of its stops — the point(s) go back to
+the pool at once — and a manager lists the impediments and acknowledges them ("ciente").
+Reassigning or dismissing by hand went with manual planning (§2.1).
 
 Every endpoint owns its transaction boundary — call the flush-only service, then
 `db.commit()` — the same discipline as `app/api/forms.py`. The impediment services flush,
@@ -14,8 +15,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import ApprovedWorker, require_role
+from app.api.deps import ApprovedWorker, Now, require_role
 from app.db.session import get_db
+from app.domain.audit.service import record_audit_trail
 from app.domain.identity.models import User, UserRole
 from app.domain.impediments.models import (
     Impediment,
@@ -26,10 +28,11 @@ from app.domain.impediments.models import (
 from app.domain.impediments.service import (
     RouteNotInProgress,
     StopNotReassignable,
+    acknowledge_impediment,
     create_impediment,
-    list_pending,
+    find_impediments,
+    get_impediment,
 )
-from app.domain.monitoring.notifications import notify_impediment_reported
 from app.domain.routing.models import Route, RouteStop
 
 router = APIRouter(tags=["impediments"])
@@ -65,6 +68,12 @@ class ImpedimentOut(BaseModel):
     status: ImpedimentStatus
     reported_at: datetime
     received_at: datetime
+    field_worker_id: UUID
+    field_worker_name: str
+    # None for a ROUTE_REMAINDER report, which names no point.
+    service_point_name: str | None
+    building_name: str | None
+    resolved_at: datetime | None
 
 
 def _raise_for_domain_error(exc: Exception) -> NoReturn:
@@ -72,6 +81,8 @@ def _raise_for_domain_error(exc: Exception) -> NoReturn:
 
 
 def _to_out(impediment: Impediment) -> ImpedimentOut:
+    """Expects the relationships `find_impediments`/`get_impediment` load."""
+    point = impediment.route_stop.service_point if impediment.route_stop is not None else None
     return ImpedimentOut(
         id=impediment.id,
         route_id=impediment.route_id,
@@ -82,7 +93,19 @@ def _to_out(impediment: Impediment) -> ImpedimentOut:
         status=impediment.status,
         reported_at=impediment.reported_at,
         received_at=impediment.received_at,
+        field_worker_id=impediment.reported_by,
+        field_worker_name=impediment.reported_by_worker.full_name,
+        service_point_name=point.name if point is not None else None,
+        building_name=point.floor.building.name if point is not None else None,
+        resolved_at=impediment.resolved_at,
     )
+
+
+async def _load_impediment(db: AsyncSession, impediment_id: UUID) -> Impediment:
+    impediment = await get_impediment(db, impediment_id)
+    if impediment is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Impediment "{impediment_id}" not found.')
+    return impediment
 
 
 @router.post(
@@ -91,11 +114,17 @@ def _to_out(impediment: Impediment) -> ImpedimentOut:
     status_code=status.HTTP_201_CREATED,
 )
 async def report_impediment(
-    route_id: UUID, body: ImpedimentReportBody, request: Request, worker: ApprovedWorker, db: _Db
+    route_id: UUID,
+    body: ImpedimentReportBody,
+    request: Request,
+    worker: ApprovedWorker,
+    db: _Db,
+    now: Now,
 ) -> ImpedimentOut:
     """RF16-RF17 — the field worker signals they cannot execute this stop (scope=STOP) or the
-    rest of the route (scope=ROUTE_REMAINDER). The report is the record; no audit-trail entry
-    is appended here (nothing on the assignment chain moved yet)."""
+    rest of the route (scope=ROUTE_REMAINDER); what it covers goes back to the pool and the
+    managers are alerted and notified. The report, and the released stops' `release_reason`,
+    are the record — no audit-trail entry is appended here."""
     route = await db.get(Route, route_id)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
@@ -121,35 +150,41 @@ async def report_impediment(
             note=body.note,
             reported_by_id=worker.id,
             reported_at=body.reported_at,
+            now=now,
+            push=request.app.state.push_sender,
         )
     except tuple(_DOMAIN_ERROR_STATUS) as exc:
         _raise_for_domain_error(exc)
-    # RF17: the managers learn about it in the notification center, not only by polling the
-    # impediment queue.
-    await notify_impediment_reported(
-        db,
-        impediment_id=impediment.id,
-        route=route,
-        route_stop=route_stop,
-        reason=body.reason.value,
-        push=request.app.state.push_sender,
-    )
     await db.commit()
-    await db.refresh(impediment)
-    return _to_out(impediment)
+    return _to_out(await _load_impediment(db, impediment.id))
 
 
 @router.get("/impediments", response_model=list[ImpedimentOut])
 async def list_impediments(
     _actor: _Manager,
     db: _Db,
-    impediment_status: Annotated[str, Query(alias="status")] = ImpedimentStatus.PENDING.value,
+    impediment_status: Annotated[ImpedimentStatus | None, Query(alias="status")] = None,
 ) -> list[ImpedimentOut]:
-    """The manager's queue. Only the PENDING queue is served — the impediment domain keeps no
-    other list — so any other `?status=` value is a client error, not an empty list."""
-    if impediment_status != ImpedimentStatus.PENDING.value:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f'Invalid status "{impediment_status}"; expected "{ImpedimentStatus.PENDING.value}".',
+    """The manager's Justificativas tab (spec §8.4): every impediment, PENDING first, or only
+    those of `?status=`."""
+    return [_to_out(i) for i in await find_impediments(db, status=impediment_status)]
+
+
+@router.post("/impediments/{impediment_id}/acknowledge", response_model=ImpedimentOut)
+async def acknowledge(impediment_id: UUID, actor: _Manager, db: _Db) -> ImpedimentOut:
+    """The manager's "ciente": PENDING → RESOLVED, audited. Idempotent on a RESOLVED one."""
+    impediment = await _load_impediment(db, impediment_id)
+    before = {"status": impediment.status.value}
+    impediment = await acknowledge_impediment(db, impediment=impediment, actor=actor)
+    if before["status"] != impediment.status.value:
+        await record_audit_trail(
+            db,
+            actor_id=actor.id,
+            entity_type="impediment",
+            entity_id=impediment.id,
+            action="acknowledge",
+            before=before,
+            after={"status": impediment.status.value},
         )
-    return [_to_out(impediment) for impediment in await list_pending(db)]
+    await db.commit()
+    return _to_out(impediment)

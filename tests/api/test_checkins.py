@@ -14,13 +14,21 @@ from app.domain.catalog.models import (
     Floor,
     ServicePoint,
 )
+from app.domain.execution.models import Execution
 from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import sign_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
-from app.domain.routing.models import Route, RouteStop
+from app.domain.routing.models import (
+    ReleaseReason,
+    Route,
+    RouteStatus,
+    RouteStop,
+    RouteStopStatus,
+)
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx2 import Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
@@ -161,6 +169,36 @@ async def _add_field_worker(db_session: AsyncSession, email: str) -> None:
         )
     )
     await db_session.commit()
+
+
+async def _release_stop(
+    db_session: AsyncSession,
+    stop_id: uuid.UUID,
+    reason: ReleaseReason,
+    *,
+    released_at: datetime | None = None,
+) -> None:
+    """Give the stop back to the pool as the release scan or an impediment would, and pause its
+    route — what a delayed offline sync finds when it lands."""
+    stop = await db_session.get(RouteStop, stop_id)
+    assert stop is not None
+    stop.status = RouteStopStatus.RELEASED
+    stop.release_reason = reason
+    stop.released_at = released_at or datetime.now(UTC)
+    route = await db_session.get(Route, stop.route_id)
+    assert route is not None
+    route.status = RouteStatus.PAUSED
+    await db_session.commit()
+
+
+def _stop_released(stop_id: uuid.UUID, reason: ReleaseReason, *, appealable: bool) -> object:
+    return {
+        "code": "STOP_RELEASED",
+        "detail": f'Route stop "{stop_id}" was released back to the pool ({reason.value}).',
+        "route_stop_id": str(stop_id),
+        "release_reason": reason.value,
+        "appealable": appealable,
+    }
 
 
 def _login(client: TestClient, email: str = _WORKER_EMAIL, password: str = _WORKER_PASSWORD) -> str:
@@ -465,3 +503,79 @@ async def test_a_fix_outside_the_building_is_out_of_radius(
 
     assert response.status_code == 201, response.text
     assert response.json()["geo_validation"] == "OUT_OF_RADIUS"
+
+
+# --- a check-in that lands after the stop was released (spec §7.5) --------------------------
+
+
+async def test_checkin_on_released_stop_is_409_appealable(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # The worker checked in offline underground; the silence release ran before the sync.
+    seeded = await _seed_route(db_session, test_settings)
+    stop_id = seeded.stops[0].id
+    await _release_stop(db_session, stop_id, ReleaseReason.LOCATION_SILENCE)
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _stop_released(
+        stop_id, ReleaseReason.LOCATION_SILENCE, appealable=True
+    )
+    assert await db_session.scalar(select(Execution.id)) is None
+
+
+async def test_checkin_after_the_appeal_window_is_not_appealable(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    stop_id = seeded.stops[0].id
+    await _release_stop(
+        db_session,
+        stop_id,
+        ReleaseReason.END_OF_DAY,
+        released_at=datetime.now(UTC) - timedelta(hours=49),
+    )
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["appealable"] is False
+
+
+async def test_checkin_prefers_a_pending_stop_to_a_released_one(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # One room of the floor was impeded; the other is still the worker's to do.
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    await _release_stop(db_session, seeded.stops[0].id, ReleaseReason.IMPEDIMENT)
+    route = await db_session.get(Route, seeded.route.id)
+    assert route is not None
+    route.status = RouteStatus.IN_PROGRESS  # a single-stop impediment does not pause the route
+    await db_session.commit()
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["route_stop_id"] == str(seeded.stops[1].id)
+
+
+async def test_checkin_choosing_a_released_room_is_409(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # The re-submit names the room the worker was in, which was released meanwhile; the other
+    # room of the floor being still pending must not turn it into "not on this floor".
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    released_id = seeded.stops[0].id
+    await _release_stop(db_session, released_id, ReleaseReason.LEFT_CAMPUS)
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code, route_stop_id=str(released_id))
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _stop_released(
+        released_id, ReleaseReason.LEFT_CAMPUS, appealable=True
+    )

@@ -8,8 +8,8 @@ DO NOT CHANGE: this module is the documented exception to "service layer flushes
 commits" — check-in and check-out each own and commit a transaction."""
 
 import uuid
-from collections.abc import Sequence
-from datetime import UTC, datetime
+from collections.abc import Collection, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -37,7 +37,8 @@ from app.domain.execution.validation import (
 from app.domain.forms.models import FormVersion, FormVersionStatus
 from app.domain.qr.crypto import QrPayload, decode_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
-from app.domain.routing.models import Route, RouteStop, RouteStopStatus
+from app.domain.routing.models import ReleaseReason, Route, RouteStop, RouteStopStatus
+from app.domain.settings.service import get_settings_row
 
 
 class QrSignatureInvalid(Exception):
@@ -82,6 +83,29 @@ class NoOpenCheckIn(Exception):
     """Check-out found no IN_PROGRESS stop with an open execution on the scanned floor."""
 
 
+class StopReleased(Exception):
+    """The stop went back to the pool before this check-in, check-out or evidence reached the
+    server — a late offline sync (spec 2026-10-20-alocacao-automatica §7.5). Nothing is written;
+    `appealable` tells the app whether to offer the worker an appeal."""
+
+    def __init__(self, stop: RouteStop, *, appealable: bool) -> None:
+        assert stop.release_reason is not None  # every RELEASED stop carries its reason
+        super().__init__(
+            f'Route stop "{stop.id}" was released back to the pool ({stop.release_reason}).'
+        )
+        self.route_stop_id = stop.id
+        self.release_reason: ReleaseReason = stop.release_reason
+        self.appealable = appealable
+
+
+# The releases the worker did not cause: an impediment is their own report, nothing to contest.
+_APPEALABLE_RELEASES = (
+    ReleaseReason.LEFT_CAMPUS,
+    ReleaseReason.LOCATION_SILENCE,
+    ReleaseReason.END_OF_DAY,
+)
+
+
 class FormVersionMismatch(Exception):
     """The check-out's `form_version_id`/`answers` do not fit the stop (Ruling 7): missing one
     of the pair, a non-PUBLISHED version, the wrong service type's form, or a stop with no
@@ -121,6 +145,10 @@ async def check_in(
     candidates, stops = await _load_pending_candidates(
         db, route_id=route.id, floor_id=decoded.floor_id, latitude=latitude, longitude=longitude
     )
+    if not candidates or _chose_another_stop(chosen_route_stop_id, stops):
+        await _raise_if_released_on_floor(
+            db, route=route, floor_id=decoded.floor_id, chosen_route_stop_id=chosen_route_stop_id
+        )
     if not candidates:
         raise FloorNotOnRoute(
             f'QR floor "{decoded.floor_id}" has no PENDING stop on route "{route.id}".'
@@ -208,6 +236,13 @@ async def check_out(
     open_rows = await _load_open_checkins(
         db, route_id=route.id, floor_id=decoded.floor_id, latitude=latitude, longitude=longitude
     )
+    open_stop_ids = {candidate.route_stop_id for candidate, _, _ in open_rows}
+    if not open_rows or _chose_another_stop(chosen_route_stop_id, open_stop_ids):
+        # The open check-in's stop was released — or, both scans offline, the stop was released
+        # before either synced: the same answer as the check-in got.
+        await _raise_if_released_on_floor(
+            db, route=route, floor_id=decoded.floor_id, chosen_route_stop_id=chosen_route_stop_id
+        )
     if not open_rows:
         raise NoOpenCheckIn(
             f'Route "{route.id}" has no open check-in on floor "{decoded.floor_id}".'
@@ -264,7 +299,70 @@ async def check_out(
     return execution
 
 
+async def released_stop_error(db: AsyncSession, *, stop: RouteStop, now: datetime) -> StopReleased:
+    """The `StopReleased` for a RELEASED `stop`, with whether its owner may still appeal: a
+    release they did not cause themselves, within `appeal_window_hours` of it (spec §7.5).
+
+        raise await released_stop_error(db, stop=stop, now=now)
+    """
+    # B5 replaces this inline check with `is_appealable`, which also looks at existing appeals.
+    window = timedelta(hours=(await get_settings_row(db)).appeal_window_hours)
+    appealable = (
+        stop.release_reason in _APPEALABLE_RELEASES
+        and stop.released_at is not None
+        and now <= stop.released_at + window
+    )
+    return StopReleased(stop, appealable=appealable)
+
+
+async def ensure_stop_not_released(
+    db: AsyncSession, *, execution: Execution, now: datetime
+) -> None:
+    """Raise `StopReleased` when `execution`'s stop went back to the pool — evidence synced
+    after the release is refused like the late check-out it belongs to.
+
+        await ensure_stop_not_released(db, execution=execution, now=now)
+    """
+    stop = await db.get(RouteStop, execution.route_stop_id)
+    if stop is not None and stop.status is RouteStopStatus.RELEASED:
+        raise await released_stop_error(db, stop=stop, now=now)
+
+
 # --- internal helpers -----------------------------------------------------------------------
+
+
+async def _raise_if_released_on_floor(
+    db: AsyncSession,
+    *,
+    route: Route,
+    floor_id: uuid.UUID,
+    chosen_route_stop_id: uuid.UUID | None,
+) -> None:
+    """Raise `StopReleased` when a stop of `route` on the scanned floor was released: the
+    worker's chosen stop if they chose one, else the latest released there."""
+    released = list(
+        await db.scalars(
+            select(RouteStop)
+            .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
+            .where(
+                RouteStop.route_id == route.id,
+                RouteStop.status == RouteStopStatus.RELEASED,
+                ServicePoint.floor_id == floor_id,
+            )
+            .order_by(RouteStop.released_at.desc())
+        )
+    )
+    if chosen_route_stop_id is not None:
+        released = [stop for stop in released if stop.id == chosen_route_stop_id]
+    if released:
+        raise await released_stop_error(db, stop=released[0], now=datetime.now(UTC))
+
+
+def _chose_another_stop(
+    chosen_route_stop_id: uuid.UUID | None, live_stop_ids: Collection[uuid.UUID]
+) -> bool:
+    """The worker's re-submit names a stop that is not among the live ones on the floor."""
+    return chosen_route_stop_id is not None and chosen_route_stop_id not in live_stop_ids
 
 
 async def _persist_answers(
@@ -391,6 +489,10 @@ async def _load_pending_candidates(
             RouteStop.status == RouteStopStatus.PENDING,
             ServicePoint.floor_id == floor_id,
         )
+        # IMPORTANT: lock the stops until the commit. The release (`release_stops`) updates only
+        # rows still live, so it either waits for this check-in and spares the stop, or commits
+        # first and this read no longer sees it — never a RELEASED stop flipped back.
+        .with_for_update(of=RouteStop)
     )
     candidates: list[Candidate] = []
     stops: dict[uuid.UUID, RouteStop] = {}
@@ -420,6 +522,9 @@ async def _load_open_checkins(
             Execution.checked_out_at.is_(None),
             ServicePoint.floor_id == floor_id,
         )
+        # IMPORTANT: same lock as `_load_pending_candidates` — a check-out racing a release
+        # either finishes the stop first or finds it released, never overwrites RELEASED.
+        .with_for_update(of=RouteStop)
     )
     return [
         (_candidate(stop, point, footprint, latitude, longitude), execution, stop)
