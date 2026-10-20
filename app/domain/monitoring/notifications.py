@@ -137,6 +137,26 @@ async def notify_impediment_reported(
     )
 
 
+async def notify_appeal_filed(
+    db: AsyncSession, *, appeal_id: uuid.UUID, description: str, push: PushSender
+) -> list[Notification]:
+    """Tell every manager that a worker contested a released stop (spec §8.4: the managers
+    receive the appeals), whether or not the APPEAL_FILED alert rule is on — same audience and
+    reasoning as `notify_impediment_reported`. Flush, never commit.
+
+        await notify_appeal_filed(db, appeal_id=appeal.id, description=text, push=push)
+    """
+    return await notify_users(
+        db,
+        user_ids=await _manager_ids(db),
+        kind="APPEAL_FILED",
+        title=_ALERT_TITLE_PT_BR[AlertKind.APPEAL_FILED],
+        body=description,
+        data={"appeal_id": str(appeal_id)},
+        push=push,
+    )
+
+
 async def notify_alert(db: AsyncSession, *, alert: Alert, push: PushSender) -> list[Notification]:
     """Notify every MANAGER and ADMIN user of a freshly created alert (spec §2 Ruling 6 — a
     route has no single owning manager, so all of them see operational alerts)."""

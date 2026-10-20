@@ -141,6 +141,7 @@ async def _do_check_in(
         idempotency_key=idempotency_key or uuid.uuid4(),
         chosen_route_stop_id=chosen_route_stop_id,
         radius_m=_RADIUS_M,
+        now=datetime.now(UTC),
         execution_id=execution_id,
         client_clock_offset_seconds=client_clock_offset_seconds,
     )
@@ -169,6 +170,7 @@ async def _do_check_out(
         checkout_idempotency_key=checkout_idempotency_key or uuid.uuid4(),
         chosen_route_stop_id=chosen_route_stop_id,
         radius_m=_RADIUS_M,
+        now=datetime.now(UTC),
         client_clock_offset_seconds=client_clock_offset_seconds,
     )
 
@@ -337,6 +339,7 @@ async def test_check_in_by_a_different_worker_is_rejected(db_session: AsyncSessi
             idempotency_key=uuid.uuid4(),
             chosen_route_stop_id=None,
             radius_m=_RADIUS_M,
+            now=datetime.now(UTC),
         )
 
 

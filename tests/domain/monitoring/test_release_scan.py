@@ -3,12 +3,14 @@ testcontainer with a frozen `now`: a worker outside the campus or silent for too
 batch given back to the pool, and the end of the workday closes every open route and raises one
 "pontos não atendidos" alert for the day."""
 
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.core.campus_clock import campus_today
 from app.core.security import hash_password
+from app.domain.appeals.models import Appeal, AppealReason, AppealStatus
 from app.domain.audit.models import AuditTrail
 from app.domain.catalog.models import FieldWorker, ServicePoint, ServiceType
 from app.domain.identity.models import User, UserRole
@@ -352,6 +354,33 @@ async def test_end_of_day_with_every_point_done_raises_nothing(db_session: Async
     assert await run_release_scan(db_session, now=_FIVE_PM) == []
     route_status, _ = await _route_state(db_session, working.route)
     assert route_status is RouteStatus.DONE
+
+
+async def test_accepted_appeal_counts_the_point_as_served(db_session: AsyncSession) -> None:
+    # Spec §8.7: a point is served on the day when it has a DONE stop or an accepted appeal on
+    # a stop of that day. A rejected (or pending) appeal leaves it unserved.
+    working = await _working(db_session, allocated_minutes_ago=5, now=_FIVE_PM, rooms=3)
+    appealed, rejected, _still_pending = working.route.stops
+    for stop, status in ((appealed, AppealStatus.ACCEPTED), (rejected, AppealStatus.REJECTED)):
+        stop.status = RouteStopStatus.RELEASED
+        stop.release_reason = ReleaseReason.LEFT_CAMPUS
+        stop.released_at = _FIVE_PM - timedelta(hours=2)
+        db_session.add(
+            Appeal(
+                route_stop_id=stop.id,
+                field_worker_id=working.worker.id,
+                reason=AppealReason.LEFT_BRIEFLY,
+                status=status,
+                idempotency_key=uuid.uuid4(),
+            )
+        )
+    await db_session.commit()
+
+    alerts = await run_release_scan(db_session, now=_FIVE_PM)
+
+    assert [alert.description for alert in alerts] == [
+        "Expediente encerrado com 2 ponto(s) não atendido(s) hoje: Limpeza (Limpa Tudo): 2."
+    ]
 
 
 async def test_saturday_scan_does_nothing(db_session: AsyncSession) -> None:

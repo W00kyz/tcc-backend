@@ -113,8 +113,8 @@ class Notification(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "notifications"
 
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
-    # 'ALERT' | 'IMPEDIMENT_REPORTED' — a plain string, not an enum: the set grows as features
-    # land and none of it drives a schema decision.
+    # 'ALERT' | 'IMPEDIMENT_REPORTED' | 'APPEAL_FILED' — a plain string, not an enum: the set
+    # grows as features land and none of it drives a schema decision.
     kind: Mapped[str] = mapped_column(String(50))
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(String(1000))

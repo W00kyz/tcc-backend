@@ -18,6 +18,7 @@ from sqlalchemy import ColumnElement, ScalarSelect, Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.domain.appeals.models import Appeal
 from app.domain.catalog.models import (
     Building,
     FieldWorker,
@@ -79,6 +80,7 @@ class ExecutionListRow:
     evidence_count: int
     route_id: UUID
     clock_skew_seconds: float | None  # app-reported device/server offset, set only when flagged
+    appeal_id: UUID | None  # the accepted appeal an `APPEAL` execution came from; None for `APP`
 
 
 @dataclass(frozen=True)
@@ -154,6 +156,7 @@ def _row_query() -> Select[Any]:
             _checkin_geo_subquery().label("checkin_geo"),
             _evidence_count_subquery().label("evidence_count"),
             RouteStop.route_id,
+            Appeal.id,
         )
         .select_from(Execution)
         .join(RouteStop, Execution.route_stop_id == RouteStop.id)
@@ -161,6 +164,12 @@ def _row_query() -> Select[Any]:
         .join(Floor, ServicePoint.floor_id == Floor.id)
         .join(Building, Floor.building_id == Building.id)
         .join(FieldWorker, Execution.field_worker_id == FieldWorker.id)
+        # One appeal per stop at most; only the APPEAL execution of the stop comes from it.
+        .outerjoin(
+            Appeal,
+            (Appeal.route_stop_id == Execution.route_stop_id)
+            & (Execution.source == ExecutionSource.APPEAL),
+        )
     )
 
 
@@ -210,6 +219,7 @@ def _to_list_row(
     checkin_geo: GeoValidation | None,
     evidence_count: int,
     route_id: UUID,
+    appeal_id: UUID | None,
 ) -> ExecutionListRow:
     return ExecutionListRow(
         execution_id=execution.id,
@@ -229,6 +239,7 @@ def _to_list_row(
         evidence_count=evidence_count,
         route_id=route_id,
         clock_skew_seconds=execution.clock_skew_seconds,
+        appeal_id=appeal_id,
     )
 
 

@@ -3,9 +3,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
-from app.api.deps import get_campus_today
+from app.api.deps import get_campus_today, get_now
 from app.core.config import Settings
 from app.core.security import hash_password
+from app.domain.appeals.models import Appeal, AppealReason
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
@@ -543,6 +544,51 @@ async def test_checkin_after_the_appeal_window_is_not_appealable(
 
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["appealable"] is False
+
+
+async def test_checkin_appeal_window_reads_the_pinned_clock(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # Released a moment ago by the wall clock, but the request's clock says 49 h later: the
+    # window is judged by the clock every endpoint reads, not by the machine's.
+    seeded = await _seed_route(db_session, test_settings)
+    stop_id = seeded.stops[0].id
+    await _release_stop(db_session, stop_id, ReleaseReason.END_OF_DAY)
+    overrides = cast(FastAPI, client.app).dependency_overrides
+    overrides[get_now] = lambda: datetime.now(UTC) + timedelta(hours=49)
+    overrides[get_campus_today] = today_on_campus
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["appealable"] is False
+
+
+async def test_checkin_on_an_appealed_stop_is_not_appealable_again(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # The worker already contested the release: the app must not open a second appeal.
+    seeded = await _seed_route(db_session, test_settings)
+    stop_id = seeded.stops[0].id
+    await _release_stop(db_session, stop_id, ReleaseReason.LOCATION_SILENCE)
+    db_session.add(
+        Appeal(
+            route_stop_id=stop_id,
+            field_worker_id=seeded.worker.id,
+            reason=AppealReason.NO_SIGNAL,
+            idempotency_key=uuid.uuid4(),
+        )
+    )
+    await db_session.commit()
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _stop_released(
+        stop_id, ReleaseReason.LOCATION_SILENCE, appealable=False
+    )
 
 
 async def test_checkin_prefers_a_pending_stop_to_a_released_one(

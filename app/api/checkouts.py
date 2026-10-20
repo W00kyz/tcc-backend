@@ -24,7 +24,7 @@ from app.api._execution_common import (
     stop_released_conflict,
 )
 from app.api.checkins import CandidateOut
-from app.api.deps import ApprovedWorker, CampusToday
+from app.api.deps import ApprovedWorker, CampusToday, Now
 from app.db.session import get_db
 from app.domain.execution.answers import AnswerIn, AnswerValidationError
 from app.domain.execution.service import (
@@ -109,6 +109,7 @@ async def create_check_out(
     worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
     today: CampusToday,
+    now: Now,
 ) -> CheckOutResponse:
     try:
         route = await resolve_route(
@@ -138,6 +139,7 @@ async def create_check_out(
             checkout_idempotency_key=body.checkout_idempotency_key,
             chosen_route_stop_id=body.route_stop_id,
             radius_m=radius_m,
+            now=now,
             execution_id=body.execution_id,
             client_clock_offset_seconds=body.client_clock_offset_seconds,
             form_version_id=body.form_version_id,

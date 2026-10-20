@@ -9,13 +9,14 @@ commits" — check-in and check-out each own and commit a transaction."""
 
 import uuid
 from collections.abc import Collection, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.domain.appeals.service import is_appealable, stop_has_appeal
 from app.domain.catalog.footprint import outline_contains
 from app.domain.catalog.models import Building, Floor, ServicePoint
 from app.domain.execution.answers import AnswerIn, build_answers
@@ -98,14 +99,6 @@ class StopReleased(Exception):
         self.appealable = appealable
 
 
-# The releases the worker did not cause: an impediment is their own report, nothing to contest.
-_APPEALABLE_RELEASES = (
-    ReleaseReason.LEFT_CAMPUS,
-    ReleaseReason.LOCATION_SILENCE,
-    ReleaseReason.END_OF_DAY,
-)
-
-
 class FormVersionMismatch(Exception):
     """The check-out's `form_version_id`/`answers` do not fit the stop (Ruling 7): missing one
     of the pair, a non-PUBLISHED version, the wrong service type's form, or a stop with no
@@ -125,6 +118,7 @@ async def check_in(
     idempotency_key: uuid.UUID,
     chosen_route_stop_id: uuid.UUID | None,
     radius_m: int,
+    now: datetime,
     execution_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
 ) -> Execution:
@@ -132,7 +126,8 @@ async def check_in(
     IN_PROGRESS. Pass `chosen_route_stop_id` on the re-submit after an `AmbiguousRoom`;
     `latitude`/`longitude` are `None` when the device has no GPS fix. The offline app supplies
     `execution_id` so a retried check-in re-uses the same row, and reports its measured
-    `client_clock_offset_seconds` (server minus device clock) so implausible skew is flagged."""
+    `client_clock_offset_seconds` (server minus device clock) so implausible skew is flagged.
+    `now` is the server clock: `synced_at`, the scan's `received_at`, the appeal window."""
     existing = await db.scalar(
         select(Execution).where(Execution.idempotency_key == idempotency_key)
     )
@@ -147,7 +142,11 @@ async def check_in(
     )
     if not candidates or _chose_another_stop(chosen_route_stop_id, stops):
         await _raise_if_released_on_floor(
-            db, route=route, floor_id=decoded.floor_id, chosen_route_stop_id=chosen_route_stop_id
+            db,
+            route=route,
+            floor_id=decoded.floor_id,
+            chosen_route_stop_id=chosen_route_stop_id,
+            now=now,
         )
     if not candidates:
         raise FloorNotOnRoute(
@@ -166,7 +165,6 @@ async def check_in(
     skew_flags = clock_skew_flag(client_clock_offset_seconds)
     flags = _merge_flags(resolution.flags, qr_flags, skew_flags)
 
-    now = datetime.now(UTC)
     execution = Execution(
         # The offline app owns the id so a retry lands on the same row (spec Ruling 7).
         id=execution_id or uuid.uuid4(),
@@ -189,6 +187,7 @@ async def check_in(
             qr_code_id=qr_code.id,
             kind=QrScanKind.CHECK_IN,
             scanned_at=scanned_at,
+            received_at=now,
             resolved=resolved,
             geo_validation=resolution.geo_validation,
             latitude=latitude,
@@ -213,6 +212,7 @@ async def check_out(
     checkout_idempotency_key: uuid.UUID,
     chosen_route_stop_id: uuid.UUID | None,
     radius_m: int,
+    now: datetime,
     execution_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
     form_version_id: uuid.UUID | None = None,
@@ -222,7 +222,7 @@ async def check_out(
     flags into the execution and marks the stop DONE. `execution_id`
     is accepted for API symmetry with check-in but ignored here — check-out resolves the open
     execution by floor, it does not create one. `client_clock_offset_seconds` still flags
-    implausible skew."""
+    implausible skew. `now` is the server clock, as for the check-in."""
     _ = execution_id  # unused: check-out closes an existing execution, never creates one
     existing = await db.scalar(
         select(Execution).where(Execution.checkout_idempotency_key == checkout_idempotency_key)
@@ -241,7 +241,11 @@ async def check_out(
         # The open check-in's stop was released — or, both scans offline, the stop was released
         # before either synced: the same answer as the check-in got.
         await _raise_if_released_on_floor(
-            db, route=route, floor_id=decoded.floor_id, chosen_route_stop_id=chosen_route_stop_id
+            db,
+            route=route,
+            floor_id=decoded.floor_id,
+            chosen_route_stop_id=chosen_route_stop_id,
+            now=now,
         )
     if not open_rows:
         raise NoOpenCheckIn(
@@ -285,6 +289,7 @@ async def check_out(
             qr_code_id=qr_code.id,
             kind=QrScanKind.CHECK_OUT,
             scanned_at=scanned_at,
+            received_at=now,
             resolved=resolved,
             geo_validation=resolution.geo_validation,
             latitude=latitude,
@@ -300,17 +305,16 @@ async def check_out(
 
 
 async def released_stop_error(db: AsyncSession, *, stop: RouteStop, now: datetime) -> StopReleased:
-    """The `StopReleased` for a RELEASED `stop`, with whether its owner may still appeal: a
-    release they did not cause themselves, within `appeal_window_hours` of it (spec §7.5).
+    """The `StopReleased` for a RELEASED `stop`, with whether its owner may still appeal it —
+    the same predicate `POST /appeals` applies (spec §7.5).
 
         raise await released_stop_error(db, stop=stop, now=now)
     """
-    # B5 replaces this inline check with `is_appealable`, which also looks at existing appeals.
-    window = timedelta(hours=(await get_settings_row(db)).appeal_window_hours)
-    appealable = (
-        stop.release_reason in _APPEALABLE_RELEASES
-        and stop.released_at is not None
-        and now <= stop.released_at + window
+    appealable = is_appealable(
+        stop,
+        now=now,
+        window_hours=(await get_settings_row(db)).appeal_window_hours,
+        has_appeal=await stop_has_appeal(db, stop.id),
     )
     return StopReleased(stop, appealable=appealable)
 
@@ -337,6 +341,7 @@ async def _raise_if_released_on_floor(
     route: Route,
     floor_id: uuid.UUID,
     chosen_route_stop_id: uuid.UUID | None,
+    now: datetime,
 ) -> None:
     """Raise `StopReleased` when a stop of `route` on the scanned floor was released: the
     worker's chosen stop if they chose one, else the latest released there."""
@@ -355,7 +360,7 @@ async def _raise_if_released_on_floor(
     if chosen_route_stop_id is not None:
         released = [stop for stop in released if stop.id == chosen_route_stop_id]
     if released:
-        raise await released_stop_error(db, stop=released[0], now=datetime.now(UTC))
+        raise await released_stop_error(db, stop=released[0], now=now)
 
 
 def _chose_another_stop(
@@ -545,6 +550,7 @@ def _build_scan(
     qr_code_id: uuid.UUID,
     kind: QrScanKind,
     scanned_at: datetime,
+    received_at: datetime,
     resolved: Candidate,
     geo_validation: GeoValidation,
     latitude: float | None,
@@ -555,7 +561,7 @@ def _build_scan(
         qr_code_id=qr_code_id,
         kind=kind,
         scanned_at=scanned_at,
-        received_at=datetime.now(UTC),  # server clock; `scanned_at` is the device's
+        received_at=received_at,  # server clock; `scanned_at` is the device's
         geo_validation=geo_validation,
         distance_m=resolved.distance_m,
         service_point_id=resolved.service_point_id,

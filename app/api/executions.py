@@ -56,6 +56,7 @@ class ExecutionListItem(BaseModel):
     evidence_count: int
     route_id: UUID
     clock_skew_seconds: float | None  # app-reported device/server clock offset when flagged
+    appeal_id: UUID | None  # set on a `source=APPEAL` execution: the accepted appeal
 
 
 class PagedExecutions(BaseModel):
@@ -126,6 +127,7 @@ def _to_item(row: ExecutionListRow) -> ExecutionListItem:
         evidence_count=row.evidence_count,
         route_id=row.route_id,
         clock_skew_seconds=row.clock_skew_seconds,
+        appeal_id=row.appeal_id,
     )
 
 

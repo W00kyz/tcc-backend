@@ -5,6 +5,7 @@ import httpx2
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.appeals import router as appeals_router
 from app.api.auth import router as auth_router
 from app.api.buildings import router as buildings_router
 from app.api.checkins import router as checkins_router
@@ -170,6 +171,7 @@ def create_app(
     app.include_router(settings_router)
     app.include_router(forms_router)
     app.include_router(impediments_router)
+    app.include_router(appeals_router)
     app.include_router(me_router)
     app.include_router(monitoring_router)
     app.include_router(notifications_router)

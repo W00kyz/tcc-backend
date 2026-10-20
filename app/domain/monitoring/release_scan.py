@@ -11,11 +11,12 @@ its own short-lived session — and then notifies the managers best-effort.
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import ColumnElement, exists, func, select
+from sqlalchemy import ColumnElement, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.campus_clock import campus_today
+from app.domain.appeals.models import Appeal, AppealStatus
 from app.domain.catalog.models import ContractorCompany, ServicePoint, ServiceType
 from app.domain.monitoring.alerts_service import alert_rule_enabled
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity, WorkerPosition
@@ -206,14 +207,21 @@ async def _close_the_day(db: AsyncSession, *, today: date, now: datetime) -> lis
 
 
 def _served_on(day: date) -> ColumnElement[bool]:
-    """Whether the point (correlated on `ServicePoint`) was served on `day`: it has a DONE stop
-    that day. A released point done later by somebody else counts as served once."""
-    # B5 adds the accepted appeal of the point's stop of `day` here, as a second OR branch.
-    return exists().where(
+    """Whether the point (correlated on `ServicePoint`) was served on `day` (spec §8.7): it has
+    a DONE stop that day, or an accepted appeal on one of its stops of that day. A released
+    point done later by somebody else counts as served once."""
+    done = exists().where(
         RouteStop.service_point_id == ServicePoint.id,
         RouteStop.service_date == day,
         RouteStop.status == RouteStopStatus.DONE,
     )
+    appealed = exists().where(
+        Appeal.route_stop_id == RouteStop.id,
+        Appeal.status == AppealStatus.ACCEPTED,
+        RouteStop.service_point_id == ServicePoint.id,
+        RouteStop.service_date == day,
+    )
+    return or_(done, appealed)
 
 
 async def _unserved_per_type(db: AsyncSession, day: date) -> list[tuple[str, str, int]]:
