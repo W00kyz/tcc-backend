@@ -20,7 +20,7 @@ from app.domain.routing.service import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_route
+from tests.support.factories import make_route, make_worker
 from tests.support.osrm import FakeOsrmClient
 
 _ROUTE_DATE = date(2026, 9, 1)
@@ -36,7 +36,7 @@ async def _seed(db: AsyncSession, *, n_points: int = 3) -> tuple[FieldWorker, li
     db.add(floor)
     await db.flush()
 
-    worker = FieldWorker(full_name="João", contractor_company_id=company.id)
+    worker = await make_worker(db, company=company, full_name="João")
     points = [
         ServicePoint(
             floor_id=floor.id,

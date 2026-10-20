@@ -44,7 +44,6 @@ from app.core.security import hash_password
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
-    FieldWorker,
     Floor,
     ServicePoint,
     ServiceType,
@@ -63,6 +62,8 @@ from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopSt
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.factories import make_worker
 
 pytestmark = pytest.mark.asyncio
 
@@ -232,8 +233,8 @@ async def _seed(db: AsyncSession) -> _Seed:
         )
         for i in range(3)
     ]
-    worker_a = FieldWorker(full_name="Ana Costa", contractor_company_id=company.id)
-    worker_b = FieldWorker(full_name="Bruno Dias", contractor_company_id=company.id)
+    worker_a = await make_worker(db, company=company, full_name="Ana Costa")
+    worker_b = await make_worker(db, company=company, full_name="Bruno Dias")
     db.add_all([*points, worker_a, worker_b])
     await db.flush()
     seed.worker_a_id, seed.worker_a_name = worker_a.id, worker_a.full_name

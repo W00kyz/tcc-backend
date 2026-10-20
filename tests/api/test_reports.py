@@ -15,7 +15,6 @@ from app.core.security import hash_password
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
-    FieldWorker,
     Floor,
     ServicePoint,
     ServiceType,
@@ -25,6 +24,8 @@ from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopSt
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.factories import make_worker
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,8 +69,8 @@ async def _seed(db: AsyncSession) -> _Seed:
     other_point = ServicePoint(
         floor_id=floor.id, name="Sala 102", description="x", latitude=-7.2, longitude=-35.9
     )
-    worker_a = FieldWorker(full_name="Ana Costa", contractor_company_id=company.id)
-    worker_b = FieldWorker(full_name="Bruno Dias", contractor_company_id=company.id)
+    worker_a = await make_worker(db, company=company, full_name="Ana Costa")
+    worker_b = await make_worker(db, company=company, full_name="Bruno Dias")
     db.add_all([point, other_point, worker_a, worker_b])
     await db.flush()
     seed.worker_a = worker_a.id

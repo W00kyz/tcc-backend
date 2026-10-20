@@ -18,7 +18,14 @@ from app.core.jwt import (
 )
 from app.core.security import hash_password
 from app.db.session import get_db
-from app.domain.identity.models import User
+from app.domain.catalog.models import FieldWorker, FieldWorkerStatus
+from app.domain.identity.models import User, UserRole
+from app.domain.identity.registration import (
+    EmailTaken,
+    NoticeOutdated,
+    UnknownCompany,
+    register_field_worker,
+)
 from app.domain.identity.service import authenticate_user, record_logout
 from app.domain.privacy.service import current_notice, has_consented, record_consent
 
@@ -35,6 +42,21 @@ class TokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     consent_required: bool
+    # Only for field workers: a pending or rejected one logs in to see where the approval stands.
+    worker_status: FieldWorkerStatus | None = None
+    rejection_reason: str | None = None
+
+
+class RegisterRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    contractor_company_id: UUID
+    privacy_notice_version: int
+
+
+class RegisterResponse(BaseModel):
+    status: FieldWorkerStatus
 
 
 class NoticeOut(BaseModel):
@@ -72,6 +94,11 @@ async def login(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid e-mail or password.")
 
     consent_required = not await has_consented(db, user_id=user.id)
+    worker = (
+        await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
+        if user.role == UserRole.FIELD_WORKER
+        else None
+    )
 
     return TokenResponse(
         access_token=create_access_token(
@@ -84,7 +111,48 @@ async def login(
             user_id=user.id, secret=settings.jwt_secret_key, days=settings.jwt_refresh_token_days
         ),
         consent_required=consent_required,
+        worker_status=worker.status if worker else None,
+        rejection_reason=worker.rejection_reason if worker else None,
     )
+
+
+@router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
+async def register(
+    body: RegisterRequest,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RegisterResponse:
+    """Public sign-up of a field worker; a manager approves it before it can work."""
+    try:
+        worker = await register_field_worker(
+            db,
+            name=body.name,
+            email=body.email,
+            password=body.password,
+            company_id=body.contractor_company_id,
+            notice_version=body.privacy_notice_version,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except EmailTaken as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "EMAIL_TAKEN", "detail": "This e-mail is already registered."},
+        ) from exc
+    except NoticeOutdated as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "NOTICE_OUTDATED",
+                "detail": "The privacy notice version is not the current one.",
+            },
+        ) from exc
+    except UnknownCompany as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "Unknown contractor company."
+        ) from exc
+    await db.commit()
+    return RegisterResponse(status=worker.status)
 
 
 @router.post("/refresh", response_model=AccessTokenResponse)

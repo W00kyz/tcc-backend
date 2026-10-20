@@ -13,7 +13,6 @@ import pytest
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
-    FieldWorker,
     Floor,
     ServicePoint,
     ServiceType,
@@ -40,6 +39,8 @@ from app.domain.reports.compliance import (
 from app.domain.reports.filters import ReportFilters
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.factories import make_worker
 
 pytestmark = pytest.mark.asyncio
 
@@ -88,7 +89,7 @@ async def _seed(db: AsyncSession) -> _Ids:
     p2 = ServicePoint(
         floor_id=f2.id, name="Sala 201", description="x", latitude=-7.2, longitude=-35.9
     )
-    worker = FieldWorker(full_name="João da Silva", contractor_company_id=company.id)
+    worker = await make_worker(db, company=company, full_name="João da Silva")
     db.add_all([p1, p2, worker])
     await db.flush()
 

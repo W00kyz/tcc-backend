@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.domain.catalog.models import ContractorCompany, FieldWorker
+from app.domain.catalog.models import ContractorCompany, FieldWorker, FieldWorkerStatus
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import WorkerPosition
 from app.domain.privacy.models import ConsentRecord, PrivacyNotice
@@ -47,7 +47,12 @@ async def _seed(
     )
     db_session.add_all([company, user])
     await db_session.flush()
-    worker = FieldWorker(full_name=email, contractor_company_id=company.id, user_id=user.id)
+    worker = FieldWorker(
+        full_name=email,
+        contractor_company_id=company.id,
+        user_id=user.id,
+        status=FieldWorkerStatus.APPROVED,
+    )
     db_session.add(worker)
     await db_session.flush()
 
@@ -65,6 +70,7 @@ async def _seed(
             full_name=route_worker_email,
             contractor_company_id=company.id,
             user_id=other_user.id,
+            status=FieldWorkerStatus.APPROVED,
         )
         db_session.add(other)
         await db_session.flush()

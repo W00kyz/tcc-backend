@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_route
+from tests.support.factories import make_route, make_worker
 
 _DAY = date(2026, 9, 1)
 
@@ -28,8 +28,8 @@ async def _seed(db: AsyncSession) -> tuple[list[FieldWorker], ServicePoint]:
     await db.flush()
     floor = Floor(building_id=building.id, label="T")
     workers = [
-        FieldWorker(full_name="W1", contractor_company_id=company.id),
-        FieldWorker(full_name="W2", contractor_company_id=company.id),
+        await make_worker(db, company=company, full_name="W1"),
+        await make_worker(db, company=company, full_name="W2"),
     ]
     db.add_all([floor, *workers])
     await db.flush()

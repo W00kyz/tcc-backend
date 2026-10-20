@@ -12,6 +12,7 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     FieldWorker,
+    FieldWorkerStatus,
     Floor,
     ServicePoint,
     ServiceType,
@@ -25,7 +26,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
-from tests.support.factories import make_route
+from tests.support.factories import make_route, make_worker
 
 _PASSWORD = "senha-forte-o-suficiente"
 
@@ -79,11 +80,14 @@ async def _seed_actors_and_points(
     # FieldWorker.full_name, not User.name.
     workers = [
         FieldWorker(
-            full_name="João da Silva", contractor_company_id=company.id, user_id=worker_user.id
+            full_name="João da Silva",
+            contractor_company_id=company.id,
+            user_id=worker_user.id,
+            status=FieldWorkerStatus.APPROVED,
         ),
-        FieldWorker(full_name="Maria Souza", contractor_company_id=company.id),
     ]
     db_session.add_all([*points, *workers])
+    workers.append(await make_worker(db_session, company=company, full_name="Maria Souza"))
     await db_session.commit()
     return manager, worker_user, workers, points
 

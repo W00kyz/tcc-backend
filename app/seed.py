@@ -18,6 +18,7 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     FieldWorker,
+    FieldWorkerStatus,
     Floor,
     ServicePoint,
     ServiceType,
@@ -81,7 +82,6 @@ async def seed() -> None:
             role=UserRole.FIELD_WORKER,
         )
         company = ContractorCompany(name="Limpa Tudo Terceirizados Ltda", cnpj="12345678000199")
-        service_type = ServiceType(name="Limpeza", average_duration_minutes=30)
         building = Building(
             name="Bloco CI",
             campus_area="Centro de Ciências e Tecnologia",
@@ -89,7 +89,13 @@ async def seed() -> None:
             footprint=_BLOCO_CI_OUTLINE,
             footprint_source="drawn",
         )
-        db.add_all([admin, manager, worker_user, company, service_type, building])
+        db.add_all([admin, manager, worker_user, company, building])
+        await db.flush()
+
+        service_type = ServiceType(
+            name="Limpeza", average_duration_minutes=30, contractor_company_id=company.id
+        )
+        db.add(service_type)
         await db.flush()
 
         floor = Floor(building_id=building.id, label="Térreo")
@@ -102,9 +108,13 @@ async def seed() -> None:
             description="Sala de aula",
             latitude=-7.2195,
             longitude=-35.9105,
+            service_type_id=service_type.id,
         )
         worker = FieldWorker(
-            full_name="João da Silva", contractor_company_id=company.id, user_id=worker_user.id
+            full_name="João da Silva",
+            contractor_company_id=company.id,
+            user_id=worker_user.id,
+            status=FieldWorkerStatus.APPROVED,
         )
         db.add_all([point, worker])
         await db.flush()

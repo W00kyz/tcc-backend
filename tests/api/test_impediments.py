@@ -15,6 +15,7 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     FieldWorker,
+    FieldWorkerStatus,
     Floor,
     ServicePoint,
 )
@@ -118,10 +119,16 @@ async def _seed(db: AsyncSession, *, source_points: int = 2) -> _Fixture:
         for i in range(source_points)
     ]
     worker_a = FieldWorker(
-        full_name="Joao da Silva", contractor_company_id=company.id, user_id=worker_a_user.id
+        full_name="Joao da Silva",
+        contractor_company_id=company.id,
+        user_id=worker_a_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     worker_b = FieldWorker(
-        full_name="Maria Souza", contractor_company_id=company.id, user_id=worker_b_user.id
+        full_name="Maria Souza",
+        contractor_company_id=company.id,
+        user_id=worker_b_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     db.add_all([*points, worker_a, worker_b])
     await db.flush()

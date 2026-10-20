@@ -9,7 +9,6 @@ import pytest
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
-    FieldWorker,
     Floor,
     ServicePoint,
     ServiceType,
@@ -43,6 +42,8 @@ from app.domain.forms.models import (
 from app.domain.qr.models import QrCode
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.factories import make_worker
 
 # Anchored to a fixed noon so every relative offset below (-1h, -25h) lands on its
 # intended UTC calendar day no matter the wall-clock time the suite runs at — a bare
@@ -143,8 +144,8 @@ async def _seed_world(db: AsyncSession) -> _World:
     floor_a, point_a = await _floor_with_point(db, building_a.id, "Térreo", "Sala A")
     floor_b, point_b = await _floor_with_point(db, building_b.id, "Térreo", "Sala B")
 
-    worker_a = FieldWorker(full_name="Ana", contractor_company_id=company.id)
-    worker_b = FieldWorker(full_name="Bruno", contractor_company_id=company.id)
+    worker_a = await make_worker(db, company=company, full_name="Ana")
+    worker_b = await make_worker(db, company=company, full_name="Bruno")
     qr_a = QrCode(floor_id=floor_a, public_code="qr-a", secret=b"s", version=1)
     qr_b = QrCode(floor_id=floor_b, public_code="qr-b", secret=b"s", version=1)
     db.add_all([worker_a, worker_b, qr_a, qr_b])
@@ -361,7 +362,7 @@ async def test_filter_by_service_type(db_session: AsyncSession) -> None:
     await db_session.flush()
     _, point = await _floor_with_point(db_session, building.id, "Térreo", "Sala A")
     _, other_point = await _floor_with_point(db_session, building.id, "1º andar", "Sala B")
-    worker = FieldWorker(full_name="Ana", contractor_company_id=company.id)
+    worker = await make_worker(db_session, company=company, full_name="Ana")
     windows = ServiceType(name="Limpeza de vidros", average_duration_minutes=30)
     floors = ServiceType(name="Limpeza de pisos", average_duration_minutes=45)
     db_session.add_all([worker, windows, floors])
@@ -429,7 +430,7 @@ async def test_pagination_is_stable_with_equal_timestamps(db_session: AsyncSessi
         (await _floor_with_point(db_session, building.id, f"Andar {i}", f"Sala {i}"))[1]
         for i in range(3)
     ]
-    worker = FieldWorker(full_name="Ana", contractor_company_id=company.id)
+    worker = await make_worker(db_session, company=company, full_name="Ana")
     db_session.add(worker)
     await db_session.flush()
     route = Route(field_worker_id=worker.id, route_date=_NOW.date(), status=RouteStatus.IN_PROGRESS)

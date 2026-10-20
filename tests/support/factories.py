@@ -3,6 +3,7 @@
 Extracted from the chain inlined in tests/api/test_routes.py so every check-in / check-out /
 evidence test starts from the same minimal graph instead of copy-pasting it."""
 
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 
@@ -11,16 +12,72 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     FieldWorker,
+    FieldWorkerStatus,
     Floor,
     ServicePoint,
 )
 from app.domain.identity.models import User, UserRole
+from app.domain.privacy.models import PrivacyNotice
 from app.domain.routing.models import Route, RouteStatus, RouteStop
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
 
 _PASSWORD = "senha-forte-o-suficiente"
+
+
+async def seed_privacy_notice(db: AsyncSession, *, version: int = 1) -> PrivacyNotice:
+    """The one current privacy notice. The tables are emptied between tests, taking the notice
+    the migration seeded with them. Commits.
+
+        await seed_privacy_notice(db_session)
+    """
+    await db.execute(text("DELETE FROM privacy_notices"))
+    notice = PrivacyNotice(
+        version=version,
+        title="Aviso de Privacidade",
+        body_markdown="# Aviso",
+        published_at=datetime.now(UTC),
+        is_current=True,
+    )
+    db.add(notice)
+    await db.commit()
+    return notice
+
+
+async def make_worker(
+    db: AsyncSession,
+    *,
+    company: ContractorCompany,
+    full_name: str = "João da Silva",
+    email: str | None = None,
+    status: FieldWorkerStatus = FieldWorkerStatus.APPROVED,
+    is_active: bool = True,
+) -> FieldWorker:
+    """A field worker with the login every worker has (log in with `_PASSWORD`). Approved and
+    active unless told otherwise; flushes, never commits.
+
+        worker = await make_worker(db, company=company, status=FieldWorkerStatus.REJECTED)
+    """
+    user = User(
+        name=full_name,
+        email=email or f"{uuid.uuid4().hex[:12]}@empresa.com",
+        password_hash=hash_password(_PASSWORD),
+        role=UserRole.FIELD_WORKER,
+    )
+    db.add(user)
+    await db.flush()
+    worker = FieldWorker(
+        full_name=full_name,
+        contractor_company_id=company.id,
+        user_id=user.id,
+        status=status,
+        is_active=is_active,
+    )
+    db.add(worker)
+    await db.flush()
+    return worker
 
 
 async def make_route(

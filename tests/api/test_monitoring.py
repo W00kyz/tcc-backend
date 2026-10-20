@@ -11,7 +11,14 @@ from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
 from app.domain.audit.models import AuditTrail
-from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    FieldWorker,
+    FieldWorkerStatus,
+    Floor,
+    ServicePoint,
+)
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import (
     Alert,
@@ -80,7 +87,10 @@ async def _seed_actors(db: AsyncSession) -> _Fixture:
     db.add_all([manager, worker_user, company])
     await db.flush()
     worker = FieldWorker(
-        full_name="Joao da Silva", contractor_company_id=company.id, user_id=worker_user.id
+        full_name="Joao da Silva",
+        contractor_company_id=company.id,
+        user_id=worker_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     db.add(worker)
     await db.flush()

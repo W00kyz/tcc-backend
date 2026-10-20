@@ -8,11 +8,13 @@ from uuid import UUID
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.campus_clock import campus_today
 from app.core.jwt import decode_token
 from app.db.session import get_db
+from app.domain.catalog.models import FieldWorker, FieldWorkerStatus
 from app.domain.identity.models import User, UserRole
 
 _bearer_scheme = HTTPBearer(auto_error=True)
@@ -48,6 +50,30 @@ def require_role(*roles: UserRole) -> Callable[..., Any]:
         return user
 
     return dependency
+
+
+async def get_approved_worker(
+    user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> FieldWorker:
+    """The caller's field worker profile, only while a manager has approved it and not switched
+    it off — the gate in front of every endpoint that acts as a worker in the field.
+
+    Example: ``async def endpoint(worker: ApprovedWorker) -> ...``
+    """
+    worker = await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
+    if worker is None or worker.status != FieldWorkerStatus.APPROVED or not worker.is_active:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "WORKER_NOT_APPROVED",
+                "detail": "This field worker account is not approved or is deactivated.",
+            },
+        )
+    return worker
+
+
+ApprovedWorker = Annotated[FieldWorker, Depends(get_approved_worker)]
 
 
 def get_campus_today() -> date:

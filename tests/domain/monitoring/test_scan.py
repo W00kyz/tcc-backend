@@ -12,6 +12,7 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     FieldWorker,
+    FieldWorkerStatus,
     Floor,
     ServicePoint,
 )
@@ -60,7 +61,10 @@ async def _base_graph(db: AsyncSession) -> tuple[FieldWorker, ServicePoint]:
         floor_id=floor.id, name="Sala 101", description="Sala", latitude=-7.2, longitude=-35.9
     )
     worker = FieldWorker(
-        full_name="João da Silva", contractor_company_id=company.id, user_id=user.id
+        full_name="João da Silva",
+        contractor_company_id=company.id,
+        user_id=user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     db.add_all([point, worker])
     await db.flush()

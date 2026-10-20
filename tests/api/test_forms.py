@@ -33,12 +33,16 @@ def _auth(token: str) -> dict[str, str]:
 
 def _service_type_id(client: TestClient, headers: dict[str, str]) -> str:
     response = client.post(
-        "/service-types",
-        json={"name": "Limpeza", "average_duration_minutes": 30},
+        "/contractor-companies",
+        json={
+            "name": "Limpa Tudo",
+            "cnpj": "12345678000199",
+            "service_types": [{"name": "Limpeza", "average_duration_minutes": 30}],
+        },
         headers=headers,
     )
     assert response.status_code == 201, response.text
-    return str(response.json()["id"])
+    return str(response.json()["service_types"][0]["id"])
 
 
 def _open_form(client: TestClient, headers: dict[str, str], service_type_id: str) -> str:

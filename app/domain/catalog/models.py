@@ -1,14 +1,28 @@
 """Minimal catalog tables (spec §4.1). RF05-RF10's write paths and endpoints (Etapa 3) live in
 app/api/*.py, one router per table here — this module stays models-only."""
 
+import enum
 import uuid
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import BigInteger, Float, ForeignKey, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.domain.identity.models import User
 
 
 class ContractorCompany(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -16,15 +30,33 @@ class ContractorCompany(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(200))
     cnpj: Mapped[str] = mapped_column(String(14), unique=True)
+    # The service types this company performs (a worker's pool is the points of these types).
+    service_types: Mapped[list["ServiceType"]] = relationship(
+        back_populates="contractor_company", order_by="ServiceType.name"
+    )
 
 
 class ServiceType(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """RNF19's load-bearing table: a row here, never a code branch, is what a 'service type' is."""
+    """RNF19's load-bearing table: a row here, never a code branch, is what a 'service type' is.
+    It belongs to a company; a type without one (migrated data) is outside every worker's pool
+    until a manager adds it to a company."""
 
     __tablename__ = "service_types"
 
     name: Mapped[str] = mapped_column(String(100), unique=True)
     average_duration_minutes: Mapped[int]
+    contractor_company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("contractor_companies.id"), nullable=True
+    )
+    contractor_company: Mapped["ContractorCompany | None"] = relationship(
+        back_populates="service_types"
+    )
+
+
+class FieldWorkerStatus(enum.StrEnum):
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
 
 
 class FieldWorker(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -34,25 +66,23 @@ class FieldWorker(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     contractor_company_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("contractor_companies.id")
     )
-    # Links the login identity (Task 3) only when the field worker has app access —
-    # nullable because a FieldWorker can be registered before being granted a User (RF08).
-    user_id: Mapped[uuid.UUID | None] = mapped_column(
+    contractor_company: Mapped["ContractorCompany"] = relationship()
+    # Every worker has a login: they register themselves (POST /auth/register).
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), unique=True
+    )
+    user: Mapped["User"] = relationship(foreign_keys=[user_id])
+    status: Mapped[FieldWorkerStatus] = mapped_column(
+        Enum(FieldWorkerStatus, name="field_worker_status"),
+        default=FieldWorkerStatus.PENDING_APPROVAL,
+    )
+    # A manager can switch an approved worker off without losing their history.
+    is_active: Mapped[bool] = mapped_column(default=True, server_default=text("true"))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
-    # Task 3 (RF08): the join rows this FieldWorker qualifies for, eager-loaded via
-    # selectinload so FieldWorkerOut.service_type_ids never triggers a lazy-load.
-    service_type_links: Mapped[list["FieldWorkerServiceType"]] = relationship()
-
-
-class FieldWorkerServiceType(Base):
-    __tablename__ = "field_worker_service_types"
-
-    field_worker_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("field_workers.id"), primary_key=True
-    )
-    service_type_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_types.id"), primary_key=True
-    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
 
 
 class Building(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -98,3 +128,9 @@ class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(String(500))
     latitude: Mapped[float] = mapped_column(Float)
     longitude: Mapped[float] = mapped_column(Float)
+    # Nullable in the database only because migrated points may have no type yet; the API
+    # requires one, and a point without a type is outside every worker's pool.
+    service_type_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("service_types.id"), nullable=True
+    )
+    service_type: Mapped["ServiceType | None"] = relationship()

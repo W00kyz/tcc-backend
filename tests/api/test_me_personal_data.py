@@ -11,6 +11,7 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     FieldWorker,
+    FieldWorkerStatus,
     Floor,
     ServicePoint,
 )
@@ -58,7 +59,12 @@ async def _seed_worker_with_execution(db_session: AsyncSession) -> SeededWorker:
     )
     db_session.add_all([company, user])
     await db_session.flush()
-    worker = FieldWorker(full_name="Joana Field", contractor_company_id=company.id, user_id=user.id)
+    worker = FieldWorker(
+        full_name="Joana Field",
+        contractor_company_id=company.id,
+        user_id=user.id,
+        status=FieldWorkerStatus.APPROVED,
+    )
     db_session.add(worker)
     await db_session.flush()
 

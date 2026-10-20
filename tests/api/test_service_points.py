@@ -2,7 +2,13 @@ import uuid
 
 import pytest
 from app.core.security import hash_password
-from app.domain.catalog.models import Building, Floor, ServicePoint
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    Floor,
+    ServicePoint,
+    ServiceType,
+)
 from app.domain.identity.models import User, UserRole
 from fastapi.testclient import TestClient
 from httpx2 import Response
@@ -33,7 +39,7 @@ OUTLINE: dict[str, object] = {
 
 async def _seed_floor(
     db_session: AsyncSession, footprint: dict[str, object] | None = OUTLINE
-) -> tuple[User, Floor]:
+) -> tuple[User, Floor, ServiceType]:
     manager = User(
         name="Larissa",
         email="larissa@pu.ufcg.edu.br",
@@ -44,15 +50,29 @@ async def _seed_floor(
     db_session.add_all([manager, building])
     await db_session.flush()
     floor = Floor(building_id=building.id, label="Térreo")
-    db_session.add(floor)
+    company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
+    db_session.add_all([floor, company])
+    await db_session.flush()
+    service_type = ServiceType(
+        name="Limpeza", average_duration_minutes=30, contractor_company_id=company.id
+    )
+    db_session.add(service_type)
     await db_session.commit()
-    return manager, floor
+    return manager, floor, service_type
 
 
-def _create_point(client: TestClient, token: str, floor_id: object, **extra: object) -> Response:
+def _create_point(
+    client: TestClient, token: str, floor_id: object, service_type_id: object, **extra: object
+) -> Response:
     return client.post(
         "/service-points",
-        json={"floor_id": str(floor_id), "name": "Sala 101", "description": "Aula", **extra},
+        json={
+            "floor_id": str(floor_id),
+            "service_type_id": str(service_type_id),
+            "name": "Sala 101",
+            "description": "Aula",
+            **extra,
+        },
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -61,9 +81,9 @@ async def test_a_point_takes_its_building_centroid(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     """A point has no location of its own: it is where its building is."""
-    manager, floor = await _seed_floor(db_session)
+    manager, floor, service_type = await _seed_floor(db_session)
 
-    response = _create_point(client, _login(client, manager.email), floor.id)
+    response = _create_point(client, _login(client, manager.email), floor.id, service_type.id)
 
     assert response.status_code == 201, response.text
     assert response.json()["latitude"] == pytest.approx(-7.2145)
@@ -73,10 +93,15 @@ async def test_a_point_takes_its_building_centroid(
 async def test_coordinates_in_the_body_are_refused(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    manager, floor = await _seed_floor(db_session)
+    manager, floor, service_type = await _seed_floor(db_session)
 
     response = _create_point(
-        client, _login(client, manager.email), floor.id, latitude=-7.2, longitude=-35.9
+        client,
+        _login(client, manager.email),
+        floor.id,
+        service_type.id,
+        latitude=-7.2,
+        longitude=-35.9,
     )
 
     assert response.status_code == 422
@@ -85,9 +110,9 @@ async def test_coordinates_in_the_body_are_refused(
 async def test_a_point_needs_a_building_outline(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    manager, floor = await _seed_floor(db_session, footprint=None)
+    manager, floor, service_type = await _seed_floor(db_session, footprint=None)
 
-    response = _create_point(client, _login(client, manager.email), floor.id)
+    response = _create_point(client, _login(client, manager.email), floor.id, service_type.id)
 
     assert response.status_code == 422
     assert "outline" in response.json()["detail"]
@@ -97,9 +122,9 @@ async def test_creating_a_service_point_for_an_unknown_floor_returns_404(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     """Regression test for Finding I2.2."""
-    manager, _floor = await _seed_floor(db_session)
+    manager, _floor, service_type = await _seed_floor(db_session)
 
-    response = _create_point(client, _login(client, manager.email), uuid.uuid4())
+    response = _create_point(client, _login(client, manager.email), uuid.uuid4(), service_type.id)
 
     assert response.status_code == 404
 
@@ -107,9 +132,9 @@ async def test_creating_a_service_point_for_an_unknown_floor_returns_404(
 async def test_redrawing_the_outline_moves_its_points(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    manager, floor = await _seed_floor(db_session)
+    manager, floor, service_type = await _seed_floor(db_session)
     token = _login(client, manager.email)
-    point_id = _create_point(client, token, floor.id).json()["id"]
+    point_id = _create_point(client, token, floor.id, service_type.id).json()["id"]
     moved = {
         "type": "Polygon",
         "coordinates": [[[-35.92, -7.22], [-35.91, -7.22], [-35.91, -7.23], [-35.92, -7.22]]],
@@ -136,9 +161,9 @@ async def test_redrawing_the_outline_moves_its_points(
 async def test_editing_a_point_changes_only_its_name_and_description(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    manager, floor = await _seed_floor(db_session)
+    manager, floor, service_type = await _seed_floor(db_session)
     token = _login(client, manager.email)
-    point_id = _create_point(client, token, floor.id).json()["id"]
+    point_id = _create_point(client, token, floor.id, service_type.id).json()["id"]
 
     response = client.patch(
         f"/service-points/{point_id}",
@@ -152,7 +177,7 @@ async def test_editing_a_point_changes_only_its_name_and_description(
 
 
 async def test_the_events_endpoints_are_gone(client: TestClient, db_session: AsyncSession) -> None:
-    manager, _floor = await _seed_floor(db_session)
+    manager, _floor, _service_type = await _seed_floor(db_session)
     token = _login(client, manager.email)
 
     response = client.get("/events", headers={"Authorization": f"Bearer {token}"})
@@ -164,7 +189,7 @@ async def test_service_points_can_be_listed_by_building(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     """The building page lists every point of the building, across its floors."""
-    manager, floor = await _seed_floor(db_session)
+    manager, floor, _service_type = await _seed_floor(db_session)
     upper = Floor(building_id=floor.building_id, label="1º andar")
     other_building = Building(name="Bloco CD", campus_area="CEEI")
     db_session.add_all([upper, other_building])
@@ -199,3 +224,57 @@ async def test_service_points_can_be_listed_by_building(
 
     assert response.status_code == 200
     assert sorted(point["name"] for point in response.json()) == ["Sala 101", "Sala 201"]
+
+
+async def test_point_requires_service_type(client: TestClient, db_session: AsyncSession) -> None:
+    manager, floor, _service_type = await _seed_floor(db_session)
+
+    response = client.post(
+        "/service-points",
+        json={"floor_id": str(floor.id), "name": "Sala 101", "description": "Aula"},
+        headers={"Authorization": f"Bearer {_login(client, manager.email)}"},
+    )
+
+    assert response.status_code == 422
+
+
+async def test_type_without_company_is_rejected(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor, _service_type = await _seed_floor(db_session)
+    orphan = ServiceType(name="Jardinagem", average_duration_minutes=45)
+    db_session.add(orphan)
+    await db_session.commit()
+
+    response = _create_point(client, _login(client, manager.email), floor.id, orphan.id)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "SERVICE_TYPE_WITHOUT_COMPANY"
+
+
+async def test_a_point_reports_its_type_and_can_change_it(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor, service_type = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+    other = ServiceType(
+        name="Jardinagem",
+        average_duration_minutes=45,
+        contractor_company_id=service_type.contractor_company_id,
+    )
+    db_session.add(other)
+    await db_session.commit()
+    created = _create_point(client, token, floor.id, service_type.id).json()
+    assert created["service_type_name"] == "Limpeza"
+
+    response = client.patch(
+        f"/service-points/{created['id']}",
+        json={"name": "Sala 101", "description": "Aula", "service_type_id": str(other.id)},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["service_type_id"] == str(other.id)
+    assert response.json()["service_type_name"] == "Jardinagem"
+    listed = client.get("/service-points", headers={"Authorization": f"Bearer {token}"}).json()
+    assert [item["service_type_name"] for item in listed] == ["Jardinagem"]

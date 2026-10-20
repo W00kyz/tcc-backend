@@ -36,7 +36,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
-from tests.support.factories import make_route
+from tests.support.factories import make_route, make_worker
 
 _PRIVATE_KEY_HEX = "11" * 32
 _PUBLIC_KEY_HEX = derive_public_key_hex(_PRIVATE_KEY_HEX)
@@ -91,7 +91,7 @@ async def _seed(
         ServicePoint(floor_id=floor.id, name=name, description="Sala", latitude=lat, longitude=lon)
         for name, lat, lon in rooms
     ]
-    worker = FieldWorker(full_name="João", contractor_company_id=company.id)
+    worker = await make_worker(db, company=company, full_name="João")
     db.add_all([*points, worker])
     await db.flush()
 

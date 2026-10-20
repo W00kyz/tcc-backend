@@ -6,7 +6,14 @@ from typing import cast
 from app.api.deps import get_campus_today
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    FieldWorker,
+    FieldWorkerStatus,
+    Floor,
+    ServicePoint,
+)
 from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import sign_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
@@ -73,7 +80,12 @@ async def _seed_route(
     db_session.add(floor)
     await db_session.flush()
 
-    worker = FieldWorker(full_name="João", contractor_company_id=company.id, user_id=worker_user.id)
+    worker = FieldWorker(
+        full_name="João",
+        contractor_company_id=company.id,
+        user_id=worker_user.id,
+        status=FieldWorkerStatus.APPROVED,
+    )
     points = [
         ServicePoint(floor_id=floor.id, name=name, description="Sala", latitude=lat, longitude=lng)
         for name, lat, lng in specs
@@ -140,7 +152,14 @@ async def _add_field_worker(db_session: AsyncSession, email: str) -> None:
     company = ContractorCompany(name="Outra Limpeza", cnpj="98765432000155")
     db_session.add_all([user, company])
     await db_session.flush()
-    db_session.add(FieldWorker(full_name=email, contractor_company_id=company.id, user_id=user.id))
+    db_session.add(
+        FieldWorker(
+            full_name=email,
+            contractor_company_id=company.id,
+            user_id=user.id,
+            status=FieldWorkerStatus.APPROVED,
+        )
+    )
     await db_session.commit()
 
 

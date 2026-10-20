@@ -21,6 +21,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # The revision right below the automatic-allocation reset: every migration up to it round-trips.
 LAST_REVERSIBLE_REVISION = "e7a2b4c6d8f0"
 
+# The automatic-allocation reset itself: migrations after it are tested from here, upgrading the
+# throwaway database one step at a time (the reset cannot be downgraded, so never below it).
+ALLOCATION_RESET_REVISION = "f3b9d1a7c2e5"
+
 _ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
 
 

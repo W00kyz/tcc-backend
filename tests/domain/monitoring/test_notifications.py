@@ -5,7 +5,7 @@ targets exactly MANAGER + ADMIN and carries the route only when the alert has on
 import uuid
 
 from app.core.security import hash_password
-from app.domain.catalog.models import ContractorCompany, FieldWorker
+from app.domain.catalog.models import ContractorCompany
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity, Notification
 from app.domain.monitoring.notifications import notify_alert, notify_users
@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
+from tests.support.factories import make_worker
 
 
 class RecordingPushSender:
@@ -45,14 +46,11 @@ async def _user(db: AsyncSession, role: UserRole) -> User:
     return user
 
 
-async def _route_with_worker(db: AsyncSession, *, with_user: bool) -> Route:
+async def _route_with_worker(db: AsyncSession) -> Route:
     company = ContractorCompany(name="Co", cnpj=str(uuid.uuid4().int)[:14])
     db.add(company)
     await db.flush()
-    user_id = (await _user(db, UserRole.FIELD_WORKER)).id if with_user else None
-    worker = FieldWorker(full_name="W", contractor_company_id=company.id, user_id=user_id)
-    db.add(worker)
-    await db.flush()
+    worker = await make_worker(db, company=company, full_name="W")
     route = Route(field_worker_id=worker.id, route_date=today_on_campus())
     db.add(route)
     await db.flush()
@@ -116,7 +114,7 @@ async def test_notify_alert_targets_manager_and_admin_only(db_session: AsyncSess
     manager = await _user(db_session, UserRole.MANAGER)
     admin = await _user(db_session, UserRole.ADMIN)
     field_worker = await _user(db_session, UserRole.FIELD_WORKER)
-    route = await _route_with_worker(db_session, with_user=False)
+    route = await _route_with_worker(db_session)
     alert = Alert(
         kind=AlertKind.BATCH_RELEASED,
         severity=AlertSeverity.WARNING,

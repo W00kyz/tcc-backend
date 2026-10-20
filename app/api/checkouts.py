@@ -20,11 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api._execution_common import (
     NoActiveRoute,
     RouteStopMissing,
-    current_worker,
     resolve_route,
 )
 from app.api.checkins import CandidateOut
-from app.api.deps import CampusToday, require_role
+from app.api.deps import ApprovedWorker, CampusToday
 from app.db.session import get_db
 from app.domain.execution.answers import AnswerIn, AnswerValidationError
 from app.domain.execution.service import (
@@ -38,7 +37,6 @@ from app.domain.execution.service import (
     check_out,
 )
 from app.domain.execution.validation import ChosenStopNotOnFloor
-from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import derive_public_key_hex
 from app.domain.settings.service import get_settings_row
 
@@ -106,14 +104,10 @@ def _ambiguous_conflict(exc: AmbiguousRoom) -> HTTPException:
 async def create_check_out(
     body: CheckOutRequest,
     request: Request,
-    user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
+    worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
     today: CampusToday,
 ) -> CheckOutResponse:
-    worker = await current_worker(db, user)
-    if worker is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has no field worker profile.")
-
     try:
         route = await resolve_route(
             db, worker_id=worker.id, route_stop_id=body.route_stop_id, today=today

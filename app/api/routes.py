@@ -12,17 +12,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CampusToday, require_role
+from app.api.deps import ApprovedWorker, CampusToday, require_role
 from app.api.route_view import _ROUTE_LOADERS, RouteOut, _load_route, _to_route_out
 from app.db.session import get_db
-from app.domain.catalog.models import FieldWorker
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import Route, RouteStatus
 
 router = APIRouter(prefix="/routes", tags=["routes"])
 
 _Manager = Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))]
-_FieldWorker = Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))]
 _Db = Annotated[AsyncSession, Depends(get_db)]
 
 
@@ -61,7 +59,7 @@ async def list_routes(
 
 @router.get("/me", response_model=list[RouteOut])
 async def list_my_routes(
-    user: _FieldWorker,
+    worker: ApprovedWorker,
     db: _Db,
     today: CampusToday,
     route_date: Annotated[date | None, Query(alias="date")] = None,
@@ -69,9 +67,6 @@ async def list_my_routes(
     """RF27 "rota do dia": the mobile feed for the signed-in worker. Same `RouteOut` shape the
     manager endpoints return, so mobile and the dashboard render a route identically. Without
     `?date=` it defaults to today."""
-    worker = await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
-    if worker is None:
-        return []
     stmt = (
         select(Route)
         .where(

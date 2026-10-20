@@ -37,7 +37,14 @@ from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
 from app.db.session import build_engine, build_session_factory
-from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    FieldWorker,
+    FieldWorkerStatus,
+    Floor,
+    ServicePoint,
+)
 from app.domain.execution.models import Execution, ExecutionSource
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity, AlertStatus, Notification
@@ -124,7 +131,10 @@ async def _seed(db: AsyncSession) -> _Seed:
     db.add_all([manager, worker_user, company])
     await db.flush()
     worker = FieldWorker(
-        full_name="Joao da Silva", contractor_company_id=company.id, user_id=worker_user.id
+        full_name="Joao da Silva",
+        contractor_company_id=company.id,
+        user_id=worker_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     db.add(worker)
     await db.flush()

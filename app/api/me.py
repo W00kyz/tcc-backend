@@ -45,7 +45,6 @@ class MyFieldWorkerOut(_Model):
     id: uuid.UUID
     full_name: str
     contractor_company_id: uuid.UUID
-    service_type_ids: list[uuid.UUID]
 
 
 class ConsentEntryOut(_Model):

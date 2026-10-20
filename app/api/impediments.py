@@ -14,8 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api._execution_common import current_worker
-from app.api.deps import require_role
+from app.api.deps import ApprovedWorker, require_role
 from app.db.session import get_db
 from app.domain.identity.models import User, UserRole
 from app.domain.impediments.models import (
@@ -36,7 +35,6 @@ from app.domain.routing.models import Route, RouteStop
 router = APIRouter(tags=["impediments"])
 
 _Manager = Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))]
-_FieldWorker = Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))]
 _Db = Annotated[AsyncSession, Depends(get_db)]
 
 # Every impediment-service failure the report endpoint translates to an HTTP status by exact
@@ -93,15 +91,11 @@ def _to_out(impediment: Impediment) -> ImpedimentOut:
     status_code=status.HTTP_201_CREATED,
 )
 async def report_impediment(
-    route_id: UUID, body: ImpedimentReportBody, request: Request, user: _FieldWorker, db: _Db
+    route_id: UUID, body: ImpedimentReportBody, request: Request, worker: ApprovedWorker, db: _Db
 ) -> ImpedimentOut:
     """RF16-RF17 — the field worker signals they cannot execute this stop (scope=STOP) or the
     rest of the route (scope=ROUTE_REMAINDER). The report is the record; no audit-trail entry
     is appended here (nothing on the assignment chain moved yet)."""
-    worker = await current_worker(db, user)
-    if worker is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has no field worker profile.")
-
     route = await db.get(Route, route_id)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')

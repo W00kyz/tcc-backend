@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_role
 from app.db.session import get_db
@@ -18,7 +19,7 @@ from app.domain.catalog.deletion import (
     impact_of_point,
     remove_photo_objects,
 )
-from app.domain.catalog.models import Building, Floor, ServicePoint
+from app.domain.catalog.models import Building, Floor, ServicePoint, ServiceType
 from app.domain.catalog.points import point_location
 from app.domain.identity.models import User, UserRole
 
@@ -32,6 +33,8 @@ class ServicePointOut(BaseModel):
     description: str
     latitude: float
     longitude: float
+    service_type_id: UUID | None
+    service_type_name: str | None
 
 
 class ServicePointCreateRequest(BaseModel):
@@ -41,6 +44,7 @@ class ServicePointCreateRequest(BaseModel):
     floor_id: UUID
     name: str
     description: str
+    service_type_id: UUID
 
 
 class ServicePointUpdateRequest(BaseModel):
@@ -48,6 +52,8 @@ class ServicePointUpdateRequest(BaseModel):
 
     name: str
     description: str
+    # Optional so a rename does not have to resend it; a point can only change type, never lose it.
+    service_type_id: UUID | None = None
 
 
 class DeletionImpactOut(BaseModel):
@@ -68,7 +74,29 @@ def _to_out(point: ServicePoint) -> ServicePointOut:
         description=point.description,
         latitude=point.latitude,
         longitude=point.longitude,
+        service_type_id=point.service_type_id,
+        service_type_name=point.service_type.name if point.service_type else None,
     )
+
+
+async def _require_service_type(db: AsyncSession, service_type_id: UUID) -> ServiceType:
+    """A point's type must exist and belong to a company, or no worker could ever receive it."""
+    service_type = await db.get(ServiceType, service_type_id)
+    if service_type is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f'Service type "{service_type_id}" not found.'
+        )
+    if service_type.contractor_company_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "SERVICE_TYPE_WITHOUT_COMPANY",
+                "detail": f'Service type "{service_type.name}" belongs to no company; add it to '
+                "a company first.",
+                "service_type_id": str(service_type_id),
+            },
+        )
+    return service_type
 
 
 @router.get("", response_model=list[ServicePointOut])
@@ -79,7 +107,11 @@ async def list_service_points(
     building_id: UUID | None = None,
 ) -> list[ServicePointOut]:
     # Registration order, so a renamed point does not jump to the end of the building's list.
-    query = select(ServicePoint).order_by(ServicePoint.created_at, ServicePoint.id)
+    query = (
+        select(ServicePoint)
+        .options(selectinload(ServicePoint.service_type))
+        .order_by(ServicePoint.created_at, ServicePoint.id)
+    )
     if floor_id is not None:
         query = query.where(ServicePoint.floor_id == floor_id)
     if building_id is not None:
@@ -111,8 +143,10 @@ async def create_service_point(
             f'Building "{floor.building_id}" has no outline; draw it before adding points.',
         )
 
+    service_type = await _require_service_type(db, body.service_type_id)
     latitude, longitude = location
     point = ServicePoint(
+        service_type=service_type,
         floor_id=body.floor_id,
         name=body.name,
         description=body.description,
@@ -128,7 +162,7 @@ async def create_service_point(
         entity_id=point.id,
         action="create",
         before=None,
-        after={"name": point.name},
+        after={"name": point.name, "service_type_id": str(service_type.id)},
     )
     await db.commit()
     return _to_out(point)
@@ -145,7 +179,15 @@ async def update_service_point(
     if point is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Service point "{point_id}" not found.')
 
-    before = {"name": point.name, "description": point.description}
+    before = {
+        "name": point.name,
+        "description": point.description,
+        "service_type_id": str(point.service_type_id) if point.service_type_id else None,
+    }
+    if body.service_type_id is not None:
+        point.service_type = await _require_service_type(db, body.service_type_id)
+    else:
+        await db.refresh(point, ["service_type"])
     point.name = body.name
     point.description = body.description
     await record_audit_trail(
@@ -155,7 +197,11 @@ async def update_service_point(
         entity_id=point.id,
         action="update",
         before=before,
-        after={"name": point.name, "description": point.description},
+        after={
+            "name": point.name,
+            "description": point.description,
+            "service_type_id": str(point.service_type_id) if point.service_type_id else None,
+        },
     )
     await db.commit()
     return _to_out(point)
