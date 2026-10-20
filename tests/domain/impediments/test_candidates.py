@@ -331,3 +331,33 @@ async def test_candidates_empty_when_route_remainder_has_no_pending(
     imp = await world.impediment(route=impeded_route, scope=ImpedimentScope.ROUTE_REMAINDER)
 
     assert await candidates_for(db_session, impediment=imp) == []
+
+
+async def test_candidates_never_include_the_impeded_worker_second_route(
+    db_session: AsyncSession,
+) -> None:
+    world = await _world(db_session)
+    st_a = await world.service_type("Limpeza")
+    impeded_worker = await world.worker(full_name="Impedido", service_type_ids=[st_a.id])
+    impeded_route = await world.route_with_stops(
+        worker=impeded_worker,
+        status=RouteStatus.IN_PROGRESS,
+        stops=[(await world.point(latitude=0.0, longitude=0.0), st_a.id)],
+    )
+    # Same worker, same day, a second (e.g. OCCASIONAL) route still PLANNED.
+    await world.route_with_stops(
+        worker=impeded_worker,
+        stops=[(await world.point(latitude=0.0, longitude=0.01), None)],
+    )
+    other = await world.worker(full_name="Substituta", service_type_ids=[st_a.id])
+    await world.route_with_stops(
+        worker=other, stops=[(await world.point(latitude=0.0, longitude=0.02), None)]
+    )
+    impeded_stop = (await _stops_of(db_session, impeded_route))[0]
+    imp = await world.impediment(
+        route=impeded_route, scope=ImpedimentScope.STOP, route_stop=impeded_stop
+    )
+
+    candidates = await candidates_for(db_session, impediment=imp)
+
+    assert [c.field_worker_id for c in candidates] == [other.id]

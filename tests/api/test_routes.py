@@ -1,9 +1,11 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
+from typing import cast
 from uuid import uuid4
 
 import pytest
+from app.api.deps import get_campus_today
 from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
@@ -13,7 +15,6 @@ from app.domain.catalog.models import (
     ContractorCompany,
     FieldWorker,
     Floor,
-    PointType,
     ServicePoint,
     ServiceType,
 )
@@ -36,6 +37,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.clock import today_on_campus
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -124,7 +126,7 @@ async def _seed_manager_and_worker_route(
     db_session.add_all([point, worker])
     await db_session.flush()
 
-    route = Route(field_worker_id=worker.id, route_date=date.today())
+    route = Route(field_worker_id=worker.id, route_date=today_on_campus())
     db_session.add(route)
     await db_session.flush()
     db_session.add(RouteStop(route_id=route.id, service_point_id=point.id, order_index=1))
@@ -165,7 +167,6 @@ async def _seed_actors_and_points(
             description="Sala",
             latitude=-7.2 + index * 0.001,
             longitude=-35.9 + index * 0.001,
-            point_type=PointType.OCCASIONAL if index == 0 else PointType.REGULAR,
         )
         for index in range(3)
     ]
@@ -252,11 +253,11 @@ async def test_routes_me_defaults_to_today_and_includes_geometry(
         db_session,
         workers[0],
         [points[0], points[1]],
-        route_date=date.today(),
+        route_date=today_on_campus(),
         with_geometry=True,
     )
     await _add_route(
-        db_session, workers[0], [points[2]], route_date=date.today() - timedelta(days=1)
+        db_session, workers[0], [points[2]], route_date=today_on_campus() - timedelta(days=1)
     )
     token = _login(client, worker_user.email)
 
@@ -266,7 +267,6 @@ async def test_routes_me_defaults_to_today_and_includes_geometry(
     body = response.json()
     assert [route["id"] for route in body] == [str(today_route.id)]  # yesterday's is excluded
     assert body[0]["route_type"] == "REGULAR"
-    assert body[0]["stops"][0]["point_type"] == "OCCASIONAL"
     assert isinstance(body[0]["stops"][1]["leg_geometry"], list)
 
 
@@ -300,7 +300,7 @@ async def test_routes_me_embeds_the_active_form_per_stop(
         options=[],
     )
 
-    route = Route(field_worker_id=workers[0].id, route_date=date.today())
+    route = Route(field_worker_id=workers[0].id, route_date=today_on_campus())
     db_session.add(route)
     await db_session.flush()
     db_session.add_all(
@@ -343,8 +343,8 @@ async def test_routes_me_embeds_the_active_form_per_stop(
 
 async def test_routes_me_filters_by_date(client: TestClient, db_session: AsyncSession) -> None:
     _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
-    tomorrow = date.today() + timedelta(days=1)
-    await _add_route(db_session, workers[0], [points[0]], route_date=date.today())
+    tomorrow = today_on_campus() + timedelta(days=1)
+    await _add_route(db_session, workers[0], [points[0]], route_date=today_on_campus())
     await _add_route(db_session, workers[0], [points[1]], route_date=tomorrow)
     token = _login(client, worker_user.email)
 
@@ -362,10 +362,10 @@ async def test_routes_me_hides_cancelled(client: TestClient, db_session: AsyncSe
         db_session,
         workers[0],
         [points[0]],
-        route_date=date.today(),
+        route_date=today_on_campus(),
         status=RouteStatus.CANCELLED,
     )
-    await _add_route(db_session, workers[0], [points[1]], route_date=date.today())
+    await _add_route(db_session, workers[0], [points[1]], route_date=today_on_campus())
     token = _login(client, worker_user.email)
 
     response = client.get("/routes/me", headers=_auth(token))
@@ -1516,7 +1516,7 @@ async def test_complete_manually_stop_not_on_route_404(
 ) -> None:
     manager, _worker_user, worker, route = await _seed_manager_and_worker_route(db_session)
     point_id = await db_session.scalar(select(ServicePoint.id))
-    other_route = Route(field_worker_id=worker.id, route_date=date.today())
+    other_route = Route(field_worker_id=worker.id, route_date=today_on_campus())
     db_session.add(other_route)
     await db_session.flush()
     other_stop = RouteStop(route_id=other_route.id, service_point_id=point_id, order_index=1)
@@ -1532,3 +1532,20 @@ async def test_complete_manually_stop_not_on_route_404(
     )
 
     assert response.status_code == 404
+
+
+async def test_routes_me_follows_the_campus_day_not_the_server_date(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression: `/routes/me` used `date.today()`, the UTC date in the API container, so from
+    21:00 in Campina Grande the worker's app showed tomorrow's routes instead of today's."""
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    campus_day = today_on_campus() + timedelta(days=1)
+    await _add_route(db_session, workers[0], [points[0]], route_date=today_on_campus())
+    campus_day_route = await _add_route(db_session, workers[0], [points[1]], route_date=campus_day)
+    cast(FastAPI, client.app).dependency_overrides[get_campus_today] = lambda: campus_day
+    token = _login(client, worker_user.email)
+
+    response = client.get("/routes/me", headers=_auth(token))
+
+    assert [route["id"] for route in response.json()] == [str(campus_day_route.id)]

@@ -3,7 +3,7 @@ and served through an authenticated content proxy (never a public MinIO URL)."""
 
 import hashlib
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import cast
 
 from app.core.config import Settings
@@ -23,6 +23,7 @@ from tests.api.test_checkins import (
     _post,
     _seed_route,
 )
+from tests.support.clock import today_on_campus
 from tests.support.object_store import FakeObjectStore
 
 # A minimal but real JPEG header — the upload endpoint checks the SOI magic bytes and
@@ -112,7 +113,7 @@ async def _seed_other_worker_execution(
     )
     route = Route(
         field_worker_id=worker.id,
-        route_date=date.today(),
+        route_date=today_on_campus(),
         status=RouteStatus.IN_PROGRESS,
         started_at=datetime.now(UTC),
     )
@@ -466,3 +467,20 @@ async def test_upload_note_distinct_idempotency_keys_create_two_rows(
         )
     ).all()
     assert len(rows) == 2
+
+
+async def test_listed_evidence_carries_its_idempotency_key(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    """The key the app generated offline is how a MEDIA answer points at its photos."""
+    token, execution_id = await _seed_execution(client, db_session, test_settings)
+    key = str(uuid.uuid4())
+    assert (
+        _upload_note(client, token, execution_id, "Nota.", idempotency_key=key).status_code == 201
+    )
+
+    listing = client.get(
+        f"/executions/{execution_id}/evidence", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert [item["idempotency_key"] for item in listing.json()] == [key]

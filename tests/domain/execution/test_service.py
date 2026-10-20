@@ -50,6 +50,8 @@ from app.domain.routing.models import (
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.clock import today_on_campus
+
 _PRIVATE_KEY_HEX = "11" * 32
 _PUBLIC_KEY_HEX = derive_public_key_hex(_PRIVATE_KEY_HEX)
 _RADIUS_M = 50
@@ -124,7 +126,7 @@ async def _seed(
     status = route_status or (RouteStatus.IN_PROGRESS if started else RouteStatus.PLANNED)
     route = Route(
         field_worker_id=worker.id,
-        route_date=datetime.now(UTC).date(),
+        route_date=today_on_campus(),
         status=status,
         started_at=datetime.now(UTC) if started else None,
     )
@@ -378,7 +380,7 @@ async def test_check_in_superseded_qr_flags_but_succeeds(db_session: AsyncSessio
 
 async def test_check_in_outside_schedule_window_flags(db_session: AsyncSession) -> None:
     seed = await _seed(db_session)
-    today = datetime.now(UTC).date()
+    today = today_on_campus()
     seed.stops[0].expected_arrival_from = datetime.combine(
         today, datetime.min.time(), tzinfo=UTC
     ) + timedelta(hours=8)
@@ -716,3 +718,53 @@ async def test_complete_manually_stop_from_another_route_raises(db_session: Asyn
 
     with pytest.raises(StopNotOnRoute):
         await _manual(db_session, seed, other.stops[0])
+
+
+# --- route completion (RF41, RF45, RNF11) ------------------------------------------------------
+
+
+async def _route_status(db: AsyncSession, seed: _Seed) -> RouteStatus:
+    # A fresh read per call — asserting `seed.route.status` twice would let mypy narrow the
+    # attribute to the first literal and flag the second comparison as unreachable.
+    await db.refresh(seed.route)
+    return seed.route.status
+
+
+async def test_check_out_of_last_stop_closes_the_route(db_session: AsyncSession) -> None:
+    seed = await _seed(
+        db_session, rooms=[("Sala 101", _LAT, _LON), ("Sala 102", _FAR_LAT, _FAR_LON)]
+    )
+
+    await _do_check_in(db_session, seed)
+    await _do_check_out(db_session, seed)
+    assert await _route_status(db_session, seed) is RouteStatus.IN_PROGRESS  # one stop open
+
+    await _do_check_in(db_session, seed, latitude=_FAR_LAT, longitude=_FAR_LON)
+    await _do_check_out(db_session, seed, latitude=_FAR_LAT, longitude=_FAR_LON)
+
+    assert await _route_status(db_session, seed) is RouteStatus.DONE
+
+
+async def test_manual_completion_of_every_stop_closes_an_unstarted_route(
+    db_session: AsyncSession,
+) -> None:
+    # RF53: the worker forgot the phone and never started; the manager completes everything.
+    seed = await _seed(db_session, started=False)
+
+    await _manual(db_session, seed, seed.stops[0])
+
+    await db_session.refresh(seed.route)
+    assert seed.route.status is RouteStatus.DONE
+
+
+async def test_manual_completion_leaves_route_open_while_stops_remain(
+    db_session: AsyncSession,
+) -> None:
+    seed = await _seed(
+        db_session, rooms=[("Sala 101", _LAT, _LON), ("Sala 102", _FAR_LAT, _FAR_LON)]
+    )
+
+    await _manual(db_session, seed, seed.stops[0])
+
+    await db_session.refresh(seed.route)
+    assert seed.route.status is RouteStatus.IN_PROGRESS

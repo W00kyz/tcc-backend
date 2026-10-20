@@ -3,7 +3,7 @@ and the audit-trail entry the access itself writes."""
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 
 from app.core.security import hash_password
 from app.domain.audit.models import AuditTrail
@@ -21,6 +21,8 @@ from app.domain.routing.models import Route, RouteStop
 from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.clock import today_on_campus
 
 _PASSWORD = "senha-forte-o-suficiente"
 
@@ -75,7 +77,7 @@ async def _seed_worker_with_execution(db_session: AsyncSession) -> SeededWorker:
     )
     db_session.add(point)
     await db_session.flush()
-    route = Route(field_worker_id=worker.id, route_date=date.today())
+    route = Route(field_worker_id=worker.id, route_date=today_on_campus())
     db_session.add(route)
     await db_session.flush()
     stop = RouteStop(route_id=route.id, service_point_id=point.id, order_index=0)

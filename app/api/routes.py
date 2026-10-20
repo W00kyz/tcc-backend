@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_role
+from app.api.deps import CampusToday, require_role
 from app.api.route_view import (
     _ROUTE_LOADERS,
     RouteOut,
@@ -252,6 +252,7 @@ async def list_routes(
 async def list_my_routes(
     user: _FieldWorker,
     db: _Db,
+    today: CampusToday,
     route_date: Annotated[date | None, Query(alias="date")] = None,
 ) -> list[RouteOut]:
     """RF27 "rota do dia": the mobile feed for the signed-in worker. Same `RouteOut` shape the
@@ -264,7 +265,7 @@ async def list_my_routes(
         select(Route)
         .where(
             Route.field_worker_id == worker.id,
-            Route.route_date == (route_date or date.today()),
+            Route.route_date == (route_date or today),
             Route.status != RouteStatus.CANCELLED,
         )
         .options(*_ROUTE_LOADERS)

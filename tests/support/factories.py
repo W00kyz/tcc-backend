@@ -17,6 +17,8 @@ from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.clock import today_on_campus
+
 _PASSWORD = "senha-forte-o-suficiente"
 
 
@@ -51,7 +53,7 @@ async def seed_route_with_one_stop(
 
     route = Route(
         field_worker_id=worker.id,
-        route_date=datetime.now(UTC).date(),
+        route_date=today_on_campus(),
         status=RouteStatus.IN_PROGRESS,
         started_at=datetime.now(UTC),
     )

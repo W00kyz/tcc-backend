@@ -35,7 +35,7 @@ from app.domain.execution.models import (
     QrScan,
     QrScanKind,
 )
-from app.domain.forms.models import FormVersion
+from app.domain.forms.models import FormQuestion, FormVersion
 from app.domain.identity.models import User
 from app.domain.routing.models import RouteStop, RouteStopStatus, StopAssignment
 
@@ -103,6 +103,8 @@ class ExecutionEvidenceRow:
     byte_size: int | None
     captured_at: datetime
     created_at: datetime
+    # The key the app generated offline; a MEDIA answer points at its photos by it.
+    idempotency_key: UUID | None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,8 @@ class AnswerDetailRow:
     question_stable_key: str
     prompt: str | None  # None when the key is no longer in the recorded form version (Ruling 15)
     value: Any
+    # Same lifetime as `prompt`: None for a key no longer in the recorded version.
+    question_type: str | None
 
 
 @dataclass(frozen=True)
@@ -298,6 +302,7 @@ def _to_evidence_row(item: EvidenceItem) -> ExecutionEvidenceRow:
         byte_size=item.byte_size,
         captured_at=item.captured_at,
         created_at=item.created_at,
+        idempotency_key=item.idempotency_key,
     )
 
 
@@ -402,9 +407,7 @@ async def _load_answers(
         .where(FormVersion.id == form_version_id)
         .options(selectinload(FormVersion.questions))
     )
-    prompt_map: dict[str, str] = (
-        {str(q.stable_key): q.prompt for q in version.questions} if version is not None else {}
-    )
+    questions = {str(q.stable_key): q for q in version.questions} if version is not None else {}
     answers = (
         await db.scalars(
             select(Answer).where(Answer.execution_id == execution_id).order_by(Answer.created_at)
@@ -413,8 +416,9 @@ async def _load_answers(
     return [
         AnswerDetailRow(
             question_stable_key=a.question_stable_key,
-            prompt=prompt_map.get(a.question_stable_key),
+            prompt=_question_prompt(questions, a.question_stable_key),
             value=a.value_json,
+            question_type=_question_type(questions, a.question_stable_key),
         )
         for a in answers
     ]
@@ -432,3 +436,13 @@ async def resolve_review(db: AsyncSession, *, execution_id: UUID) -> Execution:
     execution.review_status = ExecutionReviewStatus.RESOLVED
     await db.flush()
     return execution
+
+
+def _question_prompt(questions: dict[str, FormQuestion], stable_key: str) -> str | None:
+    question = questions.get(stable_key)
+    return None if question is None else question.prompt
+
+
+def _question_type(questions: dict[str, FormQuestion], stable_key: str) -> str | None:
+    question = questions.get(stable_key)
+    return None if question is None else question.question_type.value

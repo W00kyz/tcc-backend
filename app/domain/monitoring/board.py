@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.campus_clock import campus_today, campus_wall_clock
 from app.domain.catalog.models import FieldWorker
 from app.domain.monitoring.models import Alert, AlertKind, AlertStatus, WorkerPosition
 from app.domain.routing.models import Route, RouteStatus, RouteStopStatus
@@ -113,7 +114,7 @@ async def build_board(db: AsyncSession, *, now: datetime) -> BoardSnapshot:
 async def _load_routes(db: AsyncSession, now: datetime) -> Sequence[Route]:
     stmt = (
         select(Route)
-        .where(Route.route_date <= now.date(), Route.status.in_(_BOARD_STATUSES))
+        .where(Route.route_date <= campus_today(now), Route.status.in_(_BOARD_STATUSES))
         .options(selectinload(Route.stops))
         .order_by(Route.route_date, Route.created_at)
     )
@@ -167,10 +168,13 @@ def _is_delayed(route: Route, now: datetime, *, alert_delayed: bool) -> bool:
         and route.scheduled_start_at < now
     ):
         return True
+    # Arrival windows are campus wall-clock tagged UTC (app/core/campus_clock.py); the route's
+    # scheduled start above is a real instant and keeps the real `now`.
+    wall_now = campus_wall_clock(now)
     return any(
         stop.status is RouteStopStatus.PENDING
         and stop.expected_arrival_to is not None
-        and stop.expected_arrival_to < now
+        and stop.expected_arrival_to < wall_now
         for stop in route.stops
     )
 

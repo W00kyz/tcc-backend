@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from app.core.campus_clock import campus_today, campus_wall_clock
 from app.core.security import hash_password
 from app.domain.catalog.models import (
     Building,
@@ -34,6 +35,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 _NOW = datetime.now(UTC)
+# Arrival windows are campus wall-clock tagged UTC (app/core/campus_clock.py).
+_WALL_NOW = campus_wall_clock(_NOW)
 
 
 async def _base_graph(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
@@ -72,7 +75,7 @@ async def _route(
 ) -> Route:
     route = Route(
         field_worker_id=worker_id,
-        route_date=_NOW.date(),
+        route_date=campus_today(_NOW),
         status=status,
         scheduled_start_at=scheduled_start_at,
     )
@@ -148,7 +151,7 @@ async def _late_stop_scenario(db: AsyncSession) -> None:
         route,
         point_id,
         status=RouteStopStatus.PENDING,
-        expected_arrival_to=_NOW - timedelta(minutes=45),
+        expected_arrival_to=_WALL_NOW - timedelta(minutes=45),
     )
 
 
@@ -233,7 +236,7 @@ async def test_late_stop_creates_one_open_alert(db_session: AsyncSession) -> Non
         route,
         point_id,
         status=RouteStopStatus.PENDING,
-        expected_arrival_to=_NOW - timedelta(minutes=45),
+        expected_arrival_to=_WALL_NOW - timedelta(minutes=45),
     )
     await db_session.commit()
 
@@ -257,7 +260,7 @@ async def test_second_scan_is_idempotent(db_session: AsyncSession) -> None:
         route,
         point_id,
         status=RouteStopStatus.PENDING,
-        expected_arrival_to=_NOW - timedelta(minutes=45),
+        expected_arrival_to=_WALL_NOW - timedelta(minutes=45),
     )
     await db_session.commit()
 
@@ -290,7 +293,7 @@ async def test_disabled_rule_produces_no_alert(db_session: AsyncSession) -> None
         route,
         point_id,
         status=RouteStopStatus.PENDING,
-        expected_arrival_to=_NOW - timedelta(minutes=45),
+        expected_arrival_to=_WALL_NOW - timedelta(minutes=45),
     )
     await db_session.commit()
 
@@ -309,7 +312,7 @@ async def test_threshold_override_beats_the_global(db_session: AsyncSession) -> 
         point_id,
         status=RouteStopStatus.PENDING,
         # 6 min overdue: past the override (5) but well inside the global default (15).
-        expected_arrival_to=_NOW - timedelta(minutes=6),
+        expected_arrival_to=_WALL_NOW - timedelta(minutes=6),
     )
     await db_session.commit()
 

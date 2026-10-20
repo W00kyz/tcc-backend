@@ -13,11 +13,11 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.catalog.models import FieldWorker
+from app.domain.catalog.models import FieldWorker, ServicePoint
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import Alert, AlertKind, Notification
 from app.domain.monitoring.push import PushSender
-from app.domain.routing.models import Route
+from app.domain.routing.models import Route, RouteStop, RouteStopStatus
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,68 @@ async def notify_users(
                 extra={"event": "push_failed", "user_id": str(notification.user_id)},
             )
     return notifications
+
+
+# pt-BR label per impediment reason (RF16) — the keys mirror `ImpedimentReason`'s values; a
+# string map keeps this module free of an import on the impediments domain.
+_IMPEDIMENT_REASON_PT_BR: dict[str, str] = {
+    "ACCESS_BLOCKED": "acesso bloqueado",
+    "SITE_REFUSAL": "recusa do local",
+    "HEALTH_ISSUE": "problema de saúde",
+    "OTHER": "outro motivo",
+}
+
+
+async def _manager_ids(db: AsyncSession) -> list[uuid.UUID]:
+    return list(
+        (
+            await db.scalars(
+                select(User.id).where(
+                    User.role.in_([UserRole.MANAGER, UserRole.ADMIN]), User.is_active.is_(True)
+                )
+            )
+        ).all()
+    )
+
+
+async def notify_impediment_reported(
+    db: AsyncSession,
+    *,
+    impediment_id: uuid.UUID,
+    route: Route,
+    route_stop: RouteStop | None,
+    reason: str,
+    push: PushSender,
+) -> list[Notification]:
+    """Tell every manager that a field worker cannot go on (RF17), naming the pending point(s)
+    that now need a new owner. Same audience as `notify_alert`: a route has no single owning
+    manager (spec §2 Ruling 6). Flush, never commit.
+
+        await notify_impediment_reported(db, impediment_id=imp.id, route=route,
+                                         route_stop=stop, reason="ACCESS_BLOCKED", push=push)
+    """
+    field_worker = await db.get(FieldWorker, route.field_worker_id)
+    worker_name = field_worker.full_name if field_worker is not None else "Profissional"
+    reason_text = _IMPEDIMENT_REASON_PT_BR.get(reason, reason.lower())
+    if route_stop is not None:
+        point = await db.get(ServicePoint, route_stop.service_point_id)
+        affected = f"o ponto {point.name if point is not None else ''}".rstrip()
+    else:
+        open_stops = await db.scalars(
+            select(RouteStop).where(
+                RouteStop.route_id == route.id, RouteStop.status != RouteStopStatus.DONE
+            )
+        )
+        affected = f"o restante da rota ({len(open_stops.all())} ponto(s) pendente(s))"
+    return await notify_users(
+        db,
+        user_ids=await _manager_ids(db),
+        kind="IMPEDIMENT_REPORTED",
+        title="Impossibilidade sinalizada",
+        body=f"{worker_name} não pode executar {affected}: {reason_text}. Reatribua os pontos.",
+        data={"impediment_id": str(impediment_id), "route_id": str(route.id)},
+        push=push,
+    )
 
 
 async def notify_alert(db: AsyncSession, *, alert: Alert, push: PushSender) -> list[Notification]:

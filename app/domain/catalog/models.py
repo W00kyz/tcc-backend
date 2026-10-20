@@ -1,21 +1,14 @@
 """Minimal catalog tables (spec §4.1). RF05-RF10's write paths and endpoints (Etapa 3) live in
 app/api/*.py, one router per table here — this module stays models-only."""
 
-import enum
 import uuid
-from datetime import date
 from typing import Any
 
-from sqlalchemy import BigInteger, Enum, Float, ForeignKey, String, UniqueConstraint
+from sqlalchemy import BigInteger, Float, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
-
-
-class PointType(enum.StrEnum):
-    REGULAR = "REGULAR"
-    OCCASIONAL = "OCCASIONAL"
 
 
 class ContractorCompany(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -71,8 +64,8 @@ class Building(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # outline is only drawn, never queried spatially (spec 2026-10-11-predios-no-mapa).
     # Validated by app/domain/catalog/footprint.py before being stored.
     footprint: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    # Where the outline came from ("osm" today) and its OSM way id, so it can be
-    # traced back to the source and reimported.
+    # Where the outline came from ("osm" or "drawn" by hand on the dashboard) and, for "osm",
+    # its way id, so it can be traced back to the source and reimported.
     footprint_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
     osm_way_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
@@ -105,25 +98,3 @@ class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(String(500))
     latitude: Mapped[float] = mapped_column(Float)
     longitude: Mapped[float] = mapped_column(Float)
-    point_type: Mapped[PointType] = mapped_column(
-        Enum(PointType, name="point_type"), default=PointType.REGULAR
-    )
-    # Nullable: only an OCCASIONAL point references an event. Left in place after
-    # promote_service_point_to_regular (RF26) as the point's historical origin — see that
-    # function's docstring for the provenance rationale.
-    event_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("events.id"), nullable=True
-    )
-    event: Mapped["Event | None"] = relationship()
-
-
-class Event(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """RF22 — pontos eventuais se vinculam a um evento com janela de validade. Referenciado em
-    docs/specs/2026-08-24-arquitetura-design.md §4.1 desde a Etapa 2, criado só agora (Etapa 3,
-    Task 5) porque nenhuma tabela dependia dela até o ponto eventual existir."""
-
-    __tablename__ = "events"
-
-    name: Mapped[str] = mapped_column(String(200))
-    valid_from: Mapped[date] = mapped_column()
-    valid_until: Mapped[date] = mapped_column()

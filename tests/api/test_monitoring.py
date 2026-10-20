@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
+from app.core.campus_clock import campus_today, campus_wall_clock
 from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
@@ -31,7 +32,8 @@ from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
 _PASSWORD = "senha-forte-o-suficiente"
-_TODAY = date.today()
+# The board's "today" is the campus date, not the test machine's.
+_TODAY = campus_today(datetime.now(UTC))
 
 
 @pytest.fixture
@@ -186,7 +188,7 @@ async def test_pending_stop_past_arrival_window_is_delayed(
     fx = await _seed_actors(db_session)
     route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
     stop = route.stops[0]
-    stop.expected_arrival_to = datetime.now(UTC) - timedelta(minutes=30)
+    stop.expected_arrival_to = campus_wall_clock(datetime.now(UTC)) - timedelta(minutes=30)
     await db_session.commit()
     token = _login(client, fx.manager.email)
 
@@ -200,7 +202,25 @@ async def test_pending_stop_within_arrival_window_is_not_delayed(
 ) -> None:
     fx = await _seed_actors(db_session)
     route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
-    route.stops[0].expected_arrival_to = datetime.now(UTC) + timedelta(hours=2)
+    route.stops[0].expected_arrival_to = campus_wall_clock(datetime.now(UTC)) + timedelta(hours=2)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    body = _get_board(client, token)
+
+    assert body["routes"][0]["is_delayed"] is False
+
+
+async def test_pending_stop_window_is_read_as_campus_wall_clock(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression: windows are campus wall-clock tagged UTC. A window ending 30 min from now
+    (local) used to read as already past, because it was compared with the real UTC instant."""
+    fx = await _seed_actors(db_session)
+    route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    route.stops[0].expected_arrival_to = campus_wall_clock(datetime.now(UTC)) + timedelta(
+        minutes=30
+    )
     await db_session.commit()
     token = _login(client, fx.manager.email)
 
@@ -487,6 +507,28 @@ async def test_patch_alert_rule_persists_enabled_and_threshold(
         "updated_at": late_stop["updated_at"],
     }
     assert late_stop["updated_at"] is not None
+
+
+async def test_patch_alert_rule_explicit_null_threshold_restores_the_global_default(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Regression: the dashboard clears the threshold input to go back to the global default
+    and sends `threshold_minutes: null`; the API used to ignore it and keep the override."""
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+    client.patch("/alert-rules/LATE_STOP", json={"threshold_minutes": 5}, headers=_auth(token))
+
+    cleared = client.patch(
+        "/alert-rules/LATE_STOP", json={"threshold_minutes": None}, headers=_auth(token)
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["threshold_minutes"] is None
+
+    # A patch that does not mention the threshold still leaves it alone.
+    client.patch("/alert-rules/LATE_STOP", json={"threshold_minutes": 7}, headers=_auth(token))
+    toggled = client.patch("/alert-rules/LATE_STOP", json={"enabled": True}, headers=_auth(token))
+    assert toggled.json()["threshold_minutes"] == 7
 
 
 async def test_patch_unknown_rule_kind_is_404(client: TestClient, db_session: AsyncSession) -> None:

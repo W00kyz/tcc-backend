@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from app.api import monitoring
 from app.api.monitoring import board_event_stream
+from app.core.campus_clock import campus_today
 from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
@@ -110,7 +111,9 @@ async def _make_route(db: AsyncSession, seed: _Seed) -> Route:
     route = await create_route(
         db,
         field_worker_id=seed.worker.id,
-        route_date=datetime.now(UTC).date(),
+        # The board's "today" is the campus calendar day: from 21:00 in Campina Grande the UTC
+        # date is already tomorrow, and a UTC-dated route fell off the board (test failed at night).
+        route_date=campus_today(datetime.now(UTC)),
         route_type=RouteType.REGULAR,
         scheduled_start_at=None,
         stops=[StopInput(service_point_id=point.id)],

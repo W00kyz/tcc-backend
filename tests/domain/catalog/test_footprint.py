@@ -1,5 +1,5 @@
 import pytest
-from app.domain.catalog.footprint import PolygonFootprint
+from app.domain.catalog.footprint import PolygonFootprint, outline_centroid, outline_contains
 from pydantic import ValidationError
 
 SQUARE = [[-35.909, -7.214], [-35.908, -7.214], [-35.908, -7.215], [-35.909, -7.214]]
@@ -29,3 +29,30 @@ def test_rejects_malformed_rings(coordinates: list[list[list[float]]], fragment:
 def test_rejects_other_geometry_types() -> None:
     with pytest.raises(ValidationError):
         PolygonFootprint(type="MultiPolygon", coordinates=[SQUARE])
+
+
+# A rectangle around (-35.9085, -7.2145): the centre a point of the building takes.
+RECTANGLE = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [-35.909, -7.214],
+            [-35.908, -7.214],
+            [-35.908, -7.215],
+            [-35.909, -7.215],
+            [-35.909, -7.214],
+        ]
+    ],
+}
+
+
+def test_the_centroid_of_a_rectangle_is_its_centre() -> None:
+    lon, lat = outline_centroid(RECTANGLE)
+
+    assert lon == pytest.approx(-35.9085)
+    assert lat == pytest.approx(-7.2145)
+
+
+def test_outline_contains_tells_inside_from_outside() -> None:
+    assert outline_contains(RECTANGLE, -35.9085, -7.2145)
+    assert not outline_contains(RECTANGLE, -35.95, -7.2145)

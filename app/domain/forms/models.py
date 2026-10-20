@@ -27,6 +27,9 @@ class QuestionType(enum.StrEnum):
     BOOLEAN = "BOOLEAN"
     SINGLE_CHOICE = "SINGLE_CHOICE"
     MULTI_CHOICE = "MULTI_CHOICE"
+    # The answer is a list of photos: their evidence `idempotency_key`s, the photos themselves are
+    # ordinary PHOTO evidence (docs/specs/2026-10-19-pergunta-midia-design.md).
+    MEDIA = "MEDIA"
 
 
 class Form(UUIDPrimaryKeyMixin, TimestampMixin, Base):

@@ -17,7 +17,8 @@ from app.domain.routing.models import Route, RouteStatus, RouteStop
 
 
 class NoActiveRoute(Exception):
-    """The worker has no IN_PROGRESS route for today and passed no explicit `route_stop_id`."""
+    """The worker has no started (IN_PROGRESS or DONE) route for today and passed no explicit
+    `route_stop_id`."""
 
 
 class RouteStopMissing(Exception):
@@ -32,7 +33,9 @@ async def current_worker(db: AsyncSession, user: User) -> FieldWorker | None:
     return worker
 
 
-async def resolve_route(db: AsyncSession, *, worker_id: UUID, route_stop_id: UUID | None) -> Route:
+async def resolve_route(
+    db: AsyncSession, *, worker_id: UUID, route_stop_id: UUID | None, today: date
+) -> Route:
     """The route to act against: the one owning the chosen stop on a re-submit, else the
     worker's started route for today."""
     if route_stop_id is not None:
@@ -43,12 +46,18 @@ async def resolve_route(db: AsyncSession, *, worker_id: UUID, route_stop_id: UUI
         assert route is not None
         return route
 
+    # IN_PROGRESS first; DONE as the fallback so a replay of the last check-out (offline sync
+    # resending after a lost response) still reaches its idempotency check once that check-out
+    # closed the route (RNF06).
     started_route: Route | None = await db.scalar(
-        select(Route).where(
+        select(Route)
+        .where(
             Route.field_worker_id == worker_id,
-            Route.route_date == date.today(),
-            Route.status == RouteStatus.IN_PROGRESS,
+            Route.route_date == today,
+            Route.status.in_([RouteStatus.IN_PROGRESS, RouteStatus.DONE]),
         )
+        .order_by((Route.status == RouteStatus.IN_PROGRESS).desc(), Route.created_at.desc())
+        .limit(1)
     )
     if started_route is None:
         raise NoActiveRoute

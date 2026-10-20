@@ -84,6 +84,8 @@ class ExecutionEvidence(BaseModel):
     captured_at: datetime
     created_at: datetime
     content_url: str | None  # the authenticated proxy path for a PHOTO; None for a NOTE
+    # The app-generated key a MEDIA answer lists to point at this photo.
+    idempotency_key: UUID | None
 
 
 class ManualCompletionOut(BaseModel):
@@ -96,6 +98,8 @@ class AnswerOut(BaseModel):
     question_stable_key: str
     prompt: str | None  # null when the key is no longer in the recorded form version (Ruling 15)
     value: Any
+    # "MEDIA" lists photo idempotency keys; null alongside a null prompt.
+    question_type: str | None
 
 
 class ExecutionAssignmentOut(BaseModel):
@@ -178,6 +182,7 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
                 captured_at=item_.captured_at,
                 created_at=item_.created_at,
                 content_url=f"/evidence/{item_.id}/content" if item_.kind == "PHOTO" else None,
+                idempotency_key=item_.idempotency_key,
             )
             for item_ in detail.evidence
         ],
@@ -192,7 +197,12 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
         ),
         form_version_id=detail.form_version_id,
         answers=[
-            AnswerOut(question_stable_key=a.question_stable_key, prompt=a.prompt, value=a.value)
+            AnswerOut(
+                question_stable_key=a.question_stable_key,
+                prompt=a.prompt,
+                value=a.value,
+                question_type=a.question_type,
+            )
             for a in detail.answers
         ],
         reassigned=detail.reassigned,

@@ -4,7 +4,7 @@ tests/domain/impediments/; here we pin the HTTP surface (auth, ownership, status
 
 import uuid
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 
 import pytest
 from app.core.config import Settings
@@ -34,11 +34,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.clock import today_on_campus
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
 _PASSWORD = "senha-forte-o-suficiente"
-_ROUTE_DATE = date.today()
+_ROUTE_DATE = today_on_campus()
 
 
 @pytest.fixture
@@ -194,6 +195,52 @@ async def test_report_stop_impediment_created(client: TestClient, db_session: As
     assert body["route_stop_id"] == str(fx.source.stops[0].id)
     assert body["status"] == "PENDING"
     assert body["received_at"] is not None
+
+
+async def test_report_notifies_every_manager_with_the_pending_point(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    # RF17: reporting the impediment notifies the managers, naming the point to reassign.
+    fx = await _seed(db_session)
+    token = _login(client, fx.worker_a_user.email)
+    stop = fx.source.stops[0]
+
+    response = client.post(
+        f"/routes/{fx.source.id}/impediments",
+        json=_report_body(route_stop_id=str(stop.id)),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201, response.text
+    rows = (
+        await db_session.scalars(
+            select(Notification).where(Notification.kind == "IMPEDIMENT_REPORTED")
+        )
+    ).all()
+    assert [row.user_id for row in rows] == [fx.manager.id]
+    assert "Joao da Silva" in rows[0].body
+    assert "Ponto 0" in rows[0].body
+    assert rows[0].data["impediment_id"] == response.json()["id"]
+
+
+async def test_report_remainder_notification_counts_the_open_stops(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed(db_session, source_points=3)
+    token = _login(client, fx.worker_a_user.email)
+
+    response = client.post(
+        f"/routes/{fx.source.id}/impediments",
+        json=_report_body(route_stop_id=None, scope="ROUTE_REMAINDER"),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 201, response.text
+    row = await db_session.scalar(
+        select(Notification).where(Notification.kind == "IMPEDIMENT_REPORTED")
+    )
+    assert row is not None
+    assert "restante da rota (3 ponto(s) pendente(s))" in row.body
 
 
 async def test_report_on_route_not_owned_is_403(

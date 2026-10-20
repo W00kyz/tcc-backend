@@ -416,9 +416,41 @@ async def reassign_stops(
 
     await _recompute_legs(db, route=source_route, osrm=osrm)
     await _recompute_legs(db, route=target_route, osrm=osrm)
+    # Moving the last open stop away leaves the source route with nothing left to do.
+    if source_route.status is RouteStatus.IN_PROGRESS:
+        await complete_route_if_finished(db, route=source_route)
     await db.refresh(source_route, attribute_names=["stops"])
     await db.refresh(target_route, attribute_names=["stops"])
     return source_route, target_route
+
+
+async def complete_route_if_finished(db: AsyncSession, *, route: Route) -> bool:
+    """Close the route (`status = DONE`) once none of its stops is left open — the last
+    check-out, the manager's manual completion (RF53) or a reassignment that moved the last
+    open stop away. Without it a route stayed IN_PROGRESS forever: the board never showed it as
+    concluded (RF41), reports never counted it (RF45) and the app kept collecting GPS after the
+    last check-out (RNF11 — the position endpoint only rejects fixes for non-IN_PROGRESS routes).
+
+    A PLANNED route can close too: RF53 lets a manager complete every stop of a worker who never
+    started. A PLANNED route with no stops at all is left alone — nothing was done there.
+    Flushes, never commits. Returns whether the route was closed.
+
+        await complete_route_if_finished(db, route=route)
+        await db.commit()
+    """
+    if route.status not in (RouteStatus.PLANNED, RouteStatus.IN_PROGRESS):
+        return False
+    await db.flush()
+    statuses = (
+        await db.scalars(select(RouteStop.status).where(RouteStop.route_id == route.id))
+    ).all()
+    if any(status is not RouteStopStatus.DONE for status in statuses):
+        return False
+    if not statuses and route.status is RouteStatus.PLANNED:
+        return False
+    route.status = RouteStatus.DONE
+    await db.flush()
+    return True
 
 
 async def cancel_route(db: AsyncSession, *, route: Route, reason: str) -> Route:

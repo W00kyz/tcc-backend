@@ -1,7 +1,9 @@
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime, timedelta
+from typing import cast
 
+from app.api.deps import get_campus_today
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
@@ -9,9 +11,12 @@ from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import sign_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
 from app.domain.routing.models import Route, RouteStatus, RouteStop
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.clock import today_on_campus
 
 _WORKER_EMAIL = "joao@empresa.com"
 _WORKER_PASSWORD = "senha-forte-o-suficiente"
@@ -46,6 +51,7 @@ async def _seed_route(
     started: bool = True,
     qr_status: QrCodeStatus = QrCodeStatus.ACTIVE,
     worker_email: str = _WORKER_EMAIL,
+    footprint: dict[str, object] | None = None,
 ) -> SeededRoute:
     """One field worker, one floor with its signed QR, and a route (started by default) whose
     PENDING stops are `point_specs` (a single room at the GPS origin when omitted)."""
@@ -58,7 +64,7 @@ async def _seed_route(
         role=UserRole.FIELD_WORKER,
     )
     company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
-    building = Building(name="Bloco CI", campus_area="CCT")
+    building = Building(name="Bloco CI", campus_area="CCT", footprint=footprint)
     db_session.add_all([worker_user, company, building])
     await db_session.flush()
 
@@ -82,7 +88,7 @@ async def _seed_route(
     )
     route = Route(
         field_worker_id=worker.id,
-        route_date=date.today(),
+        route_date=today_on_campus(),
         status=RouteStatus.IN_PROGRESS if started else RouteStatus.PLANNED,
         started_at=datetime.now(UTC) if started else None,
     )
@@ -371,3 +377,76 @@ async def test_check_in_with_a_real_signed_qr_succeeds(
     body = response.json()
     assert body["execution_id"] is not None
     assert body["geo_validation"] == "VALIDATED"
+
+
+async def test_check_in_looks_for_the_route_of_the_campus_day(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    """Regression: the active route was looked up by `date.today()`, the UTC date in the API
+    container, so every check-in from 21:00 in Campina Grande failed with "No active route"."""
+    seeded = await _seed_route(db_session, test_settings)
+    # The route is on today's campus date; a campus day that moved on finds no route for it.
+    cast(FastAPI, client.app).dependency_overrides[get_campus_today] = lambda: (
+        today_on_campus() + timedelta(days=1)
+    )
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert "No active route" in response.json()["detail"]
+
+
+def _outline_around(half_side_deg: float) -> dict[str, object]:
+    """A square building outline centred on the GPS origin (`_POINT_LAT`, `_POINT_LNG`)."""
+    west, east = _POINT_LNG - half_side_deg, _POINT_LNG + half_side_deg
+    south, north = _POINT_LAT - half_side_deg, _POINT_LAT + half_side_deg
+    ring = [[west, north], [east, north], [east, south], [west, south], [west, north]]
+    return {"type": "Polygon", "coordinates": [ring]}
+
+
+async def test_two_rooms_inside_the_building_ask_for_the_room(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    """Points are located by their building, so GPS cannot tell two rooms apart: the app gets
+    the list, and the room the worker then picks is not flagged."""
+    same_spot = [("Sala A", _POINT_LAT, _POINT_LNG), ("Sala B", _POINT_LAT, _POINT_LNG)]
+    seeded = await _seed_route(
+        db_session, test_settings, point_specs=same_spot, footprint=_outline_around(0.001)
+    )
+    token = _login(client)
+
+    ambiguous = _post(client, token, seeded.qr_code.public_code)
+    assert ambiguous.status_code == 409, ambiguous.text
+    assert len(ambiguous.json()["detail"]["candidates"]) == 2
+
+    chosen = _post(client, token, seeded.qr_code.public_code, route_stop_id=str(seeded.stops[1].id))
+    assert chosen.status_code == 201, chosen.text
+    assert chosen.json()["geo_validation"] == "VALIDATED"
+    assert chosen.json()["validation_flags"] == []
+
+
+async def test_a_fix_anywhere_inside_a_large_building_is_validated(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    """The outline, not the distance to its centre, decides: a fix ~200 m from the centre of a
+    large building is still inside it."""
+    seeded = await _seed_route(db_session, test_settings, footprint=_outline_around(0.003))
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code, latitude=_POINT_LAT - 0.0018)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["geo_validation"] == "VALIDATED"
+
+
+async def test_a_fix_outside_the_building_is_out_of_radius(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings, footprint=_outline_around(0.0003))
+    token = _login(client)
+
+    response = _post(client, token, seeded.qr_code.public_code, latitude=_POINT_LAT - 0.01)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["geo_validation"] == "OUT_OF_RADIUS"

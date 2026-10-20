@@ -83,7 +83,6 @@ class RouteStopOut(BaseModel):
     building_name: str
     latitude: float
     longitude: float
-    point_type: str  # REGULAR / OCCASIONAL (RF24)
     expected_arrival_from: datetime | None
     expected_arrival_to: datetime | None
     distance_from_prev_m: float | None
@@ -208,7 +207,6 @@ def _to_stop_out(
         building_name=point.floor.building.name,
         latitude=point.latitude,
         longitude=point.longitude,
-        point_type=point.point_type.value,
         expected_arrival_from=stop.expected_arrival_from,
         expected_arrival_to=stop.expected_arrival_to,
         distance_from_prev_m=stop.distance_from_prev_m,

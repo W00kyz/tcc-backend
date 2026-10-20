@@ -76,3 +76,11 @@ async def test_confirm_with_an_access_token_is_rejected(
     )
 
     assert response.status_code == 401
+
+
+def test_confirm_rejects_a_password_shorter_than_eight_characters(client: TestClient) -> None:
+    response = client.post(
+        "/auth/password-reset/confirm", json={"token": "irrelevant", "new_password": "curta"}
+    )
+
+    assert response.status_code == 422

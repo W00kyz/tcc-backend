@@ -1,10 +1,11 @@
 import uuid
-from datetime import date, timedelta
 
+import pytest
 from app.core.security import hash_password
-from app.domain.catalog.models import Building, Event, Floor
+from app.domain.catalog.models import Building, Floor, ServicePoint
 from app.domain.identity.models import User, UserRole
 from fastapi.testclient import TestClient
+from httpx2 import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -15,14 +16,31 @@ def _login(client: TestClient, email: str) -> str:
     return str(response.json()["access_token"])
 
 
-async def _seed_floor(db_session: AsyncSession) -> tuple[User, Floor]:
+# The building outline the points take their location from (centre -35.9085, -7.2145).
+OUTLINE: dict[str, object] = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [-35.909, -7.214],
+            [-35.908, -7.214],
+            [-35.908, -7.215],
+            [-35.909, -7.215],
+            [-35.909, -7.214],
+        ]
+    ],
+}
+
+
+async def _seed_floor(
+    db_session: AsyncSession, footprint: dict[str, object] | None = OUTLINE
+) -> tuple[User, Floor]:
     manager = User(
         name="Larissa",
         email="larissa@pu.ufcg.edu.br",
         password_hash=hash_password("senha-forte-o-suficiente"),
         role=UserRole.MANAGER,
     )
-    building = Building(name="Bloco CI", campus_area="CCT")
+    building = Building(name="Bloco CI", campus_area="CCT", footprint=footprint)
     db_session.add_all([manager, building])
     await db_session.flush()
     floor = Floor(building_id=building.id, label="Térreo")
@@ -31,28 +49,48 @@ async def _seed_floor(db_session: AsyncSession) -> tuple[User, Floor]:
     return manager, floor
 
 
-async def test_manager_creates_a_regular_service_point(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    manager, floor = await _seed_floor(db_session)
-    token = _login(client, manager.email)
-
-    response = client.post(
+def _create_point(client: TestClient, token: str, floor_id: object, **extra: object) -> Response:
+    return client.post(
         "/service-points",
-        json={
-            "floor_id": str(floor.id),
-            "name": "Sala 101",
-            "description": "Sala de aula",
-            "latitude": -7.2,
-            "longitude": -35.9,
-            "point_type": "REGULAR",
-            "event_id": None,
-        },
+        json={"floor_id": str(floor_id), "name": "Sala 101", "description": "Aula", **extra},
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 201
-    assert response.json()["point_type"] == "REGULAR"
+
+async def test_a_point_takes_its_building_centroid(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """A point has no location of its own: it is where its building is."""
+    manager, floor = await _seed_floor(db_session)
+
+    response = _create_point(client, _login(client, manager.email), floor.id)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["latitude"] == pytest.approx(-7.2145)
+    assert response.json()["longitude"] == pytest.approx(-35.9085)
+
+
+async def test_coordinates_in_the_body_are_refused(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor = await _seed_floor(db_session)
+
+    response = _create_point(
+        client, _login(client, manager.email), floor.id, latitude=-7.2, longitude=-35.9
+    )
+
+    assert response.status_code == 422
+
+
+async def test_a_point_needs_a_building_outline(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor = await _seed_floor(db_session, footprint=None)
+
+    response = _create_point(client, _login(client, manager.email), floor.id)
+
+    assert response.status_code == 422
+    assert "outline" in response.json()["detail"]
 
 
 async def test_creating_a_service_point_for_an_unknown_floor_returns_404(
@@ -60,116 +98,104 @@ async def test_creating_a_service_point_for_an_unknown_floor_returns_404(
 ) -> None:
     """Regression test for Finding I2.2."""
     manager, _floor = await _seed_floor(db_session)
-    token = _login(client, manager.email)
 
-    response = client.post(
-        "/service-points",
-        json={
-            "floor_id": str(uuid.uuid4()),
-            "name": "Sala 101",
-            "description": "Sala de aula",
-            "latitude": -7.2,
-            "longitude": -35.9,
-            "point_type": "REGULAR",
-            "event_id": None,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    response = _create_point(client, _login(client, manager.email), uuid.uuid4())
 
     assert response.status_code == 404
 
 
-async def test_creating_an_occasional_point_for_an_unknown_event_returns_404(
+async def test_redrawing_the_outline_moves_its_points(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    """Regression test for Finding I2.2."""
     manager, floor = await _seed_floor(db_session)
     token = _login(client, manager.email)
+    point_id = _create_point(client, token, floor.id).json()["id"]
+    moved = {
+        "type": "Polygon",
+        "coordinates": [[[-35.92, -7.22], [-35.91, -7.22], [-35.91, -7.23], [-35.92, -7.22]]],
+    }
 
-    response = client.post(
-        "/service-points",
-        json={
-            "floor_id": str(floor.id),
-            "name": "Tenda de Inscrição",
-            "description": "Tenda temporária",
-            "latitude": -7.2,
-            "longitude": -35.9,
-            "point_type": "OCCASIONAL",
-            "event_id": str(uuid.uuid4()),
-        },
+    client.put(
+        f"/buildings/{floor.building_id}/footprint",
+        json={"footprint": moved},
         headers={"Authorization": f"Bearer {token}"},
     )
+
+    [point] = [
+        p
+        for p in client.get(
+            f"/service-points?floor_id={floor.id}", headers={"Authorization": f"Bearer {token}"}
+        ).json()
+        if p["id"] == point_id
+    ]
+    centroid = (-35.913333, -7.223333)  # of that triangle
+    assert point["longitude"] == pytest.approx(centroid[0], abs=1e-5)
+    assert point["latitude"] == pytest.approx(centroid[1], abs=1e-5)
+
+
+async def test_editing_a_point_changes_only_its_name_and_description(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+    point_id = _create_point(client, token, floor.id).json()["id"]
+
+    response = client.patch(
+        f"/service-points/{point_id}",
+        json={"name": "Sala 102", "description": "Laboratório"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "Sala 102"
+    assert response.json()["latitude"] == pytest.approx(-7.2145)
+
+
+async def test_the_events_endpoints_are_gone(client: TestClient, db_session: AsyncSession) -> None:
+    manager, _floor = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+
+    response = client.get("/events", headers={"Authorization": f"Bearer {token}"})
 
     assert response.status_code == 404
 
 
-async def test_an_occasional_point_past_its_window_is_hidden_by_default_but_reportable(
+async def test_service_points_can_be_listed_by_building(
     client: TestClient, db_session: AsyncSession
 ) -> None:
+    """The building page lists every point of the building, across its floors."""
     manager, floor = await _seed_floor(db_session)
-    past_event = Event(
-        name="Vestibular 2026",
-        valid_from=date.today() - timedelta(days=10),
-        valid_until=date.today() - timedelta(days=1),
+    upper = Floor(building_id=floor.building_id, label="1º andar")
+    other_building = Building(name="Bloco CD", campus_area="CEEI")
+    db_session.add_all([upper, other_building])
+    await db_session.flush()
+    other_floor = Floor(building_id=other_building.id, label="Térreo")
+    db_session.add(other_floor)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            ServicePoint(
+                floor_id=floor.id, name="Sala 101", description="", latitude=-7.2, longitude=-35.9
+            ),
+            ServicePoint(
+                floor_id=upper.id, name="Sala 201", description="", latitude=-7.2, longitude=-35.9
+            ),
+            ServicePoint(
+                floor_id=other_floor.id,
+                name="Sala CD",
+                description="",
+                latitude=-7.2,
+                longitude=-35.9,
+            ),
+        ]
     )
-    db_session.add(past_event)
     await db_session.commit()
     token = _login(client, manager.email)
-    client.post(
-        "/service-points",
-        json={
-            "floor_id": str(floor.id),
-            "name": "Tenda de Inscrição",
-            "description": "Tenda temporária",
-            "latitude": -7.2,
-            "longitude": -35.9,
-            "point_type": "OCCASIONAL",
-            "event_id": str(past_event.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
 
-    default_listing = client.get(
-        f"/service-points?floor_id={floor.id}", headers={"Authorization": f"Bearer {token}"}
-    )
-    assert default_listing.json() == []
-
-    full_listing = client.get(
-        f"/service-points?floor_id={floor.id}&include_archived=true",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert len(full_listing.json()) == 1
-    assert full_listing.json()[0]["name"] == "Tenda de Inscrição"
-
-
-async def test_manager_promotes_an_occasional_point_to_regular(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    manager, floor = await _seed_floor(db_session)
-    event = Event(name="Semana de Calouros", valid_from=date.today(), valid_until=date.today())
-    db_session.add(event)
-    await db_session.commit()
-    token = _login(client, manager.email)
-    created = client.post(
-        "/service-points",
-        json={
-            "floor_id": str(floor.id),
-            "name": "Recepção Calouros",
-            "description": "Ponto de recepção",
-            "latitude": -7.2,
-            "longitude": -35.9,
-            "point_type": "OCCASIONAL",
-            "event_id": str(event.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    ).json()
-
-    response = client.post(
-        f"/service-points/{created['id']}/promote",
+    response = client.get(
+        f"/service-points?building_id={floor.building_id}",
         headers={"Authorization": f"Bearer {token}"},
     )
 
     assert response.status_code == 200
-    assert response.json()["point_type"] == "REGULAR"
-    # event_id preserved as historical origin (spec Ruling 2), not cleared:
-    assert response.json()["event_id"] == str(event.id)
+    assert sorted(point["name"] for point in response.json()) == ["Sala 101", "Sala 201"]

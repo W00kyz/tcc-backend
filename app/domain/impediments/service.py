@@ -174,6 +174,9 @@ async def candidates_for(db: AsyncSession, *, impediment: Impediment) -> list[Ca
                 Route.route_date == route.route_date,
                 Route.status.in_([RouteStatus.PLANNED, RouteStatus.IN_PROGRESS]),
                 Route.id != route.id,
+                # The worker who reported the impediment is never their own substitute, even
+                # when they hold a second route that day (REGULAR + OCCASIONAL).
+                Route.field_worker_id != route.field_worker_id,
             )
             .options(selectinload(Route.stops).selectinload(RouteStop.service_point))
         )

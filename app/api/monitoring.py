@@ -271,6 +271,9 @@ async def patch_alert_rule(
         enabled=body.enabled,
         threshold_minutes=body.threshold_minutes,
         actor_id=actor.id,
+        # An explicit `"threshold_minutes": null` clears the override; an absent key does not.
+        clear_threshold="threshold_minutes" in body.model_fields_set
+        and body.threshold_minutes is None,
     )
     await record_audit_trail(
         db,

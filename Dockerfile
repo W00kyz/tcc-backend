@@ -28,4 +28,6 @@ RUN uv sync --frozen
 
 EXPOSE 8000
 
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Migrações antes do servidor: um banco novo (ou desatualizado) sobe já no head, sem
+# passo manual. `exec` deixa o uvicorn como PID 1 para receber o SIGTERM do compose.
+CMD ["sh", "-c", "uv run alembic upgrade head && exec uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]

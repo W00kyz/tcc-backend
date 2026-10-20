@@ -292,3 +292,23 @@ async def test_active_form_version_is_none_without_a_published_version(
         options=[],
     )
     assert await active_form_version(db_session, service_type_id=st.id) is None
+
+
+async def test_media_question_publishes_with_no_options(db_session: AsyncSession) -> None:
+    st = await _a_service_type(db_session)
+    form = await get_or_create_form(db_session, service_type_id=st.id)
+    await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="Foto do piso após a limpeza",
+        question_type=QuestionType.MEDIA,
+        required=True,
+        options=[],
+    )
+
+    published = await publish_form(db_session, form_id=form.id)
+
+    [question] = published.questions
+    assert question.question_type is QuestionType.MEDIA
+    assert question.options == []
+    assert question.content_hash is not None

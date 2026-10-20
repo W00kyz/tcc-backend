@@ -1,6 +1,7 @@
 """Shared FastAPI dependencies: who is calling, and are they allowed here."""
 
 from collections.abc import Callable
+from datetime import UTC, date, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.campus_clock import campus_today
 from app.core.jwt import decode_token
 from app.db.session import get_db
 from app.domain.identity.models import User, UserRole
@@ -46,3 +48,18 @@ def require_role(*roles: UserRole) -> Callable[..., Any]:
         return user
 
     return dependency
+
+
+def get_campus_today() -> date:
+    """Today on campus, the day a route belongs to. A dependency so tests can pin the clock.
+
+    `date.today()` in the API container is the UTC date, already tomorrow from 21:00 in
+    Campina Grande: the worker's "rota do dia" vanished and check-ins failed with "No active
+    route for today" every night.
+
+    Example: ``async def endpoint(today: CampusToday) -> ...``
+    """
+    return campus_today(datetime.now(UTC))
+
+
+CampusToday = Annotated[date, Depends(get_campus_today)]

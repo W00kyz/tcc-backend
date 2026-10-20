@@ -103,13 +103,23 @@ async def update_alert_rule(
     enabled: bool | None,
     threshold_minutes: int | None,
     actor_id: uuid.UUID,
+    clear_threshold: bool = False,
 ) -> AlertRule:
-    """Patch semantics — a `None` means "leave unchanged". `threshold_minutes` can only be
-    raised or overridden here, never cleared back to NULL (a client that wants the global
-    default flips `enabled` off/on instead); a dedicated clear is YAGNI for RF50 (*Baixa*)."""
+    """Patch semantics — a `None` means "leave unchanged". `clear_threshold=True` drops the
+    override back to NULL, i.e. the global default from system_settings (Ruling 8).
+
+    The dashboard's "Regras de alerta" offers exactly that — an emptied threshold input means
+    "usar o padrão global" — and used to be silently ignored here (it sent `null`, which read
+    as "unchanged"), so the override could never be removed.
+
+        await update_alert_rule(db, rule=r, enabled=None, threshold_minutes=None,
+                                actor_id=uid, clear_threshold=True)
+    """
     if enabled is not None:
         rule.enabled = enabled
-    if threshold_minutes is not None:
+    if clear_threshold:
+        rule.threshold_minutes = None
+    elif threshold_minutes is not None:
         rule.threshold_minutes = threshold_minutes
     rule.updated_by = actor_id
     rule.updated_at = datetime.now(UTC)

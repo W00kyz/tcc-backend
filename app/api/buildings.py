@@ -1,11 +1,12 @@
-"""Building CRUD for managers/admins (RF06 prerequisite). No hard-delete endpoint —
-buildings are referenced by floors, service points, and routes, so removing one
-outright would orphan history; create/list/edit is all this task needs."""
+"""Building CRUD for managers/admins (RF06 prerequisite). A building is always registered with
+its outline, which can be redrawn but never cleared. Removing a building takes its floors, QR
+codes, points and their history with it (app/domain/catalog/deletion.py)."""
 
+from dataclasses import asdict
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,8 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
+from app.domain.catalog.deletion import (
+    delete_building,
+    impact_of_building,
+    remove_photo_objects,
+)
 from app.domain.catalog.footprint import PolygonFootprint
 from app.domain.catalog.models import Building
+from app.domain.catalog.points import place_points_of_building
 from app.domain.identity.models import User, UserRole
 
 router = APIRouter(prefix="/buildings", tags=["buildings"])
@@ -32,6 +39,8 @@ class BuildingOut(BaseModel):
 class BuildingCreateRequest(BaseModel):
     name: str
     campus_area: str
+    # Every building is registered with its geometry: the manager draws it on the map first.
+    footprint: PolygonFootprint
 
 
 class BuildingUpdateRequest(BaseModel):
@@ -41,9 +50,21 @@ class BuildingUpdateRequest(BaseModel):
 
 class BuildingFootprintRequest(BaseModel):
     footprint: PolygonFootprint
-    # OSM way ids are positive and the column is a BIGINT: anything else is a client bug (422),
-    # not a value to store or an overflow to surface as a 500.
-    osm_way_id: int = Field(gt=0, lt=2**63)
+    # Present when the outline was picked from OpenStreetMap; absent when the manager drew it
+    # by hand on the dashboard map. OSM way ids are positive and the column is a BIGINT:
+    # anything else is a client bug (422), not a value to store or an overflow to surface as
+    # a 500.
+    osm_way_id: int | None = Field(default=None, gt=0, lt=2**63)
+
+
+class DeletionImpactOut(BaseModel):
+    """What a removal takes with it — shown before the manager confirms."""
+
+    points: int
+    floors: int
+    routes: int
+    executions: int
+    photos: int
 
 
 def _to_out(building: Building) -> BuildingOut:
@@ -72,7 +93,12 @@ async def create_building(
     actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> BuildingOut:
-    building = Building(name=body.name, campus_area=body.campus_area)
+    building = Building(
+        name=body.name,
+        campus_area=body.campus_area,
+        footprint=body.footprint.model_dump(),
+        footprint_source="drawn",
+    )
     db.add(building)
     await db.flush()
     await record_audit_trail(
@@ -82,7 +108,11 @@ async def create_building(
         entity_id=building.id,
         action="create",
         before=None,
-        after={"name": building.name, "campus_area": building.campus_area},
+        after={
+            "name": building.name,
+            "campus_area": building.campus_area,
+            "footprint_source": building.footprint_source,
+        },
     )
     await db.commit()
     return _to_out(building)
@@ -146,24 +176,49 @@ async def set_building_footprint(
     building = await _load_building(db, building_id)
     before = building.osm_way_id
     building.footprint = body.footprint.model_dump()
-    building.footprint_source = "osm"
+    # A redrawn outline no longer matches any OSM way, so the old link goes with it.
+    building.footprint_source = "drawn" if body.osm_way_id is None else "osm"
     building.osm_way_id = body.osm_way_id
+    # The building's points are where the building is: they follow a redrawn outline.
+    await place_points_of_building(db, building)
     await _audit_footprint(db, actor, building, "set_footprint", before)
     await db.commit()
     return _to_out(building)
 
 
-@router.delete("/{building_id}/footprint", response_model=BuildingOut)
-async def clear_building_footprint(
+@router.get("/{building_id}/deletion-impact", response_model=DeletionImpactOut)
+async def building_deletion_impact(
     building_id: UUID,
+    _actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> DeletionImpactOut:
+    await _load_building(db, building_id)
+    impact = await impact_of_building(db, building_id)
+    return DeletionImpactOut(**asdict(impact))
+
+
+@router.delete("/{building_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_building_endpoint(
+    building_id: UUID,
+    request: Request,
     actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> BuildingOut:
+) -> Response:
+    """Removes the building with its floors, QR codes, points and their history — decided by
+    the product owner (spec 2026-10-20-predios-pontos-dialogs-design.md §3.4)."""
     building = await _load_building(db, building_id)
-    before = building.osm_way_id
-    building.footprint = None
-    building.footprint_source = None
-    building.osm_way_id = None
-    await _audit_footprint(db, actor, building, "clear_footprint", before)
+    impact = await impact_of_building(db, building_id)
+    before = {"name": building.name, **asdict(impact)}
+    photo_keys = await delete_building(db, building_id)
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="building",
+        entity_id=building_id,
+        action="delete",
+        before=before,
+        after=None,
+    )
     await db.commit()
-    return _to_out(building)
+    await remove_photo_objects(request.app.state.object_store, photo_keys)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

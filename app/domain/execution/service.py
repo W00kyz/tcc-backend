@@ -11,12 +11,14 @@ commits" — check-in/check-out/manual-completion each own and commit a transact
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.domain.catalog.models import ServicePoint
+from app.domain.catalog.footprint import outline_contains
+from app.domain.catalog.models import Building, Floor, ServicePoint
 from app.domain.execution.answers import AnswerIn, build_answers
 from app.domain.execution.geo import haversine_meters
 from app.domain.execution.models import (
@@ -47,6 +49,7 @@ from app.domain.routing.models import (
     StopAssignment,
     StopAssignmentOutcome,
 )
+from app.domain.routing.service import complete_route_if_finished
 
 
 class RouteAlreadyStarted(Exception):
@@ -316,6 +319,7 @@ async def check_out(
     await _persist_answers(
         db, execution=execution, stop=stop, form_version_id=form_version_id, answers=answers
     )
+    await complete_route_if_finished(db, route=route)
     await db.commit()
     return execution
 
@@ -383,6 +387,7 @@ async def complete_manually(
     )
     stop.status = RouteStopStatus.DONE
     await _mark_assignment_executed(db, stop.id)
+    await complete_route_if_finished(db, route=route)
     await db.commit()
     return execution
 
@@ -463,14 +468,31 @@ async def _verify_qr(
     return decoded, qr_code, qr_flags
 
 
+def _distance_to_point(
+    point: ServicePoint,
+    footprint: dict[str, Any] | None,
+    latitude: float | None,
+    longitude: float | None,
+) -> float | None:
+    """Metres from the fix to the point; 0 when the fix is inside the building outline.
+
+    A point is located at its building's centre (app/domain/catalog/points.py): for a large
+    building the distance to that centre says nothing, being inside the outline does."""
+    if latitude is None or longitude is None:
+        return None
+    if footprint is not None and outline_contains(footprint, longitude, latitude):
+        return 0.0
+    return haversine_meters(latitude, longitude, point.latitude, point.longitude)
+
+
 def _candidate(
-    stop: RouteStop, point: ServicePoint, latitude: float | None, longitude: float | None
+    stop: RouteStop,
+    point: ServicePoint,
+    footprint: dict[str, Any] | None,
+    latitude: float | None,
+    longitude: float | None,
 ) -> Candidate:
-    distance = (
-        haversine_meters(latitude, longitude, point.latitude, point.longitude)
-        if latitude is not None and longitude is not None
-        else None
-    )
+    distance = _distance_to_point(point, footprint, latitude, longitude)
     return Candidate(
         route_stop_id=stop.id,
         service_point_id=point.id,
@@ -490,8 +512,10 @@ async def _load_pending_candidates(
     longitude: float | None,
 ) -> tuple[list[Candidate], dict[uuid.UUID, RouteStop]]:
     rows = await db.execute(
-        select(RouteStop, ServicePoint)
+        select(RouteStop, ServicePoint, Building.footprint)
         .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
+        .join(Floor, ServicePoint.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
         .where(
             RouteStop.route_id == route_id,
             RouteStop.status == RouteStopStatus.PENDING,
@@ -500,8 +524,8 @@ async def _load_pending_candidates(
     )
     candidates: list[Candidate] = []
     stops: dict[uuid.UUID, RouteStop] = {}
-    for stop, point in rows.all():
-        candidates.append(_candidate(stop, point, latitude, longitude))
+    for stop, point, footprint in rows.all():
+        candidates.append(_candidate(stop, point, footprint, latitude, longitude))
         stops[stop.id] = stop
     return candidates, stops
 
@@ -515,9 +539,11 @@ async def _load_open_checkins(
     longitude: float | None,
 ) -> list[tuple[Candidate, Execution, RouteStop]]:
     rows = await db.execute(
-        select(Execution, RouteStop, ServicePoint)
+        select(Execution, RouteStop, ServicePoint, Building.footprint)
         .join(RouteStop, Execution.route_stop_id == RouteStop.id)
         .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
+        .join(Floor, ServicePoint.floor_id == Floor.id)
+        .join(Building, Floor.building_id == Building.id)
         .where(
             RouteStop.route_id == route_id,
             RouteStop.status == RouteStopStatus.IN_PROGRESS,
@@ -526,8 +552,8 @@ async def _load_open_checkins(
         )
     )
     return [
-        (_candidate(stop, point, latitude, longitude), execution, stop)
-        for execution, stop, point in rows.all()
+        (_candidate(stop, point, footprint, latitude, longitude), execution, stop)
+        for execution, stop, point, footprint in rows.all()
     ]
 
 

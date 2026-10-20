@@ -4,7 +4,6 @@ targets exactly MANAGER + ADMIN, and `notify_route_assigned` no-ops for a field 
 app access."""
 
 import uuid
-from datetime import UTC, datetime
 
 import pytest
 from app.core.security import hash_password
@@ -19,6 +18,8 @@ from app.domain.monitoring.notifications import (
 from app.domain.routing.models import Route, RouteStatus
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.clock import today_on_campus
 
 
 class RecordingPushSender:
@@ -60,7 +61,7 @@ async def _route_with_worker(db: AsyncSession, *, with_user: bool) -> Route:
     await db.flush()
     route = Route(
         field_worker_id=worker.id,
-        route_date=datetime.now(UTC).date(),
+        route_date=today_on_campus(),
         status=RouteStatus.PLANNED,
     )
     db.add(route)

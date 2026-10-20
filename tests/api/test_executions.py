@@ -8,13 +8,22 @@ from app.core.config import Settings
 from app.domain.audit.models import AuditTrail
 from app.domain.catalog.models import FieldWorker, ServiceType
 from app.domain.execution.models import Execution, ExecutionReviewStatus, ExecutionSource
+from app.domain.forms.models import QuestionType
+from app.domain.forms.service import add_question, get_or_create_form, publish_form
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import StopAssignment
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.api.test_checkins import _add_field_worker, _add_user, _login, _post, _seed_route
+from tests.api.test_checkins import (
+    SeededRoute,
+    _add_field_worker,
+    _add_user,
+    _login,
+    _post,
+    _seed_route,
+)
 from tests.api.test_checkouts import _post_check_out, _publish_form_for_stop
 from tests.api.test_evidence import _PHOTO_BYTES, _PHOTO_SHA, _upload_photo
 
@@ -420,3 +429,59 @@ async def test_field_worker_forbidden_on_history_403(
     assert listing.status_code == 403, listing.text
     assert detail.status_code == 403, detail.text
     assert resolve.status_code == 403, resolve.text
+
+
+async def _publish_media_form(db_session: AsyncSession, seeded: SeededRoute) -> tuple[str, str]:
+    """The first stop gets a form with one MEDIA question; returns (version id, stable key)."""
+    service_type = ServiceType(name="Limpeza com foto", average_duration_minutes=30)
+    db_session.add(service_type)
+    await db_session.flush()
+    seeded.stops[0].service_type_id = service_type.id
+    form = await get_or_create_form(db_session, service_type_id=service_type.id)
+    await add_question(
+        db_session,
+        form_id=form.id,
+        prompt="Foto do piso após a limpeza",
+        question_type=QuestionType.MEDIA,
+        required=True,
+        options=[],
+    )
+    version = await publish_form(db_session, form_id=form.id)
+    await db_session.commit()
+    return str(version.id), str(version.questions[0].stable_key)
+
+
+async def test_detail_names_each_answer_type_and_evidence_key(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    """A MEDIA answer lists photo keys; the detail says the answer is MEDIA and which key each
+    evidence item has, so the dashboard can put each photo under its question. The second key
+    never arrives: the check-out is still accepted (Ruling 6)."""
+    seeded = await _seed_route(db_session, test_settings)
+    version_id, media_key = await _publish_media_form(db_session, seeded)
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+    worker_token = _login(client)
+    execution_id = _post(client, worker_token, seeded.qr_code.public_code).json()["execution_id"]
+    arrived, never_arrived = str(uuid.uuid4()), str(uuid.uuid4())
+    upload = _upload_photo(
+        client, worker_token, execution_id, _PHOTO_BYTES, _PHOTO_SHA, idempotency_key=arrived
+    )
+    assert upload.status_code == 201, upload.text
+
+    check_out = _post_check_out(
+        client,
+        worker_token,
+        seeded.qr_code.public_code,
+        form_version_id=version_id,
+        answers=[{"stable_key": media_key, "value": [arrived, never_arrived]}],
+    )
+    assert check_out.status_code == 201, check_out.text
+
+    body = client.get(
+        f"/executions/{execution_id}",
+        headers={"Authorization": f"Bearer {_manager_token(client)}"},
+    ).json()
+    [answer] = body["answers"]
+    assert answer["question_type"] == "MEDIA"
+    assert answer["value"] == [arrived, never_arrived]
+    assert [item["idempotency_key"] for item in body["evidence"]] == [arrived]

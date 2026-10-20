@@ -47,7 +47,7 @@ async def _building(db: AsyncSession) -> str:
     return str(building.id)
 
 
-async def test_manager_links_replaces_and_clears_a_footprint(
+async def test_manager_links_and_replaces_a_footprint(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     building_id = await _building(db_session)
@@ -64,10 +64,15 @@ async def test_manager_links_replaces_and_clears_a_footprint(
     )
     assert replaced.json()["osm_way_id"] == 456
 
-    cleared = client.delete(f"/buildings/{building_id}/footprint", headers=auth)
-    assert cleared.status_code == 200
-    assert cleared.json()["footprint"] is None
-    assert cleared.json()["osm_way_id"] is None
+
+async def test_a_footprint_cannot_be_removed(client: TestClient, db_session: AsyncSession) -> None:
+    """Every building keeps a geometry: it can be redrawn, never cleared."""
+    building_id = await _building(db_session)
+    auth = {"Authorization": f"Bearer {await _token(client, db_session)}"}
+
+    response = client.delete(f"/buildings/{building_id}/footprint", headers=auth)
+
+    assert response.status_code == 405
 
 
 async def test_an_open_ring_is_refused_with_422(
@@ -139,3 +144,42 @@ async def test_a_non_positive_osm_way_id_is_refused_with_422(
     )
 
     assert response.status_code == 422
+
+
+async def test_manager_saves_a_hand_drawn_footprint(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """An outline drawn in the dashboard has no OSM way behind it."""
+    building_id = await _building(db_session)
+    auth = {"Authorization": f"Bearer {await _token(client, db_session)}"}
+
+    response = client.put(
+        f"/buildings/{building_id}/footprint",
+        json={"footprint": {"type": "Polygon", "coordinates": [SQUARE]}},
+        headers=auth,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["footprint"] == {"type": "Polygon", "coordinates": [SQUARE]}
+    assert response.json()["footprint_source"] == "drawn"
+    assert response.json()["osm_way_id"] is None
+
+
+async def test_redrawing_an_osm_footprint_drops_the_osm_link(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    building_id = await _building(db_session)
+    auth = {"Authorization": f"Bearer {await _token(client, db_session)}"}
+    outline = {"type": "Polygon", "coordinates": [SQUARE]}
+    client.put(
+        f"/buildings/{building_id}/footprint",
+        json={"footprint": outline, "osm_way_id": 123},
+        headers=auth,
+    )
+
+    redrawn = client.put(
+        f"/buildings/{building_id}/footprint", json={"footprint": outline}, headers=auth
+    )
+
+    assert redrawn.json()["footprint_source"] == "drawn"
+    assert redrawn.json()["osm_way_id"] is None

@@ -46,6 +46,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from tests.support.clock import today_on_campus
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -140,7 +141,7 @@ async def _seed(db: AsyncSession) -> _Seed:
     route = await create_route(
         db,
         field_worker_id=worker.id,
-        route_date=datetime.now(UTC).date(),
+        route_date=today_on_campus(),
         route_type=RouteType.REGULAR,
         scheduled_start_at=None,
         stops=[StopInput(service_point_id=point.id)],

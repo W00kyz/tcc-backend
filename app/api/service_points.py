@@ -1,22 +1,25 @@
-"""Service point CRUD for managers/admins (RF06, RF22 prerequisites), plus the RF25
-archival filter and the RF26 promote endpoint. No hard-delete endpoint — a service
-point can be referenced by route stops, so removing one outright would orphan them."""
+"""Service point CRUD for managers/admins (RF06). A point is located by its building: the
+server writes its coordinates (app/domain/catalog/points.py), the API never takes them."""
 
-from datetime import date
+from dataclasses import asdict
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, model_validator
-from sqlalchemy import or_, select
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
-from app.domain.catalog.models import Event, Floor, PointType, ServicePoint
-from app.domain.catalog.service import promote_service_point_to_regular
+from app.domain.catalog.deletion import (
+    delete_point,
+    impact_of_point,
+    remove_photo_objects,
+)
+from app.domain.catalog.models import Building, Floor, ServicePoint
+from app.domain.catalog.points import point_location
 from app.domain.identity.models import User, UserRole
 
 router = APIRouter(prefix="/service-points", tags=["service-points"])
@@ -29,31 +32,32 @@ class ServicePointOut(BaseModel):
     description: str
     latitude: float
     longitude: float
-    point_type: PointType
-    event_id: UUID | None
 
 
 class ServicePointCreateRequest(BaseModel):
+    # A point is located by its building (its outline's centre), never by coordinates sent here.
+    model_config = ConfigDict(extra="forbid")
+
     floor_id: UUID
     name: str
     description: str
-    latitude: float
-    longitude: float
-    point_type: PointType = PointType.REGULAR
-    event_id: UUID | None = None
-
-    @model_validator(mode="after")
-    def _occasional_requires_event(self) -> "ServicePointCreateRequest":
-        if self.point_type == PointType.OCCASIONAL and self.event_id is None:
-            raise ValueError("event_id is required when point_type is OCCASIONAL.")
-        return self
 
 
 class ServicePointUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     description: str
-    latitude: float
-    longitude: float
+
+
+class DeletionImpactOut(BaseModel):
+    """What a removal takes with it — shown before the manager confirms."""
+
+    points: int
+    floors: int
+    routes: int
+    executions: int
+    photos: int
 
 
 def _to_out(point: ServicePoint) -> ServicePointOut:
@@ -64,8 +68,6 @@ def _to_out(point: ServicePoint) -> ServicePointOut:
         description=point.description,
         latitude=point.latitude,
         longitude=point.longitude,
-        point_type=point.point_type,
-        event_id=point.event_id,
     )
 
 
@@ -74,20 +76,15 @@ async def list_service_points(
     _actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
     db: Annotated[AsyncSession, Depends(get_db)],
     floor_id: UUID | None = None,
-    include_archived: bool = False,
+    building_id: UUID | None = None,
 ) -> list[ServicePointOut]:
-    """RF25 — an OCCASIONAL point past its event's valid_until is hidden here by default (no
-    archived_at column: computed at query time, spec Ruling 1). include_archived=true is what
-    the historical-reports view (RF43, later etapa) will pass."""
-    query = select(ServicePoint).options(selectinload(ServicePoint.event))
+    # Registration order, so a renamed point does not jump to the end of the building's list.
+    query = select(ServicePoint).order_by(ServicePoint.created_at, ServicePoint.id)
     if floor_id is not None:
         query = query.where(ServicePoint.floor_id == floor_id)
-    if not include_archived:
-        query = query.outerjoin(Event, ServicePoint.event_id == Event.id).where(
-            or_(
-                ServicePoint.point_type == PointType.REGULAR,
-                Event.valid_until >= date.today(),
-            )
+    if building_id is not None:
+        query = query.join(Floor, ServicePoint.floor_id == Floor.id).where(
+            Floor.building_id == building_id
         )
     points = (await db.scalars(query)).all()
     return [_to_out(point) for point in points]
@@ -99,26 +96,28 @@ async def create_service_point(
     actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ServicePointOut:
-    # BUG FIX (Finding I2.2): without these checks, an unknown floor_id or event_id only fails
-    # later at the ServicePoint insert's FK constraints, surfacing as an unhandled
+    # BUG FIX (Finding I2.2): without this check, an unknown floor_id only fails
+    # later at the ServicePoint insert's FK constraint, surfacing as an unhandled
     # IntegrityError (500) instead of a clean 404 — same existence-check-before-write pattern
     # as update_floor in app/api/floors.py.
     floor = await db.get(Floor, body.floor_id)
     if floor is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Floor "{body.floor_id}" not found.')
-    if body.event_id is not None:
-        event = await db.get(Event, body.event_id)
-        if event is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f'Event "{body.event_id}" not found.')
+    building = await db.get(Building, floor.building_id)
+    location = None if building is None else point_location(building)
+    if location is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f'Building "{floor.building_id}" has no outline; draw it before adding points.',
+        )
 
+    latitude, longitude = location
     point = ServicePoint(
         floor_id=body.floor_id,
         name=body.name,
         description=body.description,
-        latitude=body.latitude,
-        longitude=body.longitude,
-        point_type=body.point_type,
-        event_id=body.event_id,
+        latitude=latitude,
+        longitude=longitude,
     )
     db.add(point)
     await db.flush()
@@ -129,7 +128,7 @@ async def create_service_point(
         entity_id=point.id,
         action="create",
         before=None,
-        after={"name": point.name, "point_type": point.point_type.value},
+        after={"name": point.name},
     )
     await db.commit()
     return _to_out(point)
@@ -149,8 +148,6 @@ async def update_service_point(
     before = {"name": point.name, "description": point.description}
     point.name = body.name
     point.description = body.description
-    point.latitude = body.latitude
-    point.longitude = body.longitude
     await record_audit_trail(
         db,
         actor_id=actor.id,
@@ -164,28 +161,46 @@ async def update_service_point(
     return _to_out(point)
 
 
-@router.post("/{point_id}/promote", response_model=ServicePointOut)
-async def promote_service_point(
-    point_id: UUID,
-    actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> ServicePointOut:
+async def _load_point(db: AsyncSession, point_id: UUID) -> ServicePoint:
     point = await db.get(ServicePoint, point_id)
     if point is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Service point "{point_id}" not found.')
-    if point.point_type != PointType.OCCASIONAL:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only an OCCASIONAL point can be promoted.")
+    return point
 
-    before = {"point_type": point.point_type.value}
-    point = await promote_service_point_to_regular(db, point)
+
+@router.get("/{point_id}/deletion-impact", response_model=DeletionImpactOut)
+async def service_point_deletion_impact(
+    point_id: UUID,
+    _actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> DeletionImpactOut:
+    await _load_point(db, point_id)
+    impact = await impact_of_point(db, point_id)
+    return DeletionImpactOut(**asdict(impact))
+
+
+@router.delete("/{point_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_service_point(
+    point_id: UUID,
+    request: Request,
+    actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    """Removes the point and its history (route stops, executions, photos) — decided by the
+    product owner (spec 2026-10-20-predios-pontos-dialogs-design.md §3.4)."""
+    point = await _load_point(db, point_id)
+    impact = await impact_of_point(db, point_id)
+    before = {"name": point.name, **asdict(impact)}
+    photo_keys = await delete_point(db, point_id)
     await record_audit_trail(
         db,
         actor_id=actor.id,
         entity_type="service_point",
-        entity_id=point.id,
-        action="promote",
+        entity_id=point_id,
+        action="delete",
         before=before,
-        after={"point_type": point.point_type.value},
+        after=None,
     )
     await db.commit()
-    return _to_out(point)
+    await remove_photo_objects(request.app.state.object_store, photo_keys)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

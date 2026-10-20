@@ -461,3 +461,48 @@ async def test_reassign_stops_rejects_unknown_field_worker(db_session: AsyncSess
             actor_id=manager.id,
             osrm=FakeOsrmClient(),
         )
+
+
+async def test_reassign_stops_closes_a_started_source_route_left_with_only_done_stops(
+    db_session: AsyncSession,
+) -> None:
+    # RF16 "restante da rota": the worker did the first stop, fell ill, and the manager moved the
+    # rest away — the source route has nothing open left and must stop collecting GPS (RNF11).
+    manager, worker_a, worker_b, points = await _seed(db_session, n_points=4)
+    source = await create_route(
+        db_session,
+        field_worker_id=worker_a.id,
+        route_date=_ROUTE_DATE,
+        route_type=RouteType.REGULAR,
+        scheduled_start_at=None,
+        stops=[StopInput(service_point_id=p.id) for p in points[:2]],
+        actor_id=manager.id,
+        osrm=FakeOsrmClient(),
+    )
+    target = await create_route(
+        db_session,
+        field_worker_id=worker_b.id,
+        route_date=_ROUTE_DATE,
+        route_type=RouteType.REGULAR,
+        scheduled_start_at=None,
+        stops=[StopInput(service_point_id=p.id) for p in points[2:]],
+        actor_id=manager.id,
+        osrm=FakeOsrmClient(),
+    )
+    source.status = RouteStatus.IN_PROGRESS
+    source.stops[0].status = RouteStopStatus.DONE
+    await db_session.flush()
+
+    source, target = await reassign_stops(
+        db_session,
+        source_route=source,
+        target_route=target,
+        stop_ids=[source.stops[1].id],
+        new_field_worker_id=worker_b.id,
+        reason="profissional passou mal",
+        actor_id=manager.id,
+        osrm=FakeOsrmClient(),
+    )
+
+    assert source.status is RouteStatus.DONE
+    assert target.status is RouteStatus.PLANNED

@@ -133,3 +133,46 @@ def test_required_question_omitted_is_not_an_error() -> None:
     )
 
     assert len(rows) == 1
+
+
+# --- MEDIA: the answer is the list of the photos' app-generated idempotency keys ----------
+
+
+def _media_answers(value: object) -> tuple[FormVersion, list[AnswerIn]]:
+    question = _question(QuestionType.MEDIA)
+    return _version([question]), [AnswerIn(str(question.stable_key), value)]
+
+
+def test_media_answer_accepts_a_list_of_photo_keys() -> None:
+    keys = [str(uuid.uuid4()), str(uuid.uuid4())]
+    version, answers = _media_answers(keys)
+
+    [row] = build_answers(execution_id=uuid.uuid4(), form_version=version, answers=answers)
+
+    assert row.value_json == keys
+
+
+def test_media_answer_accepts_an_empty_list() -> None:
+    """Shape only: the device gates a required photo (RF40), the server never does."""
+    version, answers = _media_answers([])
+
+    [row] = build_answers(execution_id=uuid.uuid4(), form_version=version, answers=answers)
+
+    assert row.value_json == []
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        (str(uuid.uuid4()), "list"),
+        (["not-a-uuid"], "not-a-uuid"),
+        ([1], "1"),
+        (["00000000-0000-0000-0000-000000000001"] * 2, "repeated"),
+        ([str(uuid.uuid4()) for _ in range(11)], "at most 10"),
+    ],
+)
+def test_media_answer_rejects_a_malformed_value(value: object, reason: str) -> None:
+    version, answers = _media_answers(value)
+
+    with pytest.raises(AnswerValidationError, match=reason):
+        build_answers(execution_id=uuid.uuid4(), form_version=version, answers=answers)

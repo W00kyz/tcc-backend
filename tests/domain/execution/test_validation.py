@@ -8,7 +8,6 @@ from app.domain.execution.validation import (
     FLAG_GPS_UNAVAILABLE,
     FLAG_OUT_OF_RADIUS,
     FLAG_OUTSIDE_SCHEDULE,
-    FLAG_ROOM_CHOSEN_MANUALLY,
     Candidate,
     ChosenStopNotOnFloor,
     ScheduleWindow,
@@ -81,7 +80,9 @@ def test_chosen_stop_id_bypasses_resolution() -> None:
     )
     assert result.resolved is far
     assert result.geo_validation is GeoValidation.VALIDATED
-    assert result.flags == [FLAG_ROOM_CHOSEN_MANUALLY]  # not the nearest
+    # Points share their building's location: choosing a room is the normal path, not a
+    # signal — flagging it sent every multi-room check-in to review.
+    assert result.flags == []
 
 
 def test_chosen_stop_id_that_is_the_nearest_with_gps_has_no_flag() -> None:
@@ -94,13 +95,13 @@ def test_chosen_stop_id_that_is_the_nearest_with_gps_has_no_flag() -> None:
     assert result.flags == []
 
 
-def test_chosen_stop_id_no_gps_flags_manual_and_gps_unavailable() -> None:
+def test_chosen_stop_id_no_gps_flags_only_gps_unavailable() -> None:
     a = _candidate("Sala 1", distance_m=None)
     b = _candidate("Sala 2", distance_m=None)
     result = resolve_room([a, b], radius_m=50, has_gps=False, chosen_route_stop_id=b.route_stop_id)
     assert result.resolved is b
     assert result.geo_validation is GeoValidation.NOT_VALIDATED
-    assert result.flags == [FLAG_ROOM_CHOSEN_MANUALLY, FLAG_GPS_UNAVAILABLE]
+    assert result.flags == [FLAG_GPS_UNAVAILABLE]
 
 
 def test_chosen_stop_id_out_of_radius_flags_out_of_radius() -> None:
@@ -111,7 +112,7 @@ def test_chosen_stop_id_out_of_radius_flags_out_of_radius() -> None:
     )
     assert result.resolved is far
     assert result.geo_validation is GeoValidation.OUT_OF_RADIUS
-    assert result.flags == [FLAG_ROOM_CHOSEN_MANUALLY, FLAG_OUT_OF_RADIUS]
+    assert result.flags == [FLAG_OUT_OF_RADIUS]
 
 
 def test_chosen_stop_id_not_a_candidate_raises() -> None:

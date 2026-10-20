@@ -21,6 +21,10 @@ class AnswerIn:
 
 # Named for the signal condition, not "...Error"-suffixed — same convention as
 # app/domain/forms/service.py and app/domain/execution/service.py.
+# A MEDIA answer lists at most this many photos (design doc §6.3).
+MAX_MEDIA_PHOTOS = 10
+
+
 class AnswerValidationError(Exception):
     """A check-out answer payload is structurally invalid (Ruling 7): unknown key or bad shape."""
 
@@ -85,6 +89,8 @@ def _check_value_shape(question: FormQuestion, answer: AnswerIn) -> None:
         raise AnswerValidationError(
             f'answer for "{key}" must be a subset of {question.options!r}, got {value!r}'
         )
+    elif question_type is QuestionType.MEDIA:
+        _check_media_value(key, value)
 
 
 def _is_option_subset(value: object, options: list[str]) -> bool:
@@ -93,3 +99,33 @@ def _is_option_subset(value: object, options: list[str]) -> bool:
         and all(isinstance(item, str) for item in value)
         and set(value) <= set(options)
     )
+
+
+def _check_media_value(key: str, value: object) -> None:
+    """A list of photo keys. Shape only: a key whose photo never arrived is still accepted —
+    the field record prevails (Ruling 6) and the dashboard shows the photo as not received."""
+    if not isinstance(value, list):
+        raise AnswerValidationError(
+            f'answer for "{key}" must be a list of photo keys, got {value!r}'
+        )
+    for item in value:
+        if not _is_uuid(item):
+            raise AnswerValidationError(
+                f'answer for "{key}" must list photo keys (UUIDs), got {item!r}'
+            )
+    if len(set(value)) != len(value):
+        raise AnswerValidationError(f'answer for "{key}" has a repeated photo key: {value!r}')
+    if len(value) > MAX_MEDIA_PHOTOS:
+        raise AnswerValidationError(
+            f'answer for "{key}" lists {len(value)} photos; at most {MAX_MEDIA_PHOTOS} allowed'
+        )
+
+
+def _is_uuid(item: object) -> bool:
+    if not isinstance(item, str):
+        return False
+    try:
+        uuid.UUID(item)
+    except ValueError:
+        return False
+    return True

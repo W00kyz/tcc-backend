@@ -5,7 +5,7 @@ from uuid import UUID
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -164,7 +164,9 @@ class PasswordResetRequest(BaseModel):
 
 class PasswordResetConfirm(BaseModel):
     token: str
-    new_password: str
+    # Same floor the dashboard's reset form enforces; also the invite path (RF05), since a new
+    # user sets the first password through this endpoint.
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 @router.post("/password-reset/request", status_code=status.HTTP_202_ACCEPTED)

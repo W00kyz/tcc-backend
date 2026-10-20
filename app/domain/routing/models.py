@@ -20,8 +20,8 @@ if TYPE_CHECKING:
 
 
 class RouteType(enum.StrEnum):
-    # Same value pair as catalog.PointType, but a SEPARATE Postgres enum (name="route_type"):
-    # a route's regular/occasional flag (RF23/RF24) is not the same domain as a point's.
+    # A route's regular/occasional flag (RF23/RF24). Service points used to carry a matching
+    # point_type tied to events; that feature was removed, routes keep their own flag.
     REGULAR = "REGULAR"
     OCCASIONAL = "OCCASIONAL"
 

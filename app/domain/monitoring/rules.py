@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from app.core.campus_clock import campus_wall_clock
 from app.domain.monitoring.models import AlertKind, AlertSeverity
 
 
@@ -117,9 +118,13 @@ def rule_late_stop(
     now: datetime,
     enabled: dict[AlertKind, bool],
 ) -> list[AlertDraft]:
-    """PENDING stop on an IN_PROGRESS route past its arrival window + `late_stop_min`."""
+    """PENDING stop on an IN_PROGRESS route past its arrival window + `late_stop_min`.
+
+    The window is campus wall-clock tagged UTC (app/core/campus_clock.py), so it is compared
+    with the campus wall clock, not with the real UTC `now`."""
     if not enabled.get(AlertKind.LATE_STOP, True):
         return []
+    wall_now = campus_wall_clock(now)
     return [
         AlertDraft(
             kind=AlertKind.LATE_STOP,
@@ -137,7 +142,7 @@ def rule_late_stop(
         if route.status == "IN_PROGRESS"
         for stop in route.stops
         if stop.status == "PENDING"
-        and _overdue(stop.expected_arrival_to, thresholds.late_stop_min, now)
+        and _overdue(stop.expected_arrival_to, thresholds.late_stop_min, wall_now)
     ]
 
 

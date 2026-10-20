@@ -55,3 +55,20 @@ def test_preflight_rejects_an_unrecognized_origin() -> None:
     # Starlette's CORSMiddleware still returns 200 for a disallowed origin's preflight,
     # but omits Access-Control-Allow-Origin — the browser is what refuses to proceed.
     assert "access-control-allow-origin" not in response.headers
+
+
+def test_preflight_allows_put_for_settings_and_form_reorder() -> None:
+    client = TestClient(create_app(object_store=FakeObjectStore()))
+
+    for path in ("/settings", "/forms/00000000-0000-0000-0000-000000000000/draft/order"):
+        response = client.options(
+            path,
+            headers={
+                "Origin": _DASHBOARD_ORIGIN,
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": "Authorization,Content-Type",
+            },
+        )
+
+        assert response.status_code == 200, path
+        assert "PUT" in response.headers["access-control-allow-methods"]

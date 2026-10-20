@@ -1,7 +1,7 @@
 """POST /worker-positions — the field worker's periodic GPS report (Etapa 9, spec §2 Ruling 5)."""
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.core.security import hash_password
@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.clock import today_on_campus
 
 _PASSWORD = "senha-forte-o-suficiente"
 _LAT = -7.21
@@ -68,7 +70,7 @@ async def _seed(
         await db_session.flush()
         route_worker_id = other.id
 
-    route = Route(field_worker_id=route_worker_id, route_date=date.today(), status=status)
+    route = Route(field_worker_id=route_worker_id, route_date=today_on_campus(), status=status)
     db_session.add(route)
     await db_session.flush()
 

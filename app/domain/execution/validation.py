@@ -14,6 +14,9 @@ FLAG_OUT_OF_RADIUS = "OUT_OF_RADIUS"
 FLAG_OUTSIDE_SCHEDULE = "OUTSIDE_SCHEDULE"
 FLAG_QR_SUPERSEDED = "QR_SUPERSEDED"
 FLAG_GPS_UNAVAILABLE = "GPS_UNAVAILABLE"
+# LEGACY: no longer raised — points share their building's location, so picking the room is the
+# normal path (docs/specs/2026-10-20-predios-pontos-dialogs-design.md §3.3). Kept because older
+# executions carry it and the dashboard still labels it.
 FLAG_ROOM_CHOSEN_MANUALLY = "ROOM_CHOSEN_MANUALLY"
 FLAG_CLOCK_SKEW = "CLOCK_SKEW"
 
@@ -57,13 +60,6 @@ def _sort_key(candidate: Candidate) -> tuple[float, str]:
     return (distance, candidate.name)
 
 
-def _nearest(candidates: list[Candidate]) -> Candidate | None:
-    with_distance = [c for c in candidates if c.distance_m is not None]
-    if not with_distance:
-        return None
-    return min(with_distance, key=_sort_key)
-
-
 def resolve_room(
     candidates: list[Candidate],
     *,
@@ -86,10 +82,7 @@ def resolve_room(
         else:
             geo_validation = GeoValidation.NOT_VALIDATED
 
-        nearest = _nearest(candidates)
         flags: list[str] = []
-        if not has_gps or nearest is None or nearest.route_stop_id != chosen.route_stop_id:
-            flags.append(FLAG_ROOM_CHOSEN_MANUALLY)
         if not has_gps:
             flags.append(FLAG_GPS_UNAVAILABLE)
         if has_gps and chosen.distance_m is not None and chosen.distance_m > radius_m:

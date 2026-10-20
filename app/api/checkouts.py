@@ -24,7 +24,7 @@ from app.api._execution_common import (
     resolve_route,
 )
 from app.api.checkins import CandidateOut
-from app.api.deps import require_role
+from app.api.deps import CampusToday, require_role
 from app.db.session import get_db
 from app.domain.execution.answers import AnswerIn, AnswerValidationError
 from app.domain.execution.service import (
@@ -110,13 +110,16 @@ async def create_check_out(
     request: Request,
     user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
     db: Annotated[AsyncSession, Depends(get_db)],
+    today: CampusToday,
 ) -> CheckOutResponse:
     worker = await current_worker(db, user)
     if worker is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has no field worker profile.")
 
     try:
-        route = await resolve_route(db, worker_id=worker.id, route_stop_id=body.route_stop_id)
+        route = await resolve_route(
+            db, worker_id=worker.id, route_stop_id=body.route_stop_id, today=today
+        )
     except RouteStopMissing as exc:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f'Route stop "{body.route_stop_id}" not found.'

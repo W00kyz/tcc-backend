@@ -5,6 +5,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from app.core.campus_clock import campus_wall_clock
 from app.domain.monitoring.models import AlertKind, AlertSeverity
 from app.domain.monitoring.rules import (
     AlertThresholds,
@@ -21,6 +22,8 @@ THRESHOLDS = AlertThresholds(
     late_start_min=15, absence_min=45, late_stop_min=20, no_evidence_min=30
 )
 ALL_ON: dict[AlertKind, bool] = {}
+# Arrival windows are campus wall-clock tagged UTC (app/core/campus_clock.py).
+WALL_NOW = campus_wall_clock(NOW)
 
 
 def _route(**overrides: object) -> RouteSnapshot:
@@ -39,7 +42,7 @@ def _stop(**overrides: object) -> StopSnapshot:
     base: dict[str, object] = {
         "route_stop_id": uuid.uuid4(),
         "status": "PENDING",
-        "expected_arrival_to": NOW - timedelta(minutes=25),
+        "expected_arrival_to": WALL_NOW - timedelta(minutes=25),
         "checked_out_at": NOW - timedelta(minutes=40),
         "execution_source": "APP",
         "evidence_count": 0,
@@ -112,7 +115,7 @@ def test_worker_absent_disabled() -> None:
 
 
 def test_late_stop_fires_inside_threshold() -> None:
-    stop = _stop(expected_arrival_to=NOW - timedelta(minutes=21))
+    stop = _stop(expected_arrival_to=WALL_NOW - timedelta(minutes=21))
     route = _route(status="IN_PROGRESS", stops=[stop])
     drafts = rule_late_stop([route], THRESHOLDS, NOW, ALL_ON)
     assert len(drafts) == 1
@@ -125,7 +128,7 @@ def test_late_stop_fires_inside_threshold() -> None:
 @pytest.mark.parametrize(
     ("route_status", "stop_kwargs"),
     [
-        ("IN_PROGRESS", {"expected_arrival_to": NOW - timedelta(minutes=10)}),  # outside
+        ("IN_PROGRESS", {"expected_arrival_to": WALL_NOW - timedelta(minutes=10)}),  # outside
         ("PLANNED", {}),  # wrong route status
         ("IN_PROGRESS", {"status": "DONE"}),  # wrong stop status
         ("IN_PROGRESS", {"expected_arrival_to": None}),  # no window
@@ -134,6 +137,18 @@ def test_late_stop_fires_inside_threshold() -> None:
 def test_late_stop_silent(route_status: str, stop_kwargs: dict[str, object]) -> None:
     route = _route(status=route_status, stops=[_stop(**stop_kwargs)])
     assert rule_late_stop([route], THRESHOLDS, NOW, ALL_ON) == []
+
+
+def test_late_stop_reads_the_window_as_campus_wall_clock() -> None:
+    """Regression: a 08:00-09:00 window is stored as 09:00Z (wall-clock tagged UTC). Compared
+    with the real UTC instant, the alert fired at 06:20 in Campina Grande, three hours early."""
+    stop = _stop(expected_arrival_to=datetime(2026, 9, 6, 9, 0, tzinfo=UTC))
+    route = _route(status="IN_PROGRESS", stops=[stop])
+    nine_ten_local = datetime(2026, 9, 6, 12, 10, tzinfo=UTC)
+    nine_twenty_one_local = datetime(2026, 9, 6, 12, 21, tzinfo=UTC)
+
+    assert rule_late_stop([route], THRESHOLDS, nine_ten_local, ALL_ON) == []
+    assert len(rule_late_stop([route], THRESHOLDS, nine_twenty_one_local, ALL_ON)) == 1
 
 
 def test_late_stop_disabled() -> None:

@@ -41,7 +41,10 @@ from app.domain.impediments.service import (
     reassign_impediment,
 )
 from app.domain.impediments.service import StopNotReassignable as ImpedimentStopNotReassignable
-from app.domain.monitoring.notifications import notify_route_assigned
+from app.domain.monitoring.notifications import (
+    notify_impediment_reported,
+    notify_route_assigned,
+)
 from app.domain.routing.models import Route, RouteStatus, RouteStop
 from app.domain.routing.service import (
     RouteNotEditable,
@@ -142,7 +145,7 @@ async def _load_impediment(db: AsyncSession, impediment_id: UUID) -> Impediment:
     status_code=status.HTTP_201_CREATED,
 )
 async def report_impediment(
-    route_id: UUID, body: ImpedimentReportBody, user: _FieldWorker, db: _Db
+    route_id: UUID, body: ImpedimentReportBody, request: Request, user: _FieldWorker, db: _Db
 ) -> ImpedimentOut:
     """RF16-RF17 — the field worker signals they cannot execute this stop (scope=STOP) or the
     rest of the route (scope=ROUTE_REMAINDER). The report is the record; no audit-trail entry
@@ -179,6 +182,16 @@ async def report_impediment(
         )
     except tuple(_DOMAIN_ERROR_STATUS) as exc:
         _raise_for_domain_error(exc)
+    # RF17: the managers learn about it in the notification center, not only by polling the
+    # reassignment queue.
+    await notify_impediment_reported(
+        db,
+        impediment_id=impediment.id,
+        route=route,
+        route_stop=route_stop,
+        reason=body.reason.value,
+        push=request.app.state.push_sender,
+    )
     await db.commit()
     await db.refresh(impediment)
     return _to_out(impediment)

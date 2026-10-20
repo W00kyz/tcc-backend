@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.campus_clock import campus_today
 from app.domain.execution.models import EvidenceItem, Execution, ManualCompletion
 from app.domain.monitoring.models import (
     Alert,
@@ -113,7 +114,7 @@ async def _load_routes(db: AsyncSession, now: datetime) -> Sequence[Route]:
     left IN_PROGRESS from a previous day must still raise LATE_STOP, hence `route_date <=`."""
     stmt = (
         select(Route)
-        .where(Route.route_date <= now.date(), Route.status.in_(_SCANNED_STATUSES))
+        .where(Route.route_date <= campus_today(now), Route.status.in_(_SCANNED_STATUSES))
         .options(selectinload(Route.stops))
     )
     return (await db.scalars(stmt)).all()

@@ -72,6 +72,8 @@ class EvidenceItemOut(BaseModel):
     created_at: datetime
     # The authenticated proxy path for a PHOTO; None for a NOTE. `object_key` is never exposed.
     content_url: str | None
+    # The app-generated key a MEDIA answer lists to point at this photo.
+    idempotency_key: UUID | None
 
 
 class EvidenceNoteRequest(BaseModel):
@@ -94,6 +96,7 @@ def _to_out(item: EvidenceItem) -> EvidenceItemOut:
         byte_size=item.byte_size,
         created_at=item.created_at,
         content_url=f"/evidence/{item.id}/content" if is_photo else None,
+        idempotency_key=item.idempotency_key,
     )
 
 
