@@ -15,7 +15,7 @@ from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.domain.catalog.models import Floor, ServicePoint
+from app.domain.catalog.models import FieldWorker, Floor, ServicePoint
 from app.domain.identity.models import User
 from app.domain.impediments.models import (
     Impediment,
@@ -122,9 +122,16 @@ async def create_impediment(
 async def _release_impeded(
     db: AsyncSession, *, route: Route, route_stop: RouteStop | None, now: datetime
 ) -> list[RouteStop]:
+    # The worker released it: the audit rows name their login, not "the system".
+    worker = await db.get(FieldWorker, route.field_worker_id)
+    actor_id = worker.user_id if worker is not None else None
     if route_stop is not None:
-        return await release_stops(db, stops=[route_stop], reason=ReleaseReason.IMPEDIMENT, at=now)
-    return await release_route(db, route=route, reason=ReleaseReason.ROUTE_REMAINDER, at=now)
+        return await release_stops(
+            db, stops=[route_stop], reason=ReleaseReason.IMPEDIMENT, at=now, actor_id=actor_id
+        )
+    return await release_route(
+        db, route=route, reason=ReleaseReason.ROUTE_REMAINDER, at=now, actor_id=actor_id
+    )
 
 
 async def _raise_point_impeded(

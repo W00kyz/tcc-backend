@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from app.core.campus_clock import campus_today
 from app.core.security import hash_password
+from app.domain.audit.models import AuditTrail
 from app.domain.catalog.models import FieldWorker, ServicePoint, ServiceType
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import (
@@ -145,6 +146,59 @@ async def test_outside_campus_for_ten_minutes_releases(db_session: AsyncSession)
     assert "2 ponto(s)" in alerts[0].description
     notified = list(await db_session.scalars(select(Notification)))
     assert [(n.user_id, n.kind) for n in notified] == [(manager.id, "ALERT")]
+
+
+async def test_sparse_reporter_just_outside_not_released(db_session: AsyncSession) -> None:
+    # A worker without background permission: the last fix inside is 25 min old and the next
+    # one, 1 min old, is just past the rectangle edge. Outside for a minute, not for ten.
+    working = await _working(db_session)
+    await _position(db_session, working, _INSIDE, minutes_ago=25)
+    await _position(db_session, working, _OUTSIDE, minutes_ago=1)
+
+    alerts = await run_release_scan(db_session, now=_NOW)
+
+    route_status, _ = await _route_state(db_session, working.route)
+    assert alerts == []
+    assert route_status is RouteStatus.IN_PROGRESS
+
+
+async def test_checkin_after_outside_fix_counts_as_inside(db_session: AsyncSession) -> None:
+    # Points are on campus: a check-in after the outside fixes puts the worker back inside.
+    working = await _working(db_session)
+    await _position(db_session, working, _OUTSIDE, minutes_ago=20)
+    await _position(db_session, working, _OUTSIDE, minutes_ago=15)
+    await make_check_in(
+        db_session,
+        stop=working.route.stops[0],
+        worker=working.worker,
+        scanned_at=_NOW - timedelta(minutes=12),
+    )
+    await _position(db_session, working, _OUTSIDE, minutes_ago=5)
+
+    alerts = await run_release_scan(db_session, now=_NOW)
+
+    route_status, _ = await _route_state(db_session, working.route)
+    assert alerts == []
+    assert route_status is RouteStatus.IN_PROGRESS
+
+
+async def test_scan_release_is_audited_per_stop(db_session: AsyncSession) -> None:
+    working = await _working(db_session, allocated_minutes_ago=60)
+    stop_ids = {stop.id for stop in working.route.stops}
+
+    await run_release_scan(db_session, now=_NOW)
+
+    audits = list(
+        await db_session.scalars(select(AuditTrail).where(AuditTrail.action == "release"))
+    )
+    assert {a.entity_id for a in audits} == stop_ids
+    assert {(a.actor_id, a.entity_type) for a in audits} == {(None, "route_stop")}
+    assert audits[0].after_data == {
+        "status": "RELEASED",
+        "release_reason": "LOCATION_SILENCE",
+        "released_at": _NOW.isoformat(),
+        "route_id": str(working.route.id),
+    }
 
 
 async def test_brief_exit_does_not_release(db_session: AsyncSession) -> None:

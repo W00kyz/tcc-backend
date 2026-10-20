@@ -50,7 +50,7 @@ async def test_release_stops_changes_only_live_stops(db_session: AsyncSession) -
     await db_session.flush()
 
     released = await release_stops(
-        db_session, stops=route.stops, reason=ReleaseReason.IMPEDIMENT, at=_NOW
+        db_session, stops=route.stops, reason=ReleaseReason.IMPEDIMENT, at=_NOW, actor_id=None
     )
 
     assert {stop.id for stop in released} == {pending.id, in_progress.id}
@@ -80,7 +80,7 @@ async def test_release_stops_skips_a_stop_done_behind_the_callers_back(
     )
 
     released = await release_stops(
-        db_session, stops=[stop], reason=ReleaseReason.LEFT_CAMPUS, at=_NOW
+        db_session, stops=[stop], reason=ReleaseReason.LEFT_CAMPUS, at=_NOW, actor_id=None
     )
 
     assert released == []
@@ -99,7 +99,12 @@ async def test_release_route_pauses_or_closes(
     await db_session.flush()
 
     released = await release_route(
-        db_session, route=route, reason=ReleaseReason.END_OF_DAY, at=_NOW, close=close
+        db_session,
+        route=route,
+        reason=ReleaseReason.END_OF_DAY,
+        at=_NOW,
+        close=close,
+        actor_id=None,
     )
 
     assert {stop.id for stop in released} == {route.stops[1].id, route.stops[2].id}

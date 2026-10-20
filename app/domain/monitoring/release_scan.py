@@ -29,8 +29,18 @@ from app.domain.routing.models import (
     RouteStop,
     RouteStopStatus,
 )
-from app.domain.routing.release import LIVE_STOP_STATUSES, last_activity_at, release_route
-from app.domain.settings.campus import inside_campus, is_service_day, workday_over
+from app.domain.routing.release import (
+    LIVE_STOP_STATUSES,
+    last_activity_at,
+    last_scan_at,
+    release_route,
+)
+from app.domain.settings.campus import (
+    inside_campus,
+    inside_campus_clause,
+    is_service_day,
+    workday_over,
+)
 from app.domain.settings.models import SystemSettings
 from app.domain.settings.service import get_settings_row
 
@@ -99,7 +109,7 @@ async def _release_if_gone(
         minutes = settings.location_silence_release_minutes
     else:
         return None
-    released = await release_route(db, route=route, reason=reason, at=now)
+    released = await release_route(db, route=route, reason=reason, at=now, actor_id=None)
     return AlertDraft(
         kind=AlertKind.BATCH_RELEASED,
         severity=AlertSeverity.WARNING,
@@ -116,9 +126,11 @@ async def _release_if_gone(
 async def _left_campus(
     db: AsyncSession, *, route: Route, settings: SystemSettings, now: datetime
 ) -> bool:
-    """The latest position is outside the campus, none inside came in the last
-    `outside_campus_release_minutes`, and that position is newer than the batch — a fix from
-    before the worker came back and got this batch says nothing about it (spec §7.2)."""
+    """The worker has been outside the campus for `outside_campus_release_minutes` (spec §7.2):
+    the latest position is outside, it is newer than the batch — a fix from before the worker
+    came back and got this batch says nothing about it — and the first outside fix since they
+    were last seen inside is at least that old. Seen inside: an inside position, or any QR scan
+    — every point is on campus, and a scan counts as a received position (§7.3)."""
     latest = await db.scalar(
         select(WorkerPosition)
         .where(WorkerPosition.route_id == route.id)
@@ -129,13 +141,31 @@ async def _left_campus(
         return False
     if route.last_allocated_at is not None and latest.reported_at <= route.last_allocated_at:
         return False
-    since = now - timedelta(minutes=settings.outside_campus_release_minutes)
-    recent = await db.scalars(
-        select(WorkerPosition).where(
-            WorkerPosition.route_id == route.id, WorkerPosition.reported_at >= since
+    outside_since = await _first_outside_fix_since_seen_inside(db, route=route, settings=settings)
+    limit = now - timedelta(minutes=settings.outside_campus_release_minutes)
+    return outside_since is not None and outside_since <= limit
+
+
+async def _first_outside_fix_since_seen_inside(
+    db: AsyncSession, *, route: Route, settings: SystemSettings
+) -> datetime | None:
+    """When the current stretch outside the campus began: the earliest outside position after
+    the worker was last seen inside. None when there is no such position."""
+    inside = inside_campus_clause(settings, WorkerPosition.latitude, WorkerPosition.longitude)
+    last_inside_position = await db.scalar(
+        select(func.max(WorkerPosition.reported_at)).where(
+            WorkerPosition.route_id == route.id, inside
         )
     )
-    return not any(inside_campus(settings, p.latitude, p.longitude) for p in recent)
+    last_scan = await last_scan_at(db, route=route)
+    seen_inside = [moment for moment in (last_inside_position, last_scan) if moment is not None]
+    stmt = select(func.min(WorkerPosition.reported_at)).where(
+        WorkerPosition.route_id == route.id, ~inside
+    )
+    if seen_inside:
+        stmt = stmt.where(WorkerPosition.reported_at > max(seen_inside))
+    first_outside: datetime | None = await db.scalar(stmt)
+    return first_outside
 
 
 # --- end of the workday ----------------------------------------------------------------------
@@ -153,7 +183,9 @@ async def _close_the_day(db: AsyncSession, *, today: date, now: datetime) -> lis
         .with_for_update(skip_locked=True)
     )
     for route in open_routes.all():
-        await release_route(db, route=route, reason=ReleaseReason.END_OF_DAY, at=now, close=True)
+        await release_route(
+            db, route=route, reason=ReleaseReason.END_OF_DAY, at=now, actor_id=None, close=True
+        )
 
     unserved = await _unserved_per_type(db, today)
     if not unserved:

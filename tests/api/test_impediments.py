@@ -234,6 +234,25 @@ async def test_route_remainder_releases_the_live_stops_and_pauses(
     assert fx.source.status is RouteStatus.PAUSED
 
 
+@pytest.mark.parametrize(("scope", "released"), [("STOP", 1), ("ROUTE_REMAINDER", 2)])
+async def test_report_audits_each_released_stop_as_the_worker(
+    client: TestClient, db_session: AsyncSession, scope: str, released: int
+) -> None:
+    fx = await _seed(db_session)
+    stop_id = fx.source.stops[0].id if scope == "STOP" else None
+
+    response = _report(client, fx, route_stop_id=stop_id, scope=scope)
+
+    assert response.status_code == 201, response.text
+    audits = list(
+        await db_session.scalars(select(AuditTrail).where(AuditTrail.action == "release"))
+    )
+    assert len(audits) == released
+    assert {(a.actor_id, a.entity_type) for a in audits} == {(fx.worker_a_user.id, "route_stop")}
+    reason = "IMPEDIMENT" if scope == "STOP" else "ROUTE_REMAINDER"
+    assert {a.after_data["release_reason"] for a in audits if a.after_data} == {reason}
+
+
 async def test_report_raises_a_point_impeded_alert(
     client: TestClient, db_session: AsyncSession
 ) -> None:

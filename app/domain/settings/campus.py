@@ -4,6 +4,9 @@ allocation refuses a batch on them, and the release rules (B4) reuse them."""
 
 from datetime import date, datetime
 
+from sqlalchemy import ColumnElement, and_
+from sqlalchemy.orm import InstrumentedAttribute
+
 from app.core.campus_clock import CAMPUS_TIMEZONE
 from app.domain.settings.models import SystemSettings
 
@@ -17,6 +20,20 @@ def inside_campus(settings: SystemSettings, lat: float, lng: float) -> bool:
     return (
         settings.campus_min_lat <= lat <= settings.campus_max_lat
         and settings.campus_min_lng <= lng <= settings.campus_max_lng
+    )
+
+
+def inside_campus_clause(
+    settings: SystemSettings, lat: InstrumentedAttribute[float], lng: InstrumentedAttribute[float]
+) -> ColumnElement[bool]:
+    """`inside_campus` as a SQL predicate over two mapped columns, to filter positions in SQL.
+
+    >>> select(WorkerPosition).where(inside_campus_clause(settings, WorkerPosition.latitude,
+    ...                                                   WorkerPosition.longitude))
+    """
+    return and_(
+        lat.between(settings.campus_min_lat, settings.campus_max_lat),
+        lng.between(settings.campus_min_lng, settings.campus_max_lng),
     )
 
 
