@@ -190,7 +190,7 @@ async def test_approved_worker_reaches_routes_me(
     response = client.get("/routes/me", headers={"Authorization": f"Bearer {token}"})
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert response.json()["route"] is None
 
 
 async def test_every_worker_endpoint_refuses_a_pending_worker(

@@ -14,10 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import ApprovedWorker
+from app.api.deps import ApprovedWorker, ensure_location_consent
 from app.db.session import get_db
 from app.domain.monitoring.positions import PositionNotAccepted, record_position
-from app.domain.privacy.service import has_consented
 
 router = APIRouter(prefix="/worker-positions", tags=["monitoring"])
 
@@ -46,13 +45,7 @@ async def create_worker_position(
     worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> WorkerPositionOut:
-    # RNF10: no location data is accepted until the worker has accepted the current privacy notice.
-    if not await has_consented(db, user_id=worker.user_id):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Consent to the current privacy notice is required before location data can be "
-            "collected.",
-        )
+    await ensure_location_consent(db, worker)
 
     try:
         position = await record_position(

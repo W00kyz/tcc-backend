@@ -38,7 +38,6 @@ from app.domain.forms.models import FormVersion, FormVersionStatus
 from app.domain.qr.crypto import QrPayload, decode_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
 from app.domain.routing.models import Route, RouteStop, RouteStopStatus
-from app.domain.routing.service import complete_route_if_finished
 
 
 class QrSignatureInvalid(Exception):
@@ -261,7 +260,6 @@ async def check_out(
     await _persist_answers(
         db, execution=execution, stop=stop, form_version_id=form_version_id, answers=answers
     )
-    await complete_route_if_finished(db, route=route)
     await db.commit()
     return execution
 

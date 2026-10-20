@@ -85,6 +85,9 @@ class RouteOut(BaseModel):
     status: str
     started_at: datetime | None
     routing_degraded: bool
+    # The latest batch handed out (0 before the first). `stops` carries every batch; the app
+    # lists the current batch's stops and counts the done ones.
+    current_batch: int
     stops: list[RouteStopOut]
 
 
@@ -156,6 +159,7 @@ async def _to_route_out(db: AsyncSession, route: Route) -> RouteOut:
         status=route.status.value,
         started_at=route.started_at,
         routing_degraded=routing_degraded(route),
+        current_batch=max((stop.batch_number for stop in route.stops), default=0),
         # Route.stops is order_by="RouteStop.order_index" and every service function reloads it
         # in that order — no re-sort needed here.
         stops=[_to_stop_out(stop, form_map) for stop in route.stops],

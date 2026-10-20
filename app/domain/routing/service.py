@@ -12,35 +12,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.catalog.models import ServicePoint
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from app.domain.routing.models import Route, RouteStop, RouteStopStatus
 from app.domain.routing.osrm import OsrmClient, OsrmLeg, OsrmUnavailable
-
-_OPEN_STOP_STATUSES = (RouteStopStatus.PENDING, RouteStopStatus.IN_PROGRESS)
-
-
-async def complete_route_if_finished(db: AsyncSession, *, route: Route) -> bool:
-    """Close the route (`status = DONE`) once none of its stops is left open (PENDING or
-    IN_PROGRESS) — the last check-out. Without it a route stayed IN_PROGRESS forever: the board
-    never showed it as concluded (RF41), reports never counted it (RF45) and the app kept
-    collecting GPS after the last check-out (RNF11 — the position endpoint only rejects fixes for
-    non-IN_PROGRESS routes). A RELEASED stop is back in the pool, not open work of this route.
-
-    Only an IN_PROGRESS route closes. Flushes, never commits. Returns whether it was closed.
-
-        await complete_route_if_finished(db, route=route)
-        await db.commit()
-    """
-    if route.status is not RouteStatus.IN_PROGRESS:
-        return False
-    await db.flush()
-    statuses = (
-        await db.scalars(select(RouteStop.status).where(RouteStop.route_id == route.id))
-    ).all()
-    if any(status in _OPEN_STOP_STATUSES for status in statuses):
-        return False
-    route.status = RouteStatus.DONE
-    await db.flush()
-    return True
 
 
 def routing_degraded(route: Route) -> bool:

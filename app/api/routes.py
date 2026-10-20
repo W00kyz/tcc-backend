@@ -1,27 +1,83 @@
-"""Route reads: the manager list and detail (RF41) and the field worker's "rota do dia"
-(`GET /routes/me` — RF27). Routes are created by the automatic allocation, never by hand (spec
-2026-10-20-alocacao-automatica §2.1). The `RouteOut` read model lives in `app.api.route_view` so
-a route looks the same on mobile and the dashboard."""
+"""Routes: the manager list and detail (RF41), the field worker's day (`GET /routes/me` — RF27)
+and the automatic allocation that creates them (`POST /routes/start`, `POST
+/routes/{id}/next-batch` — spec 2026-10-20-alocacao-automatica §6.2); nobody builds a route by
+hand. The `RouteOut` read model lives in `app.api.route_view` so a route looks the same on mobile
+and the dashboard."""
 
-from datetime import date
+from collections.abc import Coroutine
+from datetime import date, datetime
 from enum import Enum
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import ApprovedWorker, CampusToday, require_role
+from app.api.deps import (
+    ApprovedWorker,
+    CampusToday,
+    Now,
+    ensure_location_consent,
+    require_role,
+)
 from app.api.route_view import _ROUTE_LOADERS, RouteOut, _load_route, _to_route_out
+from app.core.campus_clock import campus_today
 from app.db.session import get_db
 from app.domain.identity.models import User, UserRole
+from app.domain.routing.allocation import (
+    AllocationRefused,
+    AllocationResult,
+    NotAServiceDay,
+    OutsideCampus,
+    RouteAlreadyDone,
+    WorkdayOver,
+    next_batch,
+    start_or_resume,
+)
 from app.domain.routing.models import Route, RouteStatus
+from app.domain.settings.campus import is_service_day
+from app.domain.settings.service import get_settings_row
 
 router = APIRouter(prefix="/routes", tags=["routes"])
 
 _Manager = Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))]
 _Db = Annotated[AsyncSession, Depends(get_db)]
+
+_REFUSAL_CODES: dict[type[AllocationRefused], str] = {
+    NotAServiceDay: "NOT_A_SERVICE_DAY",
+    WorkdayOver: "WORKDAY_OVER",
+    OutsideCampus: "OUTSIDE_CAMPUS",
+    RouteAlreadyDone: "ROUTE_DONE",
+}
+
+
+class AllocationBody(BaseModel):
+    """Where the worker is when asking for a batch: the nearest free points are measured from
+    here, and it must be inside the campus."""
+
+    latitude: float
+    longitude: float
+    # Device clock of the fix — informational; the server clock decides the day and the hour.
+    captured_at: datetime
+
+
+class AllocationOut(BaseModel):
+    route: RouteOut
+    # True when there was nothing left to hand out: the route is now DONE for the day.
+    pool_empty: bool
+
+
+class MyDayOut(BaseModel):
+    """The worker's day for the app: today's route, if any, and the location-silence limits it
+    warns the worker about (spec §7.3)."""
+
+    service_day: bool
+    route: RouteOut | None
+    position_report_interval_seconds: int
+    location_silence_warning_minutes: int
+    location_silence_release_minutes: int
 
 
 def _parse_enum[FilterEnum: Enum](enum_cls: type[FilterEnum], value: str, param: str) -> FilterEnum:
@@ -57,27 +113,96 @@ async def list_routes(
     return [await _to_route_out(db, route) for route in routes]
 
 
-@router.get("/me", response_model=list[RouteOut])
-async def list_my_routes(
+@router.get("/me", response_model=MyDayOut)
+async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday) -> MyDayOut:
+    """RF27 "rota do dia": the signed-in worker's route of today (or none yet). Same `RouteOut`
+    shape the manager endpoints return, so mobile and the dashboard render a route identically."""
+    settings = await get_settings_row(db)
+    route = await db.scalar(
+        select(Route)
+        .where(Route.field_worker_id == worker.id, Route.route_date == today)
+        .options(*_ROUTE_LOADERS)
+    )
+    return MyDayOut(
+        service_day=is_service_day(settings, today),
+        route=await _to_route_out(db, route) if route is not None else None,
+        position_report_interval_seconds=settings.position_report_interval_seconds,
+        location_silence_warning_minutes=settings.location_silence_warning_minutes,
+        location_silence_release_minutes=settings.location_silence_release_minutes,
+    )
+
+
+@router.post("/start", response_model=AllocationOut)
+async def start_route(
+    body: AllocationBody, worker: ApprovedWorker, db: _Db, now: Now, request: Request
+) -> AllocationOut:
+    """The "Iniciar rota" button: create or reopen today's route and hand out a batch; a retry
+    while the batch is open returns it unchanged. 409 with a machine code when no batch can be
+    given."""
+    await ensure_location_consent(db, worker)
+    settings = await get_settings_row(db)
+    result = await _allocating(
+        start_or_resume(
+            db,
+            worker=worker,
+            today=campus_today(now),
+            now=now,
+            lat=body.latitude,
+            lng=body.longitude,
+            settings=settings,
+            osrm=request.app.state.osrm_client,
+        )
+    )
+    return await _allocation_out(db, result)
+
+
+@router.post("/{route_id}/next-batch", response_model=AllocationOut)
+async def next_route_batch(
+    route_id: UUID,
+    body: AllocationBody,
     worker: ApprovedWorker,
     db: _Db,
-    today: CampusToday,
-    route_date: Annotated[date | None, Query(alias="date")] = None,
-) -> list[RouteOut]:
-    """RF27 "rota do dia": the mobile feed for the signed-in worker. Same `RouteOut` shape the
-    manager endpoints return, so mobile and the dashboard render a route identically. Without
-    `?date=` it defaults to today."""
-    stmt = (
-        select(Route)
-        .where(
-            Route.field_worker_id == worker.id,
-            Route.route_date == (route_date or today),
+    now: Now,
+    request: Request,
+) -> AllocationOut:
+    """The next batch once the current one has no open stop (unchanged while it has one). An
+    empty pool closes the route: `pool_empty=true`, status DONE."""
+    await ensure_location_consent(db, worker)
+    route = await db.get(Route, route_id)
+    if route is None or route.field_worker_id != worker.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
+    settings = await get_settings_row(db)
+    result = await _allocating(
+        next_batch(
+            db,
+            route=route,
+            now=now,
+            lat=body.latitude,
+            lng=body.longitude,
+            settings=settings,
+            osrm=request.app.state.osrm_client,
         )
-        .options(*_ROUTE_LOADERS)
-        .order_by(Route.created_at)
     )
-    routes = (await db.scalars(stmt)).all()
-    return [await _to_route_out(db, route) for route in routes]
+    return await _allocation_out(db, result)
+
+
+async def _allocating(allocation: Coroutine[None, None, AllocationResult]) -> AllocationResult:
+    """Await an allocation, turning its refusal into a 409 with the machine code."""
+    try:
+        return await allocation
+    except AllocationRefused as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": _REFUSAL_CODES[type(exc)], "detail": str(exc)},
+        ) from exc
+
+
+async def _allocation_out(db: AsyncSession, result: AllocationResult) -> AllocationOut:
+    """Commit the batch (releasing the claim's row locks), then read the route back whole."""
+    await db.commit()
+    route = await _load_route(db, result.route.id)
+    assert route is not None  # just written in this session
+    return AllocationOut(route=await _to_route_out(db, route), pool_empty=result.pool_empty)
 
 
 @router.get("/{route_id}", response_model=RouteOut)

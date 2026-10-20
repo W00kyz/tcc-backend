@@ -475,26 +475,18 @@ async def test_check_out_two_open_checkins_same_floor_raises_ambiguous(
     ]
 
 
-# --- route completion (RF41, RF45, RNF11) ------------------------------------------------------
+# --- the route after its last check-out ---------------------------------------------------------
 
 
-async def _route_status(db: AsyncSession, seed: _Seed) -> RouteStatus:
-    # A fresh read per call — asserting `seed.route.status` twice would let mypy narrow the
-    # attribute to the first literal and flag the second comparison as unreachable.
-    await db.refresh(seed.route)
-    return seed.route.status
-
-
-async def test_check_out_of_last_stop_closes_the_route(db_session: AsyncSession) -> None:
-    seed = await _seed(
-        db_session, rooms=[("Sala 101", _LAT, _LON), ("Sala 102", _FAR_LAT, _FAR_LON)]
-    )
+async def test_check_out_of_last_stop_leaves_the_route_open_for_the_next_batch(
+    db_session: AsyncSession,
+) -> None:
+    """The last check-out of a batch does not close the route: the app asks for the next batch,
+    and only an empty pool (or the end of the workday) closes it (spec §6.2)."""
+    seed = await _seed(db_session, rooms=[("Sala 101", _LAT, _LON)])
 
     await _do_check_in(db_session, seed)
     await _do_check_out(db_session, seed)
-    assert await _route_status(db_session, seed) is RouteStatus.IN_PROGRESS  # one stop open
 
-    await _do_check_in(db_session, seed, latitude=_FAR_LAT, longitude=_FAR_LON)
-    await _do_check_out(db_session, seed, latitude=_FAR_LAT, longitude=_FAR_LON)
-
-    assert await _route_status(db_session, seed) is RouteStatus.DONE
+    await db_session.refresh(seed.route)
+    assert seed.route.status is RouteStatus.IN_PROGRESS

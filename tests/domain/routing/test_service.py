@@ -1,9 +1,8 @@
-"""Route service layer — the legs over the FakeOsrmClient seam and closing a finished route. No
-test touches the real OSRM (spec §8)."""
+"""Route service layer — the legs over the FakeOsrmClient seam. No test touches the real OSRM
+(spec §8)."""
 
 from datetime import date
 
-import pytest
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
@@ -11,13 +10,8 @@ from app.domain.catalog.models import (
     Floor,
     ServicePoint,
 )
-from app.domain.routing.models import RouteStatus, RouteStopStatus
 from app.domain.routing.osrm import OsrmLeg
-from app.domain.routing.service import (
-    complete_route_if_finished,
-    recompute_legs,
-    routing_degraded,
-)
+from app.domain.routing.service import recompute_legs, routing_degraded
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.factories import make_route, make_worker
@@ -104,38 +98,3 @@ async def test_zeroed_leg_is_stored_as_null(db_session: AsyncSession) -> None:
 
     assert route.stops[1].distance_from_prev_m is None
     assert route.stops[1].leg_geometry is None
-
-
-@pytest.mark.parametrize(
-    ("statuses", "closed"),
-    [
-        ((RouteStopStatus.DONE, RouteStopStatus.DONE), True),
-        # A released stop is back in the pool, not open work of this route.
-        ((RouteStopStatus.DONE, RouteStopStatus.RELEASED), True),
-        ((RouteStopStatus.DONE, RouteStopStatus.PENDING), False),
-        ((RouteStopStatus.DONE, RouteStopStatus.IN_PROGRESS), False),
-    ],
-)
-async def test_complete_route_if_finished_closes_only_without_open_stops(
-    db_session: AsyncSession, statuses: tuple[RouteStopStatus, ...], closed: bool
-) -> None:
-    worker, points = await _seed(db_session, n_points=len(statuses))
-    route = await make_route(db_session, worker=worker, day=_ROUTE_DATE, points=points)
-    for stop, status in zip(route.stops, statuses, strict=True):
-        stop.status = status
-
-    assert await complete_route_if_finished(db_session, route=route) is closed
-    assert route.status is (RouteStatus.DONE if closed else RouteStatus.IN_PROGRESS)
-
-
-async def test_complete_route_if_finished_leaves_a_paused_route_alone(
-    db_session: AsyncSession,
-) -> None:
-    worker, points = await _seed(db_session, n_points=1)
-    route = await make_route(
-        db_session, worker=worker, day=_ROUTE_DATE, points=points, status=RouteStatus.PAUSED
-    )
-    route.stops[0].status = RouteStopStatus.RELEASED
-
-    assert await complete_route_if_finished(db_session, route=route) is False
-    assert route.status is RouteStatus.PAUSED

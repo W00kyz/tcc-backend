@@ -16,6 +16,7 @@ from app.core.jwt import decode_token
 from app.db.session import get_db
 from app.domain.catalog.models import FieldWorker, FieldWorkerStatus
 from app.domain.identity.models import User, UserRole
+from app.domain.privacy.service import has_consented
 
 _bearer_scheme = HTTPBearer(auto_error=True)
 
@@ -76,7 +77,33 @@ async def get_approved_worker(
 ApprovedWorker = Annotated[FieldWorker, Depends(get_approved_worker)]
 
 
-def get_campus_today() -> date:
+async def ensure_location_consent(db: AsyncSession, worker: FieldWorker) -> None:
+    """403 until the worker has accepted the current privacy notice: no location data is
+    accepted before that (RNF10).
+
+    Example: ``await ensure_location_consent(db, worker)``
+    """
+    if not await has_consented(db, user_id=worker.user_id):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Consent to the current privacy notice is required before location data can be "
+            "collected.",
+        )
+
+
+def get_now() -> datetime:
+    """The current instant (aware, UTC). A dependency so tests can pin the clock; campus rules
+    read it through `app.core.campus_clock`.
+
+    Example: ``async def endpoint(now: Now) -> ...``
+    """
+    return datetime.now(UTC)
+
+
+Now = Annotated[datetime, Depends(get_now)]
+
+
+def get_campus_today(now: Now) -> date:
     """Today on campus, the day a route belongs to. A dependency so tests can pin the clock.
 
     `date.today()` in the API container is the UTC date, already tomorrow from 21:00 in
@@ -85,7 +112,7 @@ def get_campus_today() -> date:
 
     Example: ``async def endpoint(today: CampusToday) -> ...``
     """
-    return campus_today(datetime.now(UTC))
+    return campus_today(now)
 
 
 CampusToday = Annotated[date, Depends(get_campus_today)]

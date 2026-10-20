@@ -107,13 +107,13 @@ async def test_field_worker_sees_only_their_own_route(
     response = client.get("/routes/me", headers=_auth(token))
 
     assert response.status_code == 200
-    body = response.json()
-    assert [route["id"] for route in body] == [str(own.id)]
-    assert len(body[0]["stops"]) == 1
-    assert body[0]["field_worker_name"] == "João da Silva"
+    route = response.json()["route"]
+    assert route["id"] == str(own.id)
+    assert len(route["stops"]) == 1
+    assert route["field_worker_name"] == "João da Silva"
 
 
-async def test_routes_me_defaults_to_today_and_includes_geometry(
+async def test_routes_me_is_todays_route_with_geometry(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
@@ -133,10 +133,11 @@ async def test_routes_me_defaults_to_today_and_includes_geometry(
     response = client.get("/routes/me", headers=_auth(token))
 
     assert response.status_code == 200
-    body = response.json()
-    assert [route["id"] for route in body] == [str(today_route.id)]  # yesterday's is excluded
-    assert isinstance(body[0]["stops"][1]["leg_geometry"], list)
-    assert body[0]["routing_degraded"] is False
+    route = response.json()["route"]
+    assert route["id"] == str(today_route.id)  # yesterday's is excluded
+    assert isinstance(route["stops"][1]["leg_geometry"], list)
+    assert route["routing_degraded"] is False
+    assert route["current_batch"] == 1
 
 
 async def test_route_stop_out_carries_batch_and_release_reason(
@@ -151,7 +152,7 @@ async def test_route_stop_out_carries_batch_and_release_reason(
     await db_session.commit()
     token = _login(client, worker_user.email)
 
-    stops = client.get("/routes/me", headers=_auth(token)).json()[0]["stops"]
+    stops = client.get("/routes/me", headers=_auth(token)).json()["route"]["stops"]
 
     assert [stop["batch_number"] for stop in stops] == [1, 1]
     assert [stop["release_reason"] for stop in stops] == [None, "LEFT_CAMPUS"]
@@ -198,7 +199,7 @@ async def test_routes_me_embeds_the_active_form_per_stop(
     response = client.get("/routes/me", headers=_auth(token))
 
     assert response.status_code == 200
-    stops = response.json()[0]["stops"]
+    stops = response.json()["route"]["stops"]
 
     assert stops[0]["service_type_name"] == "Limpeza"
     assert stops[0]["service_type_id"] == str(published_type.id)
@@ -211,22 +212,6 @@ async def test_routes_me_embeds_the_active_form_per_stop(
 
     assert stops[2]["service_type_name"] == "Jardinagem"
     assert stops[2]["form"] is None  # only a draft version exists
-
-
-async def test_routes_me_filters_by_date(client: TestClient, db_session: AsyncSession) -> None:
-    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
-    tomorrow = today_on_campus() + timedelta(days=1)
-    await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points[:1])
-    await make_route(db_session, worker=workers[0], day=tomorrow, points=points[1:2])
-    await db_session.commit()
-    token = _login(client, worker_user.email)
-
-    response = client.get(f"/routes/me?date={tomorrow.isoformat()}", headers=_auth(token))
-
-    assert response.status_code == 200
-    body = response.json()
-    assert len(body) == 1
-    assert body[0]["route_date"] == tomorrow.isoformat()
 
 
 async def test_routes_me_follows_the_campus_day_not_the_server_date(
@@ -246,7 +231,7 @@ async def test_routes_me_follows_the_campus_day_not_the_server_date(
 
     response = client.get("/routes/me", headers=_auth(token))
 
-    assert [route["id"] for route in response.json()] == [str(campus_day_route.id)]
+    assert response.json()["route"]["id"] == str(campus_day_route.id)
 
 
 # --- GET /routes, GET /routes/{id} (manager) -------------------------------------------
