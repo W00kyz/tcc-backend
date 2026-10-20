@@ -134,6 +134,7 @@ async def test_pending_worker_can_login_and_sees_status(
 
     assert body["worker_status"] == "PENDING_APPROVAL"
     assert body["rejection_reason"] is None
+    assert body["worker_active"] is True
 
 
 async def test_pending_worker_gets_403_on_routes_me(
@@ -165,6 +166,61 @@ async def test_rejected_worker_sees_reason(client: TestClient, db_session: Async
 
     assert body["worker_status"] == "REJECTED"
     assert body["rejection_reason"] == "Empresa não reconhecida"
+    assert body["worker_active"] is True
+
+
+async def test_deactivated_worker_logs_in_flagged_inactive(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    # Approved but switched off by the manager: the app must know before a 403 surprises it.
+    company = await _company(db_session)
+    await make_worker(db_session, company=company, email="ana@empresa.com", is_active=False)
+    await db_session.commit()
+
+    body = _login(client, "ana@empresa.com", "senha-forte-o-suficiente")
+
+    assert (body["worker_status"], body["worker_active"]) == ("APPROVED", False)
+
+
+async def test_refresh_reflects_an_approval_made_after_login(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await seed_privacy_notice(db_session)
+    company = await _company(db_session)
+    _register(client, company)
+    refresh_token = _login(client, "ana@empresa.com")["refresh_token"]
+    worker = await db_session.scalar(select(FieldWorker))
+    assert worker is not None
+    worker.status = FieldWorkerStatus.APPROVED
+    await db_session.commit()
+
+    response = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["worker_status"], body["rejection_reason"], body["worker_active"]) == (
+        "APPROVED",
+        None,
+        True,
+    )
+
+
+async def test_refresh_reflects_a_rejection_with_reason(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await seed_privacy_notice(db_session)
+    company = await _company(db_session)
+    _register(client, company)
+    refresh_token = _login(client, "ana@empresa.com")["refresh_token"]
+    worker = await db_session.scalar(select(FieldWorker))
+    assert worker is not None
+    worker.status = FieldWorkerStatus.REJECTED
+    worker.rejection_reason = "Documento ilegível"
+    await db_session.commit()
+
+    body = client.post("/auth/refresh", json={"refresh_token": refresh_token}).json()
+
+    assert (body["worker_status"], body["rejection_reason"]) == ("REJECTED", "Documento ilegível")
 
 
 async def test_deactivated_worker_gets_403(client: TestClient, db_session: AsyncSession) -> None:

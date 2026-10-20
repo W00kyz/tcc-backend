@@ -37,14 +37,21 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class TokenResponse(BaseModel):
+class WorkerStanding(BaseModel):
+    """Only for field workers (None for everyone else): a pending, rejected or deactivated
+    one still logs in, and the app reads here why it cannot work yet. Refresh carries it too,
+    so the app learns of an approval without a new login."""
+
+    worker_status: FieldWorkerStatus | None = None
+    rejection_reason: str | None = None
+    worker_active: bool | None = None
+
+
+class TokenResponse(WorkerStanding):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
     consent_required: bool
-    # Only for field workers: a pending or rejected one logs in to see where the approval stands.
-    worker_status: FieldWorkerStatus | None = None
-    rejection_reason: str | None = None
 
 
 class RegisterRequest(BaseModel):
@@ -74,9 +81,22 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
-class AccessTokenResponse(BaseModel):
+class AccessTokenResponse(WorkerStanding):
     access_token: str
     token_type: str = "bearer"
+
+
+async def _worker_standing(db: AsyncSession, user: User) -> WorkerStanding:
+    if user.role != UserRole.FIELD_WORKER:
+        return WorkerStanding()
+    worker = await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
+    if worker is None:
+        return WorkerStanding()
+    return WorkerStanding(
+        worker_status=worker.status,
+        rejection_reason=worker.rejection_reason,
+        worker_active=worker.is_active,
+    )
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -94,11 +114,7 @@ async def login(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid e-mail or password.")
 
     consent_required = not await has_consented(db, user_id=user.id)
-    worker = (
-        await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
-        if user.role == UserRole.FIELD_WORKER
-        else None
-    )
+    standing = await _worker_standing(db, user)
 
     return TokenResponse(
         access_token=create_access_token(
@@ -111,8 +127,7 @@ async def login(
             user_id=user.id, secret=settings.jwt_secret_key, days=settings.jwt_refresh_token_days
         ),
         consent_required=consent_required,
-        worker_status=worker.status if worker else None,
-        rejection_reason=worker.rejection_reason if worker else None,
+        **standing.model_dump(),
     )
 
 
@@ -175,13 +190,15 @@ async def refresh(
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found or inactive.")
 
+    standing = await _worker_standing(db, user)
     return AccessTokenResponse(
         access_token=create_access_token(
             user_id=user.id,
             role=user.role,
             secret=settings.jwt_secret_key,
             minutes=settings.jwt_access_token_minutes,
-        )
+        ),
+        **standing.model_dump(),
     )
 
 
