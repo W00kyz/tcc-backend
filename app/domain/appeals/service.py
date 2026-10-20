@@ -226,9 +226,10 @@ async def _announce(
     await notify_appeal_filed(db, appeal_id=appeal.id, description=description, push=push)
 
 
-# Everything the lists show: the worker, and the stop's point, floor and building.
+# Everything the lists show: the worker, the reviewer, and the stop's point, floor and building.
 _LIST_OPTIONS = (
     selectinload(Appeal.field_worker),
+    selectinload(Appeal.reviewer),
     selectinload(Appeal.route_stop)
     .selectinload(RouteStop.service_point)
     .selectinload(ServicePoint.floor)

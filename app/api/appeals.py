@@ -80,6 +80,8 @@ class AppealOut(BaseModel):
     status: AppealStatus
     filed_at: datetime
     reviewed_at: datetime | None
+    # The deciding manager's display name; None while the appeal is PENDING.
+    reviewed_by_name: str | None
     review_note: str | None
 
 
@@ -122,6 +124,7 @@ def _to_out(appeal: Appeal) -> AppealOut:
         status=appeal.status,
         filed_at=appeal.created_at,
         reviewed_at=appeal.reviewed_at,
+        reviewed_by_name=appeal.reviewer.name if appeal.reviewer is not None else None,
         review_note=appeal.review_note,
     )
 

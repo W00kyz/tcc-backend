@@ -153,6 +153,7 @@ async def test_file_appeal_and_replay(client: TestClient, db_session: AsyncSessi
     assert body["release_reason"] == "LEFT_CAMPUS"
     assert body["released_at"] == "2026-10-20T12:00:00Z"
     assert body["reviewed_at"] is None
+    assert body["reviewed_by_name"] is None
     assert body["review_note"] is None
     assert replay.status_code == 201, replay.text
     assert replay.json()["id"] == body["id"]
@@ -236,6 +237,8 @@ async def test_manager_lists_pending_first_and_filters(
     assert every.status_code == 200, every.text
     assert [appeal["id"] for appeal in every.json()] == [filed["id"]]
     assert [appeal["id"] for appeal in pending.json()] == [filed["id"]]
+    # Nobody has decided a pending appeal yet.
+    assert pending.json()[0]["reviewed_by_name"] is None
     assert rejected.json() == []
 
 
@@ -267,6 +270,9 @@ async def test_accept_then_review_again_conflicts(
     assert accepted.json()["status"] == "ACCEPTED"
     assert accepted.json()["review_note"] == "Conferido."
     assert accepted.json()["reviewed_at"] == "2026-10-20T13:00:00Z"
+    assert accepted.json()["reviewed_by_name"] == "Larissa"
+    listed = client.get("/appeals", params={"status": "ACCEPTED"}, headers=manager).json()
+    assert [appeal["reviewed_by_name"] for appeal in listed] == ["Larissa"]
     assert again.status_code == 409, again.text
     assert again.json()["detail"]["code"] == "ALREADY_REVIEWED"
 
@@ -285,6 +291,7 @@ async def test_reject_with_a_note(client: TestClient, db_session: AsyncSession) 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "REJECTED"
     assert response.json()["review_note"] == "Sem registro."
+    assert response.json()["reviewed_by_name"] == "Larissa"
 
 
 async def test_review_of_an_unknown_appeal_is_404(

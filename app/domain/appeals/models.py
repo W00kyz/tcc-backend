@@ -16,6 +16,7 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 if TYPE_CHECKING:
     from app.domain.catalog.models import FieldWorker
+    from app.domain.identity.models import User
     from app.domain.routing.models import RouteStop
 
 
@@ -67,3 +68,5 @@ class Appeal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Read-only lookups for the lists, one-directional like Impediment's.
     route_stop: Mapped["RouteStop"] = relationship()
     field_worker: Mapped["FieldWorker"] = relationship()
+    # The manager who decided; an APPEAL execution has no evidence, so this is its audit trail.
+    reviewer: Mapped["User | None"] = relationship()
