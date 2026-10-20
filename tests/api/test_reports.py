@@ -65,9 +65,12 @@ async def _seed(db: AsyncSession) -> _Seed:
     point = ServicePoint(
         floor_id=floor.id, name="Sala 101", description="x", latitude=-7.2, longitude=-35.9
     )
+    other_point = ServicePoint(
+        floor_id=floor.id, name="Sala 102", description="x", latitude=-7.2, longitude=-35.9
+    )
     worker_a = FieldWorker(full_name="Ana Costa", contractor_company_id=company.id)
     worker_b = FieldWorker(full_name="Bruno Dias", contractor_company_id=company.id)
-    db.add_all([point, worker_a, worker_b])
+    db.add_all([point, other_point, worker_a, worker_b])
     await db.flush()
     seed.worker_a = worker_a.id
     seed.worker_b = worker_b.id
@@ -83,33 +86,37 @@ async def _seed(db: AsyncSession) -> _Seed:
                 service_point_id=point.id,
                 service_type_id=service_type.id,
                 order_index=0,
+                batch_number=1,
+                service_date=r1.route_date,
                 status=RouteStopStatus.DONE,
             ),
             RouteStop(
                 route_id=r1.id,
-                service_point_id=point.id,
+                service_point_id=other_point.id,
                 service_type_id=service_type.id,
                 order_index=1,
+                batch_number=1,
+                service_date=r1.route_date,
                 status=RouteStopStatus.PENDING,
             ),
         ]
     )
 
-    # R2 — worker A, 2026-09-04, CANCELLED, no stops.
+    # R2 — worker A, 2026-09-04, PAUSED, no stops.
     db.add(
         Route(
             field_worker_id=worker_a.id,
             route_date=date(2026, 9, 4),
-            status=RouteStatus.CANCELLED,
+            status=RouteStatus.PAUSED,
         )
     )
 
-    # R3 — worker B, 2026-09-05, PLANNED, no stops.
+    # R3 — worker B, 2026-09-05, IN_PROGRESS, no stops.
     db.add(
         Route(
             field_worker_id=worker_b.id,
             route_date=date(2026, 9, 5),
-            status=RouteStatus.PLANNED,
+            status=RouteStatus.IN_PROGRESS,
         )
     )
     await db.commit()
@@ -148,7 +155,7 @@ async def test_compliance_json_happy_path(client: TestClient, db_session: AsyncS
     starts = [p["period_start"] for p in body["periods"]]
     assert starts == ["2026-09-03", "2026-09-04", "2026-09-05"]
     assert body["totals"]["routes_total"] == 3
-    assert body["totals"]["routes_cancelled"] == 1
+    assert body["totals"]["routes_completed"] == 1
     assert body["totals"]["stops_total"] == 2
     assert body["totals"]["stops_done"] == 1
     assert body["totals"]["completion_rate"] == 0.5

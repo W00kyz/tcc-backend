@@ -1,12 +1,11 @@
-"""Route start (RF34), check-in (RF29), check-out (RF31), manager manual completion (RF33).
-Check-in is floor-QR-first: the QR identifies a floor, `resolve_room` picks the room from
-the worker's PENDING stops there, and the five anti-fraud layers (signature, QR status, GPS
-radius, room match, schedule window) attach flags without blocking a reviewable check-in
-(spec §4.2, §4.4).
+"""Check-in (RF29) and check-out (RF31). Check-in is floor-QR-first: the QR identifies a
+floor, `resolve_room` picks the room from the worker's PENDING stops there, and the anti-fraud
+layers (signature, QR status, GPS radius, room match, clock skew) attach flags without blocking
+a reviewable check-in (spec §4.2, §4.4). The schedule-window layer went with the planned arrival
+windows (spec 2026-10-20-alocacao-automatica §2.1).
 
 DO NOT CHANGE: this module is the documented exception to "service layer flushes, never
-commits" — check-in/check-out/manual-completion each own and commit a transaction, as
-`start_route` already does."""
+commits" — check-in and check-out each own and commit a transaction."""
 
 import uuid
 from collections.abc import Sequence
@@ -26,42 +25,20 @@ from app.domain.execution.models import (
     ExecutionReviewStatus,
     ExecutionSource,
     GeoValidation,
-    ManualCompletion,
     QrScan,
     QrScanKind,
 )
 from app.domain.execution.validation import (
     FLAG_QR_SUPERSEDED,
     Candidate,
-    ScheduleWindow,
     clock_skew_flag,
     resolve_room,
-    schedule_flag,
 )
 from app.domain.forms.models import FormVersion, FormVersionStatus
 from app.domain.qr.crypto import QrPayload, decode_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
-from app.domain.routing.models import (
-    Route,
-    RouteStatus,
-    RouteStop,
-    RouteStopStatus,
-    StopAssignment,
-    StopAssignmentOutcome,
-)
+from app.domain.routing.models import Route, RouteStop, RouteStopStatus
 from app.domain.routing.service import complete_route_if_finished
-
-
-class RouteAlreadyStarted(Exception):
-    pass
-
-
-class RouteNotStartable(Exception):
-    """The route is CANCELLED (or DONE) — a worker cannot start it (spec §3 Ruling 4)."""
-
-
-class RouteCancelled(Exception):
-    """The route was cancelled — it can no longer take check-ins or completions."""
 
 
 class QrSignatureInvalid(Exception):
@@ -102,46 +79,14 @@ class RouteNotStarted(Exception):
     pass
 
 
-class StopAlreadyDone(Exception):
-    pass
-
-
-class StopAlreadyManuallyCompleted(Exception):
-    """A `manual_completions` row already exists for this stop (its unique constraint)."""
-
-
 class NoOpenCheckIn(Exception):
     """Check-out found no IN_PROGRESS stop with an open execution on the scanned floor."""
-
-
-class StopNotOnRoute(Exception):
-    """The `stop` passed to `complete_manually` does not belong to the given `route`."""
 
 
 class FormVersionMismatch(Exception):
     """The check-out's `form_version_id`/`answers` do not fit the stop (Ruling 7): missing one
     of the pair, a non-PUBLISHED version, the wrong service type's form, or a stop with no
     service type at all."""
-
-
-async def start_route(
-    db: AsyncSession, *, route: Route, latitude: float, longitude: float, started_at: datetime
-) -> Route:
-    if route.started_at is not None:
-        raise RouteAlreadyStarted(f'Route "{route.id}" was already started at {route.started_at}.')
-    if route.status != RouteStatus.PLANNED:
-        # PLANNED is the only startable state — CANCELLED/DONE routes never move to IN_PROGRESS
-        # (spec §3 Ruling 4). IN_PROGRESS is already ruled out by the started_at guard above.
-        raise RouteNotStartable(
-            f'Route "{route.id}" is {route.status.value} and cannot be started; expected PLANNED.'
-        )
-
-    route.started_at = started_at
-    route.start_latitude = latitude
-    route.start_longitude = longitude
-    route.status = RouteStatus.IN_PROGRESS
-    await db.commit()
-    return route
 
 
 async def check_in(
@@ -192,7 +137,7 @@ async def check_in(
     resolved = resolution.resolved
     stop = stops[resolved.route_stop_id]
     skew_flags = clock_skew_flag(client_clock_offset_seconds)
-    flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags, skew_flags)
+    flags = _merge_flags(resolution.flags, qr_flags, skew_flags)
 
     now = datetime.now(UTC)
     execution = Execution(
@@ -247,7 +192,7 @@ async def check_out(
     answers: list[AnswerIn] | None = None,
 ) -> Execution:
     """Close the open check-in on the scanned floor: sets `checked_out_at`, merges any new
-    flags into the execution, marks the stop DONE and its assignment EXECUTED. `execution_id`
+    flags into the execution and marks the stop DONE. `execution_id`
     is accepted for API symmetry with check-in but ignored here — check-out resolves the open
     execution by floor, it does not create one. `client_clock_offset_seconds` still flags
     implausible skew."""
@@ -286,9 +231,7 @@ async def check_out(
 
     previous_flags = set(execution.validation_flags)
     skew_flags = clock_skew_flag(client_clock_offset_seconds)
-    checkout_flags = _merge_flags(
-        resolution.flags, _schedule_flags(stop, scanned_at), qr_flags, skew_flags
-    )
+    checkout_flags = _merge_flags(resolution.flags, qr_flags, skew_flags)
     if skew_flags and execution.clock_skew_seconds is None:
         execution.clock_skew_seconds = client_clock_offset_seconds
     merged = previous_flags | set(checkout_flags)
@@ -315,78 +258,9 @@ async def check_out(
         )
     )
     stop.status = RouteStopStatus.DONE
-    await _mark_assignment_executed(db, stop.id)
     await _persist_answers(
         db, execution=execution, stop=stop, form_version_id=form_version_id, answers=answers
     )
-    await complete_route_if_finished(db, route=route)
-    await db.commit()
-    return execution
-
-
-async def complete_manually(
-    db: AsyncSession,
-    *,
-    route: Route,
-    stop: RouteStop,
-    actor_id: uuid.UUID,
-    reason: str,
-    completed_at: datetime,
-) -> Execution:
-    """Manager closes a stop the worker could not (RF33) with an audited `manual_completions`
-    row. An IN_PROGRESS stop's open check-in `Execution` is closed in place (no orphan row);
-    a PENDING stop gets a synthetic MANAGER_MANUAL execution. No QR scan either way."""
-    if stop.route_id != route.id:
-        raise StopNotOnRoute(
-            f'Route stop "{stop.id}" belongs to route "{stop.route_id}", not "{route.id}".'
-        )
-    already_manual = await db.scalar(
-        select(ManualCompletion).where(ManualCompletion.route_stop_id == stop.id)
-    )
-    if already_manual is not None:
-        raise StopAlreadyManuallyCompleted(
-            f'Route stop "{stop.id}" was already completed manually.'
-        )
-    if stop.status is RouteStopStatus.DONE:
-        raise StopAlreadyDone(f'Route stop "{stop.id}" is already DONE.')
-    if route.status is RouteStatus.CANCELLED:
-        raise RouteCancelled(f'Route "{route.id}" was cancelled and cannot be completed.')
-
-    now = datetime.now(UTC)
-    open_checkin = await db.scalar(
-        select(Execution).where(
-            Execution.route_stop_id == stop.id, Execution.checked_out_at.is_(None)
-        )
-    )
-    if open_checkin is not None:
-        open_checkin.checked_out_at = completed_at
-        execution = open_checkin
-    else:
-        execution = Execution(
-            route_stop_id=stop.id,
-            field_worker_id=route.field_worker_id,
-            checked_in_at=completed_at,
-            checked_out_at=completed_at,
-            synced_at=now,
-            source=ExecutionSource.MANAGER_MANUAL,
-            idempotency_key=uuid.uuid4(),
-            review_status=ExecutionReviewStatus.NONE,
-            validation_flags=[],
-        )
-        db.add(execution)
-        await db.flush()
-
-    db.add(
-        ManualCompletion(
-            route_stop_id=stop.id,
-            execution_id=execution.id,
-            completed_by=actor_id,
-            reason=reason,
-            completed_at=completed_at,
-        )
-    )
-    stop.status = RouteStopStatus.DONE
-    await _mark_assignment_executed(db, stop.id)
     await complete_route_if_finished(db, route=route)
     await db.commit()
     return execution
@@ -436,8 +310,6 @@ async def _persist_answers(
 
 
 def _guard_route(route: Route, worker_id: uuid.UUID, *, require_started: bool) -> None:
-    if route.status is RouteStatus.CANCELLED:
-        raise RouteCancelled(f'Route "{route.id}" was cancelled and cannot take check-ins.')
     if route.field_worker_id != worker_id:
         raise StopNotAssignedToWorker(f'Route "{route.id}" is not on worker "{worker_id}"\'s list.')
     if require_started and route.started_at is None:
@@ -557,13 +429,6 @@ async def _load_open_checkins(
     ]
 
 
-def _schedule_flags(stop: RouteStop, scanned_at: datetime) -> list[str]:
-    window = ScheduleWindow(
-        arrival_from=stop.expected_arrival_from, arrival_to=stop.expected_arrival_to
-    )
-    return schedule_flag(window, scanned_at)
-
-
 def _merge_flags(*groups: Sequence[str]) -> list[str]:
     merged: set[str] = set()
     for group in groups:
@@ -594,14 +459,3 @@ def _build_scan(
         latitude=latitude,
         longitude=longitude,
     )
-
-
-async def _mark_assignment_executed(db: AsyncSession, route_stop_id: uuid.UUID) -> None:
-    assignment = await db.scalar(
-        select(StopAssignment)
-        .where(StopAssignment.route_stop_id == route_stop_id)
-        .order_by(StopAssignment.sequence.desc())
-        .limit(1)
-    )
-    if assignment is not None:
-        assignment.outcome = StopAssignmentOutcome.EXECUTED

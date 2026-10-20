@@ -1,17 +1,14 @@
-"""Impediment service (Task 2) — report, PENDING queue and dismiss, over the `db_session`
-fixture (spec RF16-RF21, Etapa 8)."""
+"""Impediment service (Task 2) — report and the PENDING queue, over the `db_session` fixture
+(spec RF16-RF17, Etapa 8)."""
 
-import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from app.domain.impediments.models import ImpedimentReason, ImpedimentScope
+from app.domain.impediments.models import ImpedimentReason, ImpedimentScope, ImpedimentStatus
 from app.domain.impediments.service import (
-    AlreadyResolved,
     RouteNotInProgress,
     StopNotReassignable,
     create_impediment,
-    dismiss_impediment,
     list_pending,
 )
 from app.domain.routing.models import Route, RouteStatus, RouteStopStatus
@@ -53,7 +50,7 @@ async def test_create_impediment_stop_scope_rejects_route_not_in_progress(
     stop, worker = await seed_route_with_one_stop(db_session)
     route = await db_session.get(Route, stop.route_id)
     assert route is not None
-    route.status = RouteStatus.PLANNED
+    route.status = RouteStatus.PAUSED
     await db_session.flush()
 
     with pytest.raises(RouteNotInProgress):
@@ -149,7 +146,7 @@ async def test_create_impediment_route_remainder_scope_rejects_route_not_in_prog
     stop, worker = await seed_route_with_one_stop(db_session)
     route = await db_session.get(Route, stop.route_id)
     assert route is not None
-    route.status = RouteStatus.CANCELLED
+    route.status = RouteStatus.DONE
     await db_session.flush()
 
     with pytest.raises(RouteNotInProgress):
@@ -203,55 +200,9 @@ async def test_list_pending_returns_only_pending_ordered_oldest_first(
         reported_by_id=worker.id,
         reported_at=now - timedelta(hours=2),
     )
-    actor_id = worker.user_id or uuid.uuid4()
-    await dismiss_impediment(db_session, impediment=resolved, actor_id=actor_id)
+    resolved.status = ImpedimentStatus.RESOLVED
+    await db_session.flush()
 
     pending = await list_pending(db_session)
 
     assert [p.id for p in pending] == [older.id, newer.id]
-
-
-async def test_dismiss_impediment_marks_resolved(db_session: AsyncSession) -> None:
-    stop, worker = await seed_route_with_one_stop(db_session)
-    route = await db_session.get(Route, stop.route_id)
-    assert route is not None
-    impediment = await create_impediment(
-        db_session,
-        route=route,
-        route_stop=stop,
-        scope=ImpedimentScope.STOP,
-        reason=ImpedimentReason.OTHER,
-        note=None,
-        reported_by_id=worker.id,
-        reported_at=datetime.now(UTC),
-    )
-    actor_id = worker.user_id
-    assert actor_id is not None
-
-    resolved = await dismiss_impediment(db_session, impediment=impediment, actor_id=actor_id)
-
-    assert resolved.status.value == "RESOLVED"
-    assert resolved.resolved_by == actor_id
-    assert resolved.resolved_at is not None
-
-
-async def test_dismiss_impediment_twice_raises_already_resolved(db_session: AsyncSession) -> None:
-    stop, worker = await seed_route_with_one_stop(db_session)
-    route = await db_session.get(Route, stop.route_id)
-    assert route is not None
-    impediment = await create_impediment(
-        db_session,
-        route=route,
-        route_stop=stop,
-        scope=ImpedimentScope.STOP,
-        reason=ImpedimentReason.OTHER,
-        note=None,
-        reported_by_id=worker.id,
-        reported_at=datetime.now(UTC),
-    )
-    actor_id = worker.user_id
-    assert actor_id is not None
-    await dismiss_impediment(db_session, impediment=impediment, actor_id=actor_id)
-
-    with pytest.raises(AlreadyResolved):
-        await dismiss_impediment(db_session, impediment=impediment, actor_id=actor_id)

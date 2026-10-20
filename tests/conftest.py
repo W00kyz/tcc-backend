@@ -13,6 +13,7 @@ from app.core.mail import RecordingMailer
 from app.db.base import Base
 from app.db.session import build_engine, build_session_factory
 from fastapi.testclient import TestClient
+from sqlalchemy import make_url
 from testcontainers.postgres import PostgresContainer
 
 # app.main builds a module-level FastAPI singleton at import time (`app = create_app()`), which
@@ -27,6 +28,7 @@ os.environ.setdefault("QR_SIGNING_PRIVATE_KEY_HEX", "00" * 32)
 
 from app.main import create_app
 
+from tests.support.migrations import clone_database, create_template_database, drop_database
 from tests.support.object_store import FakeObjectStore
 
 _POSTGIS_IMAGE = (
@@ -44,6 +46,22 @@ def postgres_url() -> Iterator[str]:
         alembic_cfg.attributes["sqlalchemy_url"] = url
         command.upgrade(alembic_cfg, "head")
         yield url
+
+
+@pytest.fixture(scope="session")
+def _pre_reset_template(postgres_url: str) -> Iterator[str]:
+    name = create_template_database(postgres_url)
+    yield name
+    drop_database(postgres_url, name)
+
+
+@pytest.fixture
+def pre_reset_database_url(postgres_url: str, _pre_reset_template: str) -> Iterator[str]:
+    """A throwaway database at `LAST_REVERSIBLE_REVISION`, for the migration tests — the shared
+    session database is at head and cannot be downgraded past the allocation reset."""
+    url = clone_database(postgres_url, _pre_reset_template)
+    yield url
+    drop_database(postgres_url, str(make_url(url).database))
 
 
 @pytest.fixture

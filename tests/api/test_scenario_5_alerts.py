@@ -1,15 +1,16 @@
-"""Cenário 5 ponta a ponta — verificação periódica, alerta de atraso e board em tempo real
-(requisitos §7.5, design §2 Ruling 10).
+"""Cenário 5 ponta a ponta — verificação periódica, alerta e board em tempo real (requisitos
+§7.5, design §2 Ruling 10).
 
-The etapa deliverable: the periodic scan spots a stop that blew past its arrival window,
-records ONE `LATE_STOP` alert with a severity and a description, fans a notification out to
-the manager, and the alert shows up on the live board without a refresh; the manager then
-acknowledges it and the very next board frame reflects that. Every hop runs against the real
-Postgres/PostGIS testcontainer — `run_alert_scan` and `acknowledge` through a real HTTP
-request, the SSE body driven directly.
+The etapa deliverable: the periodic scan spots a stop done through the app with no evidence,
+records ONE `NO_EVIDENCE` alert with a severity and a description (INFO, so nobody is paged),
+and the alert shows up on the live board without a refresh; the manager then acknowledges it
+and the very next board frame reflects that. (The schedule-based LATE_STOP alert of the
+original scenario went with the planned arrival windows, spec 2026-10-20-alocacao-automatica.)
+Every hop runs against the real Postgres/PostGIS testcontainer — `run_alert_scan` and
+`acknowledge` through a real HTTP request, the SSE body driven directly.
 
 What stays out of scope for pytest (manual author steps, same treatment as
-`tests/api/test_checkin_timing.py` and `tests/api/test_scenario_4_reassignment.py`):
+`tests/api/test_checkin_timing.py`):
 - the dashboard client and the "sem refresh" experience on a real browser — httpx's
   ASGITransport buffers the whole response and cannot drive an open-ended SSE stream, so the
   generator (`board_event_stream`) is exercised directly against the app's real session
@@ -23,6 +24,7 @@ select it with `uv run pytest -m slow`.
 
 import asyncio
 import json
+import uuid
 from collections.abc import AsyncGenerator, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -36,17 +38,18 @@ from app.core.mail import RecordingMailer
 from app.core.security import hash_password
 from app.db.session import build_engine, build_session_factory
 from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
+from app.domain.execution.models import Execution, ExecutionSource
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity, AlertStatus, Notification
 from app.domain.monitoring.scan import run_alert_scan
-from app.domain.routing.models import Route, RouteStatus, RouteType
-from app.domain.routing.service import StopInput, create_route
+from app.domain.routing.models import Route, RouteStopStatus
 from app.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.support.clock import today_on_campus
+from tests.support.factories import make_route
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -138,20 +141,28 @@ async def _seed(db: AsyncSession) -> _Seed:
     db.add(point)
     await db.flush()
 
-    route = await create_route(
-        db,
-        field_worker_id=worker.id,
-        route_date=today_on_campus(),
-        route_type=RouteType.REGULAR,
-        scheduled_start_at=None,
-        stops=[StopInput(service_point_id=point.id)],
-        actor_id=manager.id,
-        osrm=FakeOsrmClient(),
+    # One stop of a two-stop batch (the route stays open, so the scan still looks at it)
+    # checked out through the app two hours ago with no evidence — well past the default
+    # 30 min `no_evidence_grace_min`, so NO_EVIDENCE fires on the first scan.
+    other = ServicePoint(
+        floor_id=floor.id, name="Ponto 1", description="Sala", latitude=-7.2, longitude=-35.9
     )
-    route.status = RouteStatus.IN_PROGRESS
-    # Well past the arrival window AND past the default 15 min `late_stop_tolerance_min`, so
-    # the LATE_STOP rule fires on the first scan.
-    route.stops[0].expected_arrival_to = datetime.now(UTC) - timedelta(hours=2)
+    db.add(other)
+    await db.flush()
+    route = await make_route(db, worker=worker, day=today_on_campus(), points=[point, other])
+    route.stops[0].status = RouteStopStatus.DONE
+    checked_out_at = datetime.now(UTC) - timedelta(hours=2)
+    db.add(
+        Execution(
+            route_stop_id=route.stops[0].id,
+            field_worker_id=worker.id,
+            checked_in_at=checked_out_at - timedelta(minutes=20),
+            checked_out_at=checked_out_at,
+            synced_at=checked_out_at,
+            source=ExecutionSource.APP,
+            idempotency_key=uuid.uuid4(),
+        )
+    )
     await db.flush()
     return _Seed(manager=manager, worker_user=worker_user, worker=worker, route=route)
 
@@ -195,7 +206,6 @@ async def test_periodic_scan_alerts_and_realtime_board_end_to_end(
     seed = await _seed(db_session)
     route_id = str(seed.route.id)
     stop_id = str(seed.route.stops[0].id)
-    manager_id = str(seed.manager.id)
     await db_session.commit()
 
     # --- Step 1: the periodic check identifies the violation and registers ONE alert --------
@@ -203,8 +213,8 @@ async def test_periodic_scan_alerts_and_realtime_board_end_to_end(
     assert len(inserted) == 1
     alert = inserted[0]
     alert_id = str(alert.id)
-    assert alert.kind is AlertKind.LATE_STOP
-    assert alert.severity is AlertSeverity.WARNING
+    assert alert.kind is AlertKind.NO_EVIDENCE
+    assert alert.severity is AlertSeverity.INFO
     assert alert.status is AlertStatus.OPEN
     assert alert.description.strip() != ""
     assert str(alert.route_id) == route_id
@@ -213,13 +223,11 @@ async def test_periodic_scan_alerts_and_realtime_board_end_to_end(
     alert_count = await db_session.scalar(select(func.count()).select_from(Alert))
     assert alert_count == 1
 
-    # --- Step 2: a notification reached the manager (and only the manager) ------------------
+    # --- Step 2: an INFO alert pages nobody (spec §2 Ruling 6) ------------------------------
     notifications = list(
         await db_session.scalars(select(Notification).where(Notification.kind == "ALERT"))
     )
-    assert len(notifications) == 1
-    assert str(notifications[0].user_id) == manager_id
-    assert notifications[0].data["alert_id"] == alert_id
+    assert notifications == []
 
     # --- Step 3: the scan is idempotent — a second pass adds nothing -----------------------
     again = await run_alert_scan(db_session, now=datetime.now(UTC))
@@ -229,7 +237,7 @@ async def test_periodic_scan_alerts_and_realtime_board_end_to_end(
         await db_session.scalar(
             select(func.count()).select_from(Notification).where(Notification.kind == "ALERT")
         )
-        == 1
+        == 0
     )
 
     # --- Step 4: the alert shows on the live board WITHOUT a refresh -----------------------
@@ -237,11 +245,10 @@ async def test_periodic_scan_alerts_and_realtime_board_end_to_end(
     try:
         board = await _next_board(stream)
         seeded = next(r for r in board["routes"] if r["route_id"] == route_id)
-        assert seeded["is_delayed"] is True
         assert seeded["open_alert_count"] >= 1
 
         on_board = next(a for a in board["open_alerts"] if a["id"] == alert_id)
-        assert on_board["kind"] == "LATE_STOP"
+        assert on_board["kind"] == "NO_EVIDENCE"
         assert on_board["status"] == "OPEN"
 
         # --- Step 5: the manager marks it handled -----------------------------------------
@@ -252,7 +259,7 @@ async def test_periodic_scan_alerts_and_realtime_board_end_to_end(
 
         # The next board frame reflects the acknowledgement: the OPEN count drops to 0 and the
         # alert now rides the board as ACKNOWLEDGED (`build_board` keeps OPEN+ACKNOWLEDGED in
-        # `open_alerts` but only OPEN feeds `open_alert_count` / the delay signal).
+        # `open_alerts` but only OPEN feeds `open_alert_count`).
         after_ack = await _next_board(stream)
         seeded_after = next(r for r in after_ack["routes"] if r["route_id"] == route_id)
         assert seeded_after["open_alert_count"] == 0

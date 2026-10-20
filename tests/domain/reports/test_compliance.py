@@ -10,7 +10,6 @@ import uuid
 from datetime import UTC, date, datetime
 
 import pytest
-from app.core.security import hash_password
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
@@ -25,9 +24,7 @@ from app.domain.execution.models import (
     Execution,
     ExecutionReviewStatus,
     ExecutionSource,
-    ManualCompletion,
 )
-from app.domain.identity.models import User, UserRole
 from app.domain.impediments.models import (
     Impediment,
     ImpedimentReason,
@@ -41,13 +38,7 @@ from app.domain.reports.compliance import (
     build_compliance_report,
 )
 from app.domain.reports.filters import ReportFilters
-from app.domain.routing.models import (
-    Route,
-    RouteStatus,
-    RouteStop,
-    RouteStopStatus,
-    StopAssignment,
-)
+from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -80,18 +71,12 @@ class _Ids:
 
 async def _seed(db: AsyncSession) -> _Ids:
     ids = _Ids()
-    user = User(
-        name="Gestor",
-        email=f"gestor-{uuid.uuid4()}@ufcg.edu.br",
-        password_hash=hash_password("senha-forte-o-suficiente"),
-        role=UserRole.MANAGER,
-    )
     company = ContractorCompany(name="Limpa Tudo", cnpj=str(uuid.uuid4().int)[:14])
     b1 = Building(name="Bloco CI", campus_area="CCT")
     b2 = Building(name="Bloco CN", campus_area="CCT")
     s1 = ServiceType(name="Varrição", average_duration_minutes=30)
     s2 = ServiceType(name="Coleta", average_duration_minutes=20)
-    db.add_all([user, company, b1, b2, s1, s2])
+    db.add_all([company, b1, b2, s1, s2])
     await db.flush()
     f1 = Floor(building_id=b1.id, label="Térreo")
     f2 = Floor(building_id=b2.id, label="Térreo")
@@ -128,6 +113,8 @@ async def _seed(db: AsyncSession) -> _Ids:
             service_point_id=point_id,
             service_type_id=service_type_id,
             order_index=order_index,
+            batch_number=1,
+            service_date=route.route_date,
             status=status,
         )
         db.add(stop)
@@ -182,29 +169,29 @@ async def _seed(db: AsyncSession) -> _Ids:
     )
     db.add(
         Alert(
-            kind=AlertKind.LATE_STOP,
-            severity=AlertSeverity.WARNING,
+            kind=AlertKind.NO_EVIDENCE,
+            severity=AlertSeverity.INFO,
             dedup_key=f"k-{uuid.uuid4()}",
             description="atraso",
             route_id=r1.id,
         )
     )
 
-    # R2 — 2026-08-28 (Fri), CANCELLED, not started. One PENDING stop in building 2 / type 1.
+    # R2 — 2026-08-28 (Fri), PAUSED, never started. One PENDING stop in building 2 / type 1.
     r2 = Route(
         field_worker_id=worker.id,
         route_date=date(2026, 8, 28),
-        status=RouteStatus.CANCELLED,
+        status=RouteStatus.PAUSED,
     )
     db.add(r2)
     await db.flush()
     await _stop(r2, p2.id, s1.id, RouteStopStatus.PENDING, 0)
 
-    # R3 — 2026-09-03 (Thu), PLANNED, no stops → routes but zero stops.
+    # R3 — 2026-09-03 (Thu), PAUSED, never started, no stops → routes but zero stops.
     r3 = Route(
         field_worker_id=worker.id,
         route_date=date(2026, 9, 3),
-        status=RouteStatus.PLANNED,
+        status=RouteStatus.PAUSED,
     )
     db.add(r3)
     await db.flush()
@@ -219,30 +206,11 @@ async def _seed(db: AsyncSession) -> _Ids:
     await db.flush()
     r4_s1 = await _stop(r4, p2.id, s2.id, RouteStopStatus.DONE, 0)
     await _stop(r4, p1.id, s1.id, RouteStopStatus.IN_PROGRESS, 1)
-    db.add_all(
-        [
-            StopAssignment(
-                route_stop_id=r4_s1.id, field_worker_id=worker.id, sequence=1, assigned_by=user.id
-            ),
-            StopAssignment(
-                route_stop_id=r4_s1.id, field_worker_id=worker.id, sequence=2, assigned_by=user.id
-            ),
-        ]
-    )
-    e3 = await _execution(r4_s1, date(2026, 9, 4), ExecutionReviewStatus.NONE)
-    db.add(
-        ManualCompletion(
-            route_stop_id=r4_s1.id,
-            execution_id=e3.id,
-            completed_by=user.id,
-            reason="offline",
-            completed_at=_clock(date(2026, 9, 4)),
-        )
-    )
+    await _execution(r4_s1, date(2026, 9, 4), ExecutionReviewStatus.NONE)  # no evidence
     db.add(
         Alert(
-            kind=AlertKind.LATE_STOP,
-            severity=AlertSeverity.WARNING,
+            kind=AlertKind.NO_EVIDENCE,
+            severity=AlertSeverity.INFO,
             dedup_key=f"k-{uuid.uuid4()}",
             description="atraso",
             route_id=r4.id,
@@ -286,7 +254,7 @@ _D2 = dict(  # noqa: C408
     routes_total=1,
     routes_started=0,
     routes_completed=0,
-    routes_cancelled=1,
+    routes_cancelled=0,
     stops_total=1,
     stops_done=0,
     stops_pending=1,
@@ -320,9 +288,9 @@ _D4 = dict(  # noqa: C408
     stops_total=2,
     stops_done=1,
     stops_pending=0,
-    stops_reassigned=1,
+    stops_reassigned=0,
     executions_total=1,
-    executions_with_evidence=1,
+    executions_with_evidence=0,
     executions_flagged=0,
     impediments_total=0,
     alerts_total=1,
@@ -376,7 +344,6 @@ async def test_weekly_metrics(db_session: AsyncSession) -> None:
         completion_rate=0.5,
     )
     assert report.totals.completion_rate == pytest.approx(2 / 5)
-    assert report.totals.stops_reassigned == 1
 
 
 async def test_monthly_metrics(db_session: AsyncSession) -> None:
@@ -457,20 +424,20 @@ async def test_building_filter_narrows_scope(db_session: AsyncSession) -> None:
     assert report.filters_applied.building_name == "Bloco CI"
 
 
-async def test_route_status_cancelled_filter(db_session: AsyncSession) -> None:
+async def test_route_status_paused_filter(db_session: AsyncSession) -> None:
     await _seed(db_session)
     filters = ReportFilters(
         date_from=date(2026, 8, 1),
         date_to=date(2026, 9, 30),
-        route_status=RouteStatus.CANCELLED.value,
+        route_status=RouteStatus.PAUSED.value,
     )
     report = await build_compliance_report(
         db_session, granularity=ReportGranularity.DAILY, filters=filters
     )
-    assert [r.period_start for r in report.periods] == [date(2026, 8, 28)]
+    assert [r.period_start for r in report.periods] == [date(2026, 8, 28), date(2026, 9, 3)]
     _assert_row(report.periods[0], "2026-08-28", date(2026, 8, 28), **_D2, completion_rate=0.0)
     # `filters_applied` is the human-readable struct (spec §2 Ruling 8) — pt-BR label, not enum.
-    assert report.filters_applied.route_status == "Cancelada"
+    assert report.filters_applied.route_status == "Pausada"
 
 
 def test_route_status_labels_cover_every_member() -> None:

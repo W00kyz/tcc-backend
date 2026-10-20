@@ -61,8 +61,8 @@ def _snapshot_digest(snapshot: BoardSnapshot) -> str:
 
 @router.get("/monitoring/board", response_model=BoardSnapshot)
 async def get_board(_actor: _Manager, db: _Db) -> BoardSnapshot:
-    """RF41 — the coloured route board: every open route with its derived `is_delayed` flag and
-    OPEN alert count, the board's alert list, and the latest GPS fix per worker."""
+    """RF41 — the route board: every open route with its OPEN alert count, the board's alert
+    list, and the latest GPS fix per worker."""
     return await build_board(db, now=datetime.now(UTC))
 
 
@@ -125,7 +125,7 @@ class AlertOut(BaseModel):
     kind: AlertKind
     severity: str
     description: str
-    route_id: UUID
+    route_id: UUID | None  # null for a day-level alert (POINTS_UNSERVED)
     route_stop_id: UUID | None
     field_worker_id: UUID | None
     status: AlertStatus

@@ -1,9 +1,9 @@
 """RF43 / RF44 — the manager execution-history surface: a filterable paginated list, a detail
-view bundling the scans / evidence / manual-completion, and review resolution.
+view bundling the scans / evidence / form answers, and review resolution.
 
 Transaction discipline: `history` flushes and this router owns `db.commit()`. The list and
 detail endpoints are pure reads; only `resolve_review` writes (the status change plus one
-`audit_trail` row, exactly as `complete_stop_manually` does).
+`audit_trail` row).
 """
 
 from datetime import date, datetime
@@ -88,12 +88,6 @@ class ExecutionEvidence(BaseModel):
     idempotency_key: UUID | None
 
 
-class ManualCompletionOut(BaseModel):
-    completed_by: UUID
-    reason: str
-    completed_at: datetime
-
-
 class AnswerOut(BaseModel):
     question_stable_key: str
     prompt: str | None  # null when the key is no longer in the recorded form version (Ruling 15)
@@ -102,31 +96,11 @@ class AnswerOut(BaseModel):
     question_type: str | None
 
 
-class ExecutionAssignmentOut(BaseModel):
-    """One row of the stop's append-only assignment chain (RF21), surfaced on the execution
-    detail so the manager panel (Task 8) can show who was originally designated and why the
-    stop moved. Named distinctly from `app.api.route_view.AssignmentOut`: FastAPI dedupes
-    OpenAPI component schemas by class name, so two different classes sharing one name would
-    silently clobber each other in the contract (Task 5 hit this)."""
-
-    field_worker_id: UUID
-    full_name: str
-    sequence: int
-    assigned_by_name: str
-    transfer_reason: str | None
-    outcome: str | None
-
-
 class ExecutionDetail(ExecutionListItem):
     scans: list[ExecutionScan]
     evidence: list[ExecutionEvidence]
-    manual_completion: ManualCompletionOut | None
     form_version_id: UUID | None
     answers: list[AnswerOut]
-    # Etapa 8 (RF21): `reassigned` is always present; `assignment_history` is the ordered chain,
-    # populated only when `reassigned` is True, else null.
-    reassigned: bool
-    assignment_history: list[ExecutionAssignmentOut] | None
 
 
 class ResolveReviewRequest(BaseModel):
@@ -157,7 +131,6 @@ def _to_item(row: ExecutionListRow) -> ExecutionListItem:
 
 def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
     item = _to_item(detail.execution)
-    completion = detail.manual_completion
     return ExecutionDetail(
         **item.model_dump(),
         scans=[
@@ -186,15 +159,6 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
             )
             for item_ in detail.evidence
         ],
-        manual_completion=(
-            ManualCompletionOut(
-                completed_by=completion.completed_by,
-                reason=completion.reason,
-                completed_at=completion.completed_at,
-            )
-            if completion is not None
-            else None
-        ),
         form_version_id=detail.form_version_id,
         answers=[
             AnswerOut(
@@ -205,22 +169,6 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
             )
             for a in detail.answers
         ],
-        reassigned=detail.reassigned,
-        assignment_history=(
-            [
-                ExecutionAssignmentOut(
-                    field_worker_id=a.field_worker_id,
-                    full_name=a.full_name,
-                    sequence=a.sequence,
-                    assigned_by_name=a.assigned_by_name,
-                    transfer_reason=a.transfer_reason,
-                    outcome=a.outcome,
-                )
-                for a in detail.assignment_history
-            ]
-            if detail.assignment_history is not None
-            else None
-        ),
     )
 
 

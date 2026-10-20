@@ -2,8 +2,8 @@
 
 `list_executions` builds one denormalised row per execution (worker, service point, building,
 floor, the check-in GPS verdict and the evidence count) with the RF44 filters applied
-conditionally; `get_execution_detail` adds the scans, evidence items and the manual-completion
-record; `resolve_review` closes a review flag.
+conditionally; `get_execution_detail` adds the scans, evidence items and the form answers;
+`resolve_review` closes a review flag.
 
 Transaction discipline: this module flushes, never commits — the endpoint owns the commit
 (only `execution/service.py` self-commits).
@@ -31,13 +31,11 @@ from app.domain.execution.models import (
     ExecutionReviewStatus,
     ExecutionSource,
     GeoValidation,
-    ManualCompletion,
     QrScan,
     QrScanKind,
 )
 from app.domain.forms.models import FormQuestion, FormVersion
-from app.domain.identity.models import User
-from app.domain.routing.models import RouteStop, RouteStopStatus, StopAssignment
+from app.domain.routing.models import RouteStop, RouteStopStatus
 
 
 class ReviewNotPending(Exception):  # noqa: N818 - names the condition the endpoint maps to 409
@@ -74,7 +72,7 @@ class ExecutionListRow:
     floor_label: str
     checked_in_at: datetime
     checked_out_at: datetime | None
-    geo_validation: str | None  # from the CHECK_IN scan; None for a MANAGER_MANUAL execution
+    geo_validation: str | None  # from the CHECK_IN scan; None for an execution without a scan
     review_status: str
     validation_flags: list[str]
     source: str
@@ -108,13 +106,6 @@ class ExecutionEvidenceRow:
 
 
 @dataclass(frozen=True)
-class ManualCompletionRow:
-    completed_by: UUID
-    reason: str
-    completed_at: datetime
-
-
-@dataclass(frozen=True)
 class AnswerDetailRow:
     question_stable_key: str
     prompt: str | None  # None when the key is no longer in the recorded form version (Ruling 15)
@@ -124,29 +115,12 @@ class AnswerDetailRow:
 
 
 @dataclass(frozen=True)
-class AssignmentDetailRow:
-    """One row of the stop's append-only `stop_assignments` chain (spec §3.4, RF21), mirroring
-    `app.api.route_view.AssignmentOut`. Surfaced on the execution detail only when the stop was
-    reassigned, so the manager panel (Task 8) can show who was originally designated and why."""
-
-    field_worker_id: UUID
-    full_name: str
-    sequence: int
-    assigned_by_name: str
-    transfer_reason: str | None
-    outcome: str | None
-
-
-@dataclass(frozen=True)
 class ExecutionDetailRow:
     execution: ExecutionListRow
     scans: list[ExecutionScanRow]
     evidence: list[ExecutionEvidenceRow]
-    manual_completion: ManualCompletionRow | None
     form_version_id: UUID | None
     answers: list[AnswerDetailRow]
-    reassigned: bool
-    assignment_history: list[AssignmentDetailRow] | None
 
 
 def _checkin_geo_subquery() -> ScalarSelect[Any]:
@@ -313,7 +287,6 @@ async def get_execution_detail(db: AsyncSession, execution_id: UUID) -> Executio
 
     form_version_id: UUID | None = row[0].form_version_id
     answers = await _load_answers(db, execution_id, form_version_id)
-    assignment_history = await _load_assignment_history(db, row[0].route_stop_id)
 
     scans = (
         await db.scalars(
@@ -327,71 +300,13 @@ async def get_execution_detail(db: AsyncSession, execution_id: UUID) -> Executio
             .order_by(EvidenceItem.captured_at)
         )
     ).all()
-    completion = await db.scalar(
-        select(ManualCompletion).where(ManualCompletion.execution_id == execution_id)
-    )
     return ExecutionDetailRow(
         execution=_to_list_row(*row),
         scans=[_to_scan_row(scan) for scan in scans],
         evidence=[_to_evidence_row(item) for item in evidence],
-        manual_completion=(
-            ManualCompletionRow(
-                completed_by=completion.completed_by,
-                reason=completion.reason,
-                completed_at=completion.completed_at,
-            )
-            if completion is not None
-            else None
-        ),
         form_version_id=form_version_id,
         answers=answers,
-        reassigned=assignment_history is not None,
-        assignment_history=assignment_history,
     )
-
-
-async def _load_assignment_history(
-    db: AsyncSession, route_stop_id: UUID
-) -> list[AssignmentDetailRow] | None:
-    """RF21 — the stop's append-only assignment chain, ordered by sequence, with the worker and
-    `assigned_by` ids resolved to display names via one batched query each (the same N+1
-    discipline as `app.api.route_view._resolve_assignment_names`). That helper is not reused: it
-    traverses a `Route` with eager-loaded `stop.assignments`, whereas this path works from a
-    flat `StopAssignment` list — a shared helper would need an awkward common shape for a two-
-    query saving. Returns None (no chain to surface) unless the stop was reassigned at least
-    once, i.e. more than one row."""
-    rows = (
-        await db.scalars(
-            select(StopAssignment)
-            .where(StopAssignment.route_stop_id == route_stop_id)
-            .order_by(StopAssignment.sequence)
-        )
-    ).all()
-    if len(rows) <= 1:
-        return None
-
-    worker_rows = await db.execute(
-        select(FieldWorker.id, FieldWorker.full_name).where(
-            FieldWorker.id.in_({r.field_worker_id for r in rows})
-        )
-    )
-    worker_names = {row.id: row.full_name for row in worker_rows}
-    user_rows = await db.execute(
-        select(User.id, User.name).where(User.id.in_({r.assigned_by for r in rows}))
-    )
-    user_names = {row.id: row.name for row in user_rows}
-
-    return [
-        AssignmentDetailRow(
-            field_worker_id=r.field_worker_id,
-            full_name=worker_names.get(r.field_worker_id, ""),
-            sequence=r.sequence,
-            assigned_by_name=user_names.get(r.assigned_by, ""),
-            transfer_reason=r.transfer_reason,
-            outcome=r.outcome.value if r.outcome is not None else None,
-        )
-        for r in rows
-    ]
 
 
 async def _load_answers(

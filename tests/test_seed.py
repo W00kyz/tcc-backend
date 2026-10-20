@@ -8,6 +8,7 @@ import pytest
 from app import seed as seed_module
 from app.core.config import get_settings
 from app.domain.identity.models import User
+from app.domain.routing.models import Route
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,3 +28,5 @@ async def test_seed_populates_a_fresh_database_and_is_idempotent(
 
     users = await db_session.scalar(select(func.count()).select_from(User))
     assert users == 3
+    # Routes come from the automatic allocation, never from the seed.
+    assert await db_session.scalar(select(func.count()).select_from(Route)) == 0

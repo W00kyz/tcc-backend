@@ -1,6 +1,6 @@
 """Removing a building or a service point takes its history with it (spec
 2026-10-20-predios-pontos-dialogs-design.md §3.4): route stops and everything hanging off them,
-routes left with no stop, template stops, and — for a building — floors and QR codes. Photo
+routes left with no stop, and — for a building — floors and QR codes. Photo
 objects are removed from storage once the rows are gone."""
 
 from typing import cast
@@ -10,8 +10,7 @@ from app.domain.catalog.models import Building, Floor, ServicePoint
 from app.domain.execution.models import EvidenceItem, Execution
 from app.domain.identity.models import UserRole
 from app.domain.qr.models import QrCode
-from app.domain.routing.models import Route, RouteStop, RouteType
-from app.domain.routing.templates import RouteTemplate, RouteTemplateStop, TemplateRecurrence
+from app.domain.routing.models import Route, RouteStop
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -90,22 +89,10 @@ async def test_deleting_a_point_removes_its_history_but_keeps_a_route_with_other
     assert _store(client).objects == {}
 
 
-async def test_deleting_the_only_point_of_a_route_and_a_template_deletes_them(
+async def test_deleting_the_only_point_of_a_route_deletes_the_route(
     client: TestClient, db_session: AsyncSession, test_settings: Settings
 ) -> None:
     seeded = await _seed_route(db_session, test_settings)
-    template = RouteTemplate(
-        name="Diária", recurrence=TemplateRecurrence.DAILY, route_type=RouteType.REGULAR
-    )
-    db_session.add(template)
-    await db_session.flush()
-    db_session.add(
-        RouteTemplateStop(
-            route_template_id=template.id, service_point_id=seeded.points[0].id, order_index=1
-        )
-    )
-    seeded.route.template_id = template.id
-    await db_session.commit()
     point_id, route_id = seeded.points[0].id, seeded.route.id
     await _executed_first_stop(client, db_session, seeded)
 
@@ -114,7 +101,6 @@ async def test_deleting_the_only_point_of_a_route_and_a_template_deletes_them(
     assert response.status_code == 204, response.text
     db_session.expire_all()
     assert await db_session.get(Route, route_id) is None
-    assert await _count(db_session, RouteTemplate) == 0
 
 
 async def test_deleting_a_building_removes_floors_qr_codes_points_and_routes(

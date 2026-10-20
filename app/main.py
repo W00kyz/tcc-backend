@@ -22,7 +22,6 @@ from app.api.monitoring import router as monitoring_router
 from app.api.notifications import router as notifications_router
 from app.api.qr_codes import router as qr_codes_router
 from app.api.reports import reports_router
-from app.api.route_templates import router as route_templates_router
 from app.api.routes import router as routes_router
 from app.api.service_points import router as service_points_router
 from app.api.service_types import router as service_types_router
@@ -154,7 +153,6 @@ def create_app(
     app.include_router(health_router)
     app.include_router(auth_router)
     app.include_router(routes_router)
-    app.include_router(route_templates_router)
     app.include_router(checkins_router)
     app.include_router(checkouts_router)
     app.include_router(evidence_router)

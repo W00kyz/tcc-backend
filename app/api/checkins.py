@@ -32,7 +32,6 @@ from app.domain.execution.service import (
     QrCodeUnknown,
     QrRevoked,
     QrSignatureInvalid,
-    RouteCancelled,
     RouteNotStarted,
     StopNotAssignedToWorker,
     check_in,
@@ -52,7 +51,6 @@ _DOMAIN_ERROR_STATUS: dict[type[Exception], int] = {
     ChosenStopNotOnFloor: status.HTTP_422_UNPROCESSABLE_ENTITY,
     StopNotAssignedToWorker: status.HTTP_403_FORBIDDEN,
     RouteNotStarted: status.HTTP_409_CONFLICT,
-    RouteCancelled: status.HTTP_409_CONFLICT,
 }
 
 

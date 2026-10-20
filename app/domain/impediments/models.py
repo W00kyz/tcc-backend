@@ -1,12 +1,9 @@
-"""Impediment reports that trigger emergency substitution/reassignment (RF16-RF21, Etapa 8).
+"""Impediment reports (RF16-RF17, Etapa 8).
 
-An `Impediment` is only the field worker's request — "I cannot execute this stop/the rest of
-this route" — reported from the app with the device-local `reported_at` and reconciled against
-server time at `received_at`. It never touches `stop_assignments` itself: the manager reviews
-the impediment and, if a reassignment is warranted, the routing module appends a new
-`StopAssignment` row with `sequence + 1` (spec §3 Ruling 2 / `app/domain/routing/models.py`
-module docstring). Keeping the request and the append-only assignment chain in separate tables
-is what lets a rejected or duplicate impediment leave no mark on that audit chain."""
+An `Impediment` is the field worker's report — "I cannot execute this stop/the rest of this
+route" — sent from the app with the device-local `reported_at` and reconciled against server
+time at `received_at`. The manager sees it in the queue; nobody reassigns stops by hand any more
+(spec 2026-10-20-alocacao-automatica §2.1)."""
 
 import enum
 import uuid

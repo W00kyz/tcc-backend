@@ -1,6 +1,6 @@
 """RF47-RF52 alert scan driver (spec §2 Ruling 1/2). `run_alert_scan` is the only side-effecting
 piece of the monitoring rules: it loads route/stop/execution state once, hands hand-built
-snapshots to the 4 pure rules (`app.domain.monitoring.rules`), and writes any new violations as
+snapshots to the pure rules (`app.domain.monitoring.rules`), and writes any new violations as
 `Alert` rows with a single conflict-safe batch insert keyed by `dedup_key`.
 
 Transaction discipline: unlike a domain service, this driver COMMITS. It is invoked by the
@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.campus_clock import campus_today
-from app.domain.execution.models import EvidenceItem, Execution, ManualCompletion
+from app.domain.execution.models import EvidenceItem, Execution
 from app.domain.monitoring.models import (
     Alert,
     AlertKind,
@@ -37,10 +37,7 @@ from app.domain.monitoring.rules import (
     AlertThresholds,
     RouteSnapshot,
     StopSnapshot,
-    rule_late_start,
-    rule_late_stop,
     rule_no_evidence,
-    rule_worker_absent,
 )
 from app.domain.routing.models import Route, RouteStatus, RouteStop
 from app.domain.settings.models import SystemSettings
@@ -48,7 +45,7 @@ from app.domain.settings.service import get_settings_row
 
 logger = logging.getLogger(__name__)
 
-_SCANNED_STATUSES = (RouteStatus.PLANNED, RouteStatus.IN_PROGRESS)
+_SCANNED_STATUSES = (RouteStatus.IN_PROGRESS, RouteStatus.PAUSED)
 
 # Below WARNING nobody is paged — an INFO alert is recorded but not fanned out (spec §2 Ruling 6).
 _NOTIFIABLE_SEVERITIES = (AlertSeverity.WARNING, AlertSeverity.CRITICAL)
@@ -60,7 +57,7 @@ async def run_alert_scan(
     now: datetime | None = None,
     push: PushSender | None = None,
 ) -> list[Alert]:
-    """Load current state, run the 4 alert rules, batch-insert new `Alert` rows, COMMIT.
+    """Load current state, run the alert rules, batch-insert new `Alert` rows, COMMIT.
 
     Returns only the rows this pass actually inserted (the `ON CONFLICT (dedup_key) DO NOTHING`
     swallows violations that already have an open/handled alert), so the caller can fan them out
@@ -80,9 +77,7 @@ async def run_alert_scan(
     thresholds = _resolve_thresholds(settings, rules_by_kind)
     enabled = {kind: _is_enabled(rules_by_kind, kind) for kind in AlertKind}
 
-    drafts: list[AlertDraft] = []
-    for rule in (rule_late_start, rule_worker_absent, rule_late_stop, rule_no_evidence):
-        drafts.extend(rule(snapshots, thresholds, now, enabled))
+    drafts = rule_no_evidence(snapshots, thresholds, now, enabled)
 
     inserted = await _insert_new_alerts(db, drafts)
     await db.commit()
@@ -111,7 +106,7 @@ async def _notify_new_alerts(db: AsyncSession, inserted: list[Alert], push: Push
 
 async def _load_routes(db: AsyncSession, now: datetime) -> Sequence[Route]:
     """Today's (or an earlier day's still-open) routes with their stops eager-loaded. A route
-    left IN_PROGRESS from a previous day must still raise LATE_STOP, hence `route_date <=`."""
+    left open from a previous day must still raise its alerts, hence `route_date <=`."""
     stmt = (
         select(Route)
         .where(Route.route_date <= campus_today(now), Route.status.in_(_SCANNED_STATUSES))
@@ -125,41 +120,27 @@ async def _build_snapshots(db: AsyncSession, routes: Sequence[Route]) -> list[Ro
     latest_exec = await _latest_execution_per_stop(db, stop_ids)
     exec_ids = [e.id for e in latest_exec.values()]
     evidence_counts = await _evidence_counts(db, exec_ids)
-    manual_stop_ids = await _stops_with_manual_completion(db, stop_ids)
-
-    snapshots: list[RouteSnapshot] = []
-    for route in routes:
-        stops = [
-            _stop_snapshot(stop, latest_exec, evidence_counts, manual_stop_ids)
-            for stop in route.stops
-        ]
-        snapshots.append(
-            RouteSnapshot(
-                route_id=route.id,
-                status=route.status.value,
-                scheduled_start_at=route.scheduled_start_at,
-                field_worker_id=route.field_worker_id,
-                stops=stops,
-            )
+    return [
+        RouteSnapshot(
+            route_id=route.id,
+            stops=[_stop_snapshot(stop, latest_exec, evidence_counts) for stop in route.stops],
         )
-    return snapshots
+        for route in routes
+    ]
 
 
 def _stop_snapshot(
     stop: RouteStop,
     latest_exec: dict[uuid.UUID, Execution],
     evidence_counts: dict[uuid.UUID, int],
-    manual_stop_ids: set[uuid.UUID],
 ) -> StopSnapshot:
     execution = latest_exec.get(stop.id)
     return StopSnapshot(
         route_stop_id=stop.id,
         status=stop.status.value,
-        expected_arrival_to=stop.expected_arrival_to,
         checked_out_at=execution.checked_out_at if execution is not None else None,
         execution_source=execution.source.value if execution is not None else None,
         evidence_count=evidence_counts.get(execution.id, 0) if execution is not None else 0,
-        has_manual_completion=stop.id in manual_stop_ids,
     )
 
 
@@ -191,21 +172,7 @@ async def _evidence_counts(
     return dict(rows.tuples().all())
 
 
-async def _stops_with_manual_completion(
-    db: AsyncSession, stop_ids: Sequence[uuid.UUID]
-) -> set[uuid.UUID]:
-    if not stop_ids:
-        return set()
-    rows = await db.scalars(
-        select(ManualCompletion.route_stop_id).where(ManualCompletion.route_stop_id.in_(stop_ids))
-    )
-    return set(rows)
-
-
 _GLOBAL_THRESHOLD_ATTR: dict[AlertKind, str] = {
-    AlertKind.LATE_START: "late_start_tolerance_min",
-    AlertKind.WORKER_ABSENT: "absence_tolerance_min",
-    AlertKind.LATE_STOP: "late_stop_tolerance_min",
     AlertKind.NO_EVIDENCE: "no_evidence_grace_min",
 }
 
@@ -222,12 +189,7 @@ def _resolve_thresholds(
             return rule.threshold_minutes
         return int(getattr(settings, _GLOBAL_THRESHOLD_ATTR[kind]))
 
-    return AlertThresholds(
-        late_start_min=minutes(AlertKind.LATE_START),
-        absence_min=minutes(AlertKind.WORKER_ABSENT),
-        late_stop_min=minutes(AlertKind.LATE_STOP),
-        no_evidence_min=minutes(AlertKind.NO_EVIDENCE),
-    )
+    return AlertThresholds(no_evidence_min=minutes(AlertKind.NO_EVIDENCE))
 
 
 def _is_enabled(rules_by_kind: dict[AlertKind, AlertRule], kind: AlertKind) -> bool:

@@ -10,7 +10,6 @@ from app.core.config import Settings
 from app.domain.catalog.models import Building, FieldWorker, Floor, ServicePoint
 from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution, ExecutionSource
 from app.domain.identity.models import User, UserRole
-from app.domain.routing.models import Route, RouteStatus, RouteStop
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy import select
@@ -24,6 +23,7 @@ from tests.api.test_checkins import (
     _seed_route,
 )
 from tests.support.clock import today_on_campus
+from tests.support.factories import make_route
 from tests.support.object_store import FakeObjectStore
 
 # A minimal but real JPEG header — the upload endpoint checks the SOI magic bytes and
@@ -111,17 +111,10 @@ async def _seed_other_worker_execution(
     point = ServicePoint(
         floor_id=floor.id, name="Sala X", description="Sala", latitude=-7.1, longitude=-35.8
     )
-    route = Route(
-        field_worker_id=worker.id,
-        route_date=today_on_campus(),
-        status=RouteStatus.IN_PROGRESS,
-        started_at=datetime.now(UTC),
-    )
-    db_session.add_all([point, route])
+    db_session.add(point)
     await db_session.flush()
-    stop = RouteStop(route_id=route.id, service_point_id=point.id, order_index=1)
-    db_session.add(stop)
-    await db_session.flush()
+    route = await make_route(db_session, worker=worker, day=today_on_campus(), points=[point])
+    stop = route.stops[0]
     execution = Execution(
         route_stop_id=stop.id,
         field_worker_id=worker.id,

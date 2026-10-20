@@ -165,10 +165,10 @@ async def test_route_of_a_different_worker_409(
     assert response.status_code == 409, response.text
 
 
-async def test_planned_route_409(
+async def test_paused_route_409(
     client: TestClient, db_session: AsyncSession, test_settings: Settings
 ) -> None:
-    seeded = await _seed(db_session, status=RouteStatus.PLANNED)
+    seeded = await _seed(db_session, status=RouteStatus.PAUSED)
     token = _login(client)
 
     response = _post(client, token, route_id=str(seeded.route.id))

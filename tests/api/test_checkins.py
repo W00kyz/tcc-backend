@@ -10,13 +10,14 @@ from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, 
 from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import sign_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
-from app.domain.routing.models import Route, RouteStatus, RouteStop
+from app.domain.routing.models import Route, RouteStop
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
+from tests.support.factories import make_route
 
 _WORKER_EMAIL = "joao@empresa.com"
 _WORKER_PASSWORD = "senha-forte-o-suficiente"
@@ -86,23 +87,18 @@ async def _seed_route(
     qr_code = QrCode(
         floor_id=floor.id, public_code=qr_payload, secret=b"sig", version=1, status=qr_status
     )
-    route = Route(
-        field_worker_id=worker.id,
-        route_date=today_on_campus(),
-        status=RouteStatus.IN_PROGRESS if started else RouteStatus.PLANNED,
-        started_at=datetime.now(UTC) if started else None,
-    )
-    db_session.add_all([qr_code, route])
-    await db_session.flush()
-
-    stops = [
-        RouteStop(route_id=route.id, service_point_id=point.id, order_index=index + 1)
-        for index, point in enumerate(points)
-    ]
-    db_session.add_all(stops)
+    db_session.add(qr_code)
+    route = await make_route(db_session, worker=worker, day=today_on_campus(), points=points)
+    if not started:
+        route.started_at = None
     await db_session.commit()
     return SeededRoute(
-        worker=worker, route=route, floor=floor, qr_code=qr_code, stops=stops, points=points
+        worker=worker,
+        route=route,
+        floor=floor,
+        qr_code=qr_code,
+        stops=list(route.stops),
+        points=points,
     )
 
 

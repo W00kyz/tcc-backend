@@ -17,12 +17,12 @@ from app.domain.catalog.models import (
 from app.domain.execution.models import Execution, ExecutionSource
 from app.domain.identity.models import User, UserRole
 from app.domain.privacy.models import ConsentRecord, PrivacyNotice
-from app.domain.routing.models import Route, RouteStop
 from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
+from tests.support.factories import make_route
 
 _PASSWORD = "senha-forte-o-suficiente"
 
@@ -77,12 +77,8 @@ async def _seed_worker_with_execution(db_session: AsyncSession) -> SeededWorker:
     )
     db_session.add(point)
     await db_session.flush()
-    route = Route(field_worker_id=worker.id, route_date=today_on_campus())
-    db_session.add(route)
-    await db_session.flush()
-    stop = RouteStop(route_id=route.id, service_point_id=point.id, order_index=0)
-    db_session.add(stop)
-    await db_session.flush()
+    route = await make_route(db_session, worker=worker, day=today_on_campus(), points=[point])
+    stop = route.stops[0]
 
     db_session.add(
         Execution(

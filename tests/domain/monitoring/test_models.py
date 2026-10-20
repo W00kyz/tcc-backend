@@ -3,7 +3,6 @@ from datetime import UTC, datetime
 
 import pytest
 from alembic import command
-from alembic.config import Config
 from app.domain.monitoring.models import (
     Alert,
     AlertKind,
@@ -17,46 +16,54 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from tests.support.factories import seed_route_with_one_stop
+from tests.support.migrations import LAST_REVERSIBLE_REVISION, alembic_config
 
 
 async def test_alert_round_trips_with_and_without_route_stop(db_session: AsyncSession) -> None:
     stop, worker = await seed_route_with_one_stop(db_session)
 
     stop_alert = Alert(
-        kind=AlertKind.LATE_STOP,
-        severity=AlertSeverity.WARNING,
-        dedup_key=f"LATE_STOP:{stop.id}",
-        description="Stop past its arrival window.",
+        kind=AlertKind.NO_EVIDENCE,
+        severity=AlertSeverity.INFO,
+        dedup_key=f"NO_EVIDENCE:{stop.id}",
+        description="Stop done without evidence.",
         route_id=stop.route_id,
         route_stop_id=stop.id,
         field_worker_id=worker.id,
     )
     route_alert = Alert(
-        kind=AlertKind.WORKER_ABSENT,
-        severity=AlertSeverity.CRITICAL,
-        dedup_key=f"WORKER_ABSENT:{stop.route_id}",
-        description="Route not started.",
+        kind=AlertKind.BATCH_RELEASED,
+        severity=AlertSeverity.WARNING,
+        dedup_key=f"BATCH_RELEASED:{stop.route_id}",
+        description="Batch released.",
         route_id=stop.route_id,
     )
-    db_session.add_all([stop_alert, route_alert])
+    day_alert = Alert(
+        kind=AlertKind.POINTS_UNSERVED,
+        severity=AlertSeverity.WARNING,
+        dedup_key="POINTS_UNSERVED:2026-10-20",
+        description="Points not served today.",
+    )
+    db_session.add_all([stop_alert, route_alert, day_alert])
     await db_session.flush()
-    await db_session.refresh(stop_alert)
-    await db_session.refresh(route_alert)
+    for alert in (stop_alert, route_alert, day_alert):
+        await db_session.refresh(alert)
 
     assert stop_alert.status is AlertStatus.OPEN
     assert stop_alert.route_stop_id == stop.id
     assert route_alert.route_stop_id is None
     assert route_alert.field_worker_id is None
+    assert day_alert.route_id is None  # a day-level alert belongs to no route
     assert stop_alert.created_at is not None
 
 
 async def test_dedup_key_is_unique(db_session: AsyncSession) -> None:
     stop, _ = await seed_route_with_one_stop(db_session)
-    key = f"LATE_STOP:{stop.id}"
+    key = f"NO_EVIDENCE:{stop.id}"
 
     db_session.add(
         Alert(
-            kind=AlertKind.LATE_STOP,
+            kind=AlertKind.NO_EVIDENCE,
             severity=AlertSeverity.WARNING,
             dedup_key=key,
             description="first",
@@ -67,7 +74,7 @@ async def test_dedup_key_is_unique(db_session: AsyncSession) -> None:
 
     db_session.add(
         Alert(
-            kind=AlertKind.LATE_STOP,
+            kind=AlertKind.NO_EVIDENCE,
             severity=AlertSeverity.WARNING,
             dedup_key=key,
             description="duplicate",
@@ -83,9 +90,9 @@ async def test_notification_round_trips(db_session: AsyncSession) -> None:
 
     note = Notification(
         user_id=worker.user_id,
-        kind="ROUTE_ASSIGNED",
-        title="Nova rota",
-        body="Você recebeu uma nova rota.",
+        kind="ALERT",
+        title="Pontos liberados",
+        body="Os pontos do João foram liberados.",
         data={"route_id": str(worker.id)},
     )
     db_session.add(note)
@@ -119,12 +126,6 @@ _MONITORING_TABLES = ("alerts", "alert_rules", "notifications", "worker_position
 _MONITORING_ENUMS = ("alert_kind", "alert_severity", "alert_status")
 
 
-def _alembic_config(url: str) -> Config:
-    cfg = Config(str(__file__).replace("tests/domain/monitoring/test_models.py", "alembic.ini"))
-    cfg.attributes["sqlalchemy_url"] = url
-    return cfg
-
-
 async def _schema_probe(url: str) -> tuple[list[str], list[str], list[str]]:
     engine = create_async_engine(url)
     try:
@@ -148,28 +149,27 @@ async def _schema_probe(url: str) -> tuple[list[str], list[str], list[str]]:
         await engine.dispose()
 
 
-def test_migration_round_trips_clean_and_seeds_alert_rules(postgres_url: str) -> None:
+def test_migration_round_trips_clean_and_seeds_alert_rules(pre_reset_database_url: str) -> None:
     """Downgrading past the Etapa 9 migration leaves no orphaned table or enum; the re-upgrade
-    re-seeds the 4 rules.
+    re-seeds the 4 rules of that time (the allocation reset swaps them, see
+    tests/migrations/test_allocation_reset.py).
 
-    Targets the Etapa 9 down_revision by id rather than "-1": Etapa 11 (revision 3cf7fec14642)
-    now sits on top of monitoring, so "-1" would only reverse the LGPD migration.
+    Targets the Etapa 9 down_revision by id rather than "-1": later migrations sit on top of
+    monitoring, so "-1" would reverse the wrong one. Runs on a scratch database
+    (tests/support/migrations.py) — the shared one is past the irreversible allocation reset.
 
     A plain (sync) test on purpose: alembic's env.py calls asyncio.run(), which would blow up
     inside an already-running event loop."""
-    cfg = _alembic_config(postgres_url)
+    url = pre_reset_database_url
+    cfg = alembic_config(url)
 
-    # try/finally: a mid-test failure must never leave the shared session container downgraded.
-    try:
-        command.downgrade(cfg, "1212c573b12e")
-        tables, enums, _ = asyncio.run(_schema_probe(postgres_url))
-        assert tables == []
-        assert enums == []
+    command.downgrade(cfg, "1212c573b12e")
+    tables, enums, _ = asyncio.run(_schema_probe(url))
+    assert tables == []
+    assert enums == []
 
-        command.upgrade(cfg, "head")
-        tables, enums, rule_kinds = asyncio.run(_schema_probe(postgres_url))
-        assert sorted(tables) == sorted(_MONITORING_TABLES)
-        assert sorted(enums) == sorted(_MONITORING_ENUMS)
-        assert {AlertKind(k) for k in rule_kinds} == set(AlertKind)
-    finally:
-        command.upgrade(cfg, "head")
+    command.upgrade(cfg, LAST_REVERSIBLE_REVISION)
+    tables, enums, rule_kinds = asyncio.run(_schema_probe(url))
+    assert sorted(tables) == sorted(_MONITORING_TABLES)
+    assert sorted(enums) == sorted(_MONITORING_ENUMS)
+    assert sorted(rule_kinds) == ["LATE_START", "LATE_STOP", "NO_EVIDENCE", "WORKER_ABSENT"]

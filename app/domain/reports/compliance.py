@@ -31,16 +31,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.domain.catalog.models import Building, FieldWorker, Floor, ServicePoint, ServiceType
-from app.domain.execution.models import (
-    EvidenceItem,
-    Execution,
-    ExecutionReviewStatus,
-    ManualCompletion,
-)
+from app.domain.execution.models import EvidenceItem, Execution, ExecutionReviewStatus
 from app.domain.impediments.models import Impediment
 from app.domain.monitoring.models import Alert
 from app.domain.reports.filters import ReportFilters
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus, StopAssignment
+from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 
 
 class ReportGranularity(enum.StrEnum):
@@ -53,9 +48,8 @@ class ReportGranularity(enum.StrEnum):
 # (spec §2 Ruling 8), so `route_status` carries the display label, not the raw enum value.
 # These strings must match the dashboard i18n (`routeStatus*` / `reportsRouteStatus*`).
 _ROUTE_STATUS_LABELS: dict[RouteStatus, str] = {
-    RouteStatus.PLANNED: "Planejada",
     RouteStatus.IN_PROGRESS: "Em andamento",
-    RouteStatus.CANCELLED: "Cancelada",
+    RouteStatus.PAUSED: "Pausada",
     RouteStatus.DONE: "Concluída",
 }
 
@@ -199,7 +193,7 @@ def _scope_conditions(filters: ReportFilters) -> list[ColumnElement[bool]]:
 
 async def _route_counts(
     db: AsyncSession, period: ColumnElement[date], filters: ReportFilters
-) -> dict[date, Row[tuple[date, int, int, int, int]]]:
+) -> dict[date, Row[tuple[date, int, int, int]]]:
     started = or_(
         Route.started_at.is_not(None),
         Route.status.in_([RouteStatus.IN_PROGRESS, RouteStatus.DONE]),
@@ -210,7 +204,6 @@ async def _route_counts(
             func.count().label("routes_total"),
             func.count().filter(started).label("routes_started"),
             func.count().filter(Route.status == RouteStatus.DONE).label("routes_completed"),
-            func.count().filter(Route.status == RouteStatus.CANCELLED).label("routes_cancelled"),
         )
         .where(*_scope_conditions(filters))
         .group_by(period)
@@ -220,19 +213,13 @@ async def _route_counts(
 
 async def _stop_counts(
     db: AsyncSession, period: ColumnElement[date], filters: ReportFilters
-) -> dict[date, Row[tuple[date, int, int, int, int]]]:
-    reassigned = (
-        select(func.count(StopAssignment.id))
-        .where(StopAssignment.route_stop_id == RouteStop.id)
-        .scalar_subquery()
-    ) >= 2
+) -> dict[date, Row[tuple[date, int, int, int]]]:
     stmt = (
         select(
             period.label("period_start"),
             func.count(RouteStop.id).label("stops_total"),
             func.count().filter(RouteStop.status == RouteStopStatus.DONE).label("stops_done"),
             func.count().filter(RouteStop.status == RouteStopStatus.PENDING).label("stops_pending"),
-            func.count().filter(reassigned).label("stops_reassigned"),
         )
         .select_from(RouteStop)
         .join(Route, RouteStop.route_id == Route.id)
@@ -245,10 +232,7 @@ async def _stop_counts(
 async def _execution_counts(
     db: AsyncSession, period: ColumnElement[date], filters: ReportFilters
 ) -> dict[date, Row[tuple[date, int, int, int]]]:
-    has_evidence = or_(
-        select(EvidenceItem.id).where(EvidenceItem.execution_id == Execution.id).exists(),
-        select(ManualCompletion.id).where(ManualCompletion.execution_id == Execution.id).exists(),
-    )
+    has_evidence = select(EvidenceItem.id).where(EvidenceItem.execution_id == Execution.id).exists()
     flagged = Execution.review_status == ExecutionReviewStatus.PENDING_REVIEW
     stmt = (
         select(
@@ -312,8 +296,8 @@ async def _resolve_filters_applied(db: AsyncSession, filters: ReportFilters) -> 
 def _build_row(
     granularity: ReportGranularity,
     period_start: date,
-    routes: Row[tuple[date, int, int, int, int]],
-    stops: Row[tuple[date, int, int, int, int]] | None,
+    routes: Row[tuple[date, int, int, int]],
+    stops: Row[tuple[date, int, int, int]] | None,
     executions: Row[tuple[date, int, int, int]] | None,
     impediments_total: int,
     alerts_total: int,
@@ -326,11 +310,14 @@ def _build_row(
         routes_total=routes.routes_total,
         routes_started=routes.routes_started,
         routes_completed=routes.routes_completed,
-        routes_cancelled=routes.routes_cancelled,
+        # LEGACY: routes are no longer cancelled nor stops reassigned (spec
+        # 2026-10-20-alocacao-automatica §2.1). Both stay 0 until the report is rewritten on the
+        # point-per-day model (§8.7).
+        routes_cancelled=0,
         stops_total=stops_total,
         stops_done=stops_done,
         stops_pending=stops.stops_pending if stops is not None else 0,
-        stops_reassigned=stops.stops_reassigned if stops is not None else 0,
+        stops_reassigned=0,
         executions_total=executions.executions_total if executions is not None else 0,
         executions_with_evidence=(
             executions.executions_with_evidence if executions is not None else 0

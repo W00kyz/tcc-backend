@@ -34,7 +34,6 @@ from app.domain.execution.service import (
     QrCodeUnknown,
     QrRevoked,
     QrSignatureInvalid,
-    RouteCancelled,
     StopNotAssignedToWorker,
     check_out,
 )
@@ -54,7 +53,6 @@ _DOMAIN_ERROR_STATUS: dict[type[Exception], int] = {
     AnswerValidationError: status.HTTP_422_UNPROCESSABLE_ENTITY,
     FormVersionMismatch: status.HTTP_422_UNPROCESSABLE_ENTITY,
     StopNotAssignedToWorker: status.HTTP_403_FORBIDDEN,
-    RouteCancelled: status.HTTP_409_CONFLICT,
 }
 
 

@@ -2,10 +2,9 @@
 route / stop / alert / GPS state into one `BoardSnapshot` — the payload `GET /monitoring/board`
 returns and the SSE stream (Task 8) diffs and re-emits on change.
 
-`is_delayed` is derived here, never persisted (Ruling 9): the board shows the RAW delay signal
-(no tolerance) while the `Alert` carries the tolerance. `open_alerts` lists both `OPEN` and
-`ACKNOWLEDGED` rows so the dashboard can show "a manager is on it" distinctly; `open_alert_count`
-and the `is_delayed` alert signal count only `OPEN` (Ruling 9 says "um alerta OPEN").
+`open_alerts` lists both `OPEN` and `ACKNOWLEDGED` rows so the dashboard can show "a manager is
+on it" distinctly; `open_alert_count` counts only `OPEN`. The derived `is_delayed` flag went with
+the planned start times and arrival windows (spec 2026-10-20-alocacao-automatica §8.7).
 
     snapshot = await build_board(db, now=datetime.now(UTC))
 """
@@ -20,15 +19,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.campus_clock import campus_today, campus_wall_clock
+from app.core.campus_clock import campus_today
 from app.domain.catalog.models import FieldWorker
 from app.domain.monitoring.models import Alert, AlertKind, AlertStatus, WorkerPosition
 from app.domain.routing.models import Route, RouteStatus, RouteStopStatus
 
 # Same scope as the alert scan: a stale route still open shows on the board (spec §2 Ruling 1).
-_BOARD_STATUSES = (RouteStatus.PLANNED, RouteStatus.IN_PROGRESS)
-# Alert kinds that, while OPEN, mark their route delayed (Ruling 9).
-_DELAY_ALERT_KINDS = frozenset({AlertKind.LATE_START, AlertKind.WORKER_ABSENT, AlertKind.LATE_STOP})
+_BOARD_STATUSES = (RouteStatus.IN_PROGRESS, RouteStatus.PAUSED)
 # Statuses the dashboard still treats as "open work" — RESOLVED drops off the board.
 _BOARD_ALERT_STATUSES = (AlertStatus.OPEN, AlertStatus.ACKNOWLEDGED)
 
@@ -39,7 +36,6 @@ class BoardRoute(BaseModel):
     field_worker_name: str
     route_date: date
     status: str
-    is_delayed: bool
     open_alert_count: int
     stop_total: int
     stop_done: int
@@ -50,7 +46,7 @@ class BoardAlert(BaseModel):
     kind: AlertKind
     severity: str
     description: str
-    route_id: uuid.UUID
+    route_id: uuid.UUID | None
     route_stop_id: uuid.UUID | None
     field_worker_id: uuid.UUID | None
     status: AlertStatus
@@ -78,14 +74,10 @@ async def build_board(db: AsyncSession, *, now: datetime) -> BoardSnapshot:
     N+1 — and fold them into a `BoardSnapshot`."""
     routes = await _load_routes(db, now)
     alerts = await _load_board_alerts(db, [route.id for route in routes])
-    open_by_route: dict[uuid.UUID, int] = defaultdict(int)
-    delayed_route_ids: set[uuid.UUID] = set()
+    open_by_route: dict[uuid.UUID | None, int] = defaultdict(int)
     for alert in alerts:
-        if alert.status is not AlertStatus.OPEN:
-            continue
-        open_by_route[alert.route_id] += 1
-        if alert.kind in _DELAY_ALERT_KINDS:
-            delayed_route_ids.add(alert.route_id)
+        if alert.status is AlertStatus.OPEN:
+            open_by_route[alert.route_id] += 1
 
     worker_ids = [route.field_worker_id for route in routes]
     names = await _worker_names(db, worker_ids)
@@ -96,7 +88,6 @@ async def build_board(db: AsyncSession, *, now: datetime) -> BoardSnapshot:
             route,
             name=names.get(route.field_worker_id, ""),
             open_alert_count=open_by_route[route.id],
-            is_delayed=_is_delayed(route, now, alert_delayed=route.id in delayed_route_ids),
         )
         for route in routes
     ]
@@ -157,38 +148,13 @@ async def _latest_positions(
     return (await db.scalars(stmt)).all()
 
 
-def _is_delayed(route: Route, now: datetime, *, alert_delayed: bool) -> bool:
-    """Ruling 9 — ANY of: an OPEN LATE_*/WORKER_ABSENT alert, a PLANNED route past its
-    scheduled start, or a PENDING stop past its arrival window. No tolerance — the raw signal."""
-    if alert_delayed:
-        return True
-    if (
-        route.status is RouteStatus.PLANNED
-        and route.scheduled_start_at is not None
-        and route.scheduled_start_at < now
-    ):
-        return True
-    # Arrival windows are campus wall-clock tagged UTC (app/core/campus_clock.py); the route's
-    # scheduled start above is a real instant and keeps the real `now`.
-    wall_now = campus_wall_clock(now)
-    return any(
-        stop.status is RouteStopStatus.PENDING
-        and stop.expected_arrival_to is not None
-        and stop.expected_arrival_to < wall_now
-        for stop in route.stops
-    )
-
-
-def _to_board_route(
-    route: Route, *, name: str, open_alert_count: int, is_delayed: bool
-) -> BoardRoute:
+def _to_board_route(route: Route, *, name: str, open_alert_count: int) -> BoardRoute:
     return BoardRoute(
         route_id=route.id,
         field_worker_id=route.field_worker_id,
         field_worker_name=name,
         route_date=route.route_date,
         status=route.status.value,
-        is_delayed=is_delayed,
         open_alert_count=open_alert_count,
         stop_total=len(route.stops),
         stop_done=sum(1 for stop in route.stops if stop.status is RouteStopStatus.DONE),

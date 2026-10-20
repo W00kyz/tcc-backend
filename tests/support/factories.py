@@ -3,7 +3,8 @@
 Extracted from the chain inlined in tests/api/test_routes.py so every check-in / check-out /
 evidence test starts from the same minimal graph instead of copy-pasting it."""
 
-from datetime import UTC, datetime
+from collections.abc import Sequence
+from datetime import UTC, date, datetime
 
 from app.core.security import hash_password
 from app.domain.catalog.models import (
@@ -14,12 +15,52 @@ from app.domain.catalog.models import (
     ServicePoint,
 )
 from app.domain.identity.models import User, UserRole
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from app.domain.routing.models import Route, RouteStatus, RouteStop
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
 
 _PASSWORD = "senha-forte-o-suficiente"
+
+
+async def make_route(
+    db: AsyncSession,
+    *,
+    worker: FieldWorker,
+    day: date,
+    points: Sequence[ServicePoint],
+    status: RouteStatus = RouteStatus.IN_PROGRESS,
+) -> Route:
+    """A route as the automatic allocation leaves it: started, with one batch (`batch_number=1`)
+    of PENDING stops over `points` in that order, each stamped `service_date=day`. Flushes, never
+    commits; `route.stops` comes back loaded.
+
+        route = await make_route(db, worker=worker, day=today_on_campus(), points=[point])
+        await db.commit()
+    """
+    now = datetime.now(UTC)
+    route = Route(
+        field_worker_id=worker.id,
+        route_date=day,
+        status=status,
+        started_at=now,
+        last_allocated_at=now,
+    )
+    db.add(route)
+    await db.flush()
+    db.add_all(
+        RouteStop(
+            route_id=route.id,
+            service_point_id=point.id,
+            order_index=index,
+            batch_number=1,
+            service_date=day,
+        )
+        for index, point in enumerate(points, start=1)
+    )
+    await db.flush()
+    await db.refresh(route, attribute_names=["stops"])
+    return route
 
 
 async def seed_route_with_one_stop(
@@ -51,21 +92,6 @@ async def seed_route_with_one_stop(
     db_session.add_all([point, worker])
     await db_session.flush()
 
-    route = Route(
-        field_worker_id=worker.id,
-        route_date=today_on_campus(),
-        status=RouteStatus.IN_PROGRESS,
-        started_at=datetime.now(UTC),
-    )
-    db_session.add(route)
-    await db_session.flush()
-
-    stop = RouteStop(
-        route_id=route.id,
-        service_point_id=point.id,
-        order_index=1,
-        status=RouteStopStatus.PENDING,
-    )
-    db_session.add(stop)
+    route = await make_route(db_session, worker=worker, day=today_on_campus(), points=[point])
     await db_session.commit()
-    return stop, worker
+    return route.stops[0], worker

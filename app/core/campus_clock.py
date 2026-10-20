@@ -1,13 +1,7 @@
 """The campus wall clock (UFCG, Campina Grande).
 
-IMPORTANT: arrival windows (`route_stops.expected_arrival_*`, and template times materialised by
-`routing.service._combine_date_time`) are stored as campus wall-clock times tagged UTC — the
-dashboard sends "08:00" as 08:00Z and the mobile app reads `.hour` straight off the timestamp
-(mobile `route_screen.dart`, INTENTIONAL). The stored value is NOT a real UTC instant.
-
-So anything compared with a window must be expressed the same way: `campus_wall_clock(now)`,
-not `now`. Comparing with the real UTC instant made late-stop alerts fire three hours early.
-Real instants (check-ins, `scheduled_start_at`, `created_at`) keep using plain UTC.
+Campus "today" and "now" always come from here, never from `date.today()` or a bare UTC date:
+the server runs in UTC, three hours ahead of the campus.
 """
 
 from datetime import UTC, date, datetime
@@ -18,7 +12,7 @@ CAMPUS_TIMEZONE = ZoneInfo("America/Fortaleza")
 
 
 def campus_wall_clock(now: datetime) -> datetime:
-    """`now` (aware) as campus wall-clock time tagged UTC, comparable with arrival windows.
+    """`now` (aware) as campus wall-clock time tagged UTC — the campus hour, not a real instant.
 
     >>> campus_wall_clock(datetime(2026, 9, 6, 12, 10, tzinfo=UTC))
     datetime.datetime(2026, 9, 6, 9, 10, tzinfo=datetime.timezone.utc)

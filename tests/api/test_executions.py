@@ -6,19 +6,17 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.domain.audit.models import AuditTrail
-from app.domain.catalog.models import FieldWorker, ServiceType
+from app.domain.catalog.models import ServiceType
 from app.domain.execution.models import Execution, ExecutionReviewStatus, ExecutionSource
 from app.domain.forms.models import QuestionType
 from app.domain.forms.service import add_question, get_or_create_form, publish_form
-from app.domain.identity.models import User, UserRole
-from app.domain.routing.models import StopAssignment
+from app.domain.identity.models import UserRole
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.api.test_checkins import (
     SeededRoute,
-    _add_field_worker,
     _add_user,
     _login,
     _post,
@@ -165,7 +163,7 @@ async def test_get_execution_detail_includes_scans_and_evidence(
     assert body["scans"][0]["kind"] == "CHECK_IN"
     assert len(body["evidence"]) == 1
     assert body["evidence"][0]["kind"] == "PHOTO"
-    assert body["manual_completion"] is None
+    assert not {"manual_completion", "reassigned", "assignment_history"} & set(body)
     # No service-type form on this stop → no form section (Ruling 15).
     assert body["form_version_id"] is None
     assert body["answers"] == []
@@ -206,85 +204,6 @@ async def test_get_execution_detail_surfaces_form_answers(
     assert by_key[form.text_key]["value"] == "tudo certo"
     assert by_key[form.bool_key]["prompt"] == "Área limpa?"
     assert by_key[form.bool_key]["value"] is True
-
-
-async def test_get_execution_detail_not_reassigned_hides_history(
-    client: TestClient, db_session: AsyncSession, test_settings: Settings
-) -> None:
-    seeded = await _seed_route(db_session, test_settings)
-    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
-    worker_token = _login(client)
-    execution_id = _post(client, worker_token, seeded.qr_code.public_code).json()["execution_id"]
-
-    response = client.get(
-        f"/executions/{execution_id}",
-        headers={"Authorization": f"Bearer {_manager_token(client)}"},
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["reassigned"] is False
-    assert body["assignment_history"] is None
-
-
-async def test_get_execution_detail_surfaces_reassignment_chain(
-    client: TestClient, db_session: AsyncSession, test_settings: Settings
-) -> None:
-    seeded = await _seed_route(db_session, test_settings)
-    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
-    manager = await db_session.scalar(select(User).where(User.email == _MANAGER_EMAIL))
-    assert manager is not None
-    # The sequence-1 designation POST /routes/{id}/reassign finds and marks REASSIGNED.
-    db_session.add(
-        StopAssignment(
-            route_stop_id=seeded.stops[0].id,
-            field_worker_id=seeded.worker.id,
-            sequence=1,
-            assigned_by=manager.id,
-        )
-    )
-    await db_session.commit()
-    await _add_field_worker(db_session, "maria@empresa.com")
-    substitute = await db_session.scalar(
-        select(FieldWorker)
-        .join(User, FieldWorker.user_id == User.id)
-        .where(User.email == "maria@empresa.com")
-    )
-    assert substitute is not None
-
-    manager_token = _manager_token(client)
-    reassign = client.post(
-        f"/routes/{seeded.route.id}/reassign",
-        json={"field_worker_id": str(substitute.id), "reason": "cobertura de ferias"},
-        headers={"Authorization": f"Bearer {manager_token}"},
-    )
-    assert reassign.status_code == 200, reassign.text
-
-    substitute_token = _login(client, email="maria@empresa.com")
-    checkin = _post(client, substitute_token, seeded.qr_code.public_code)
-    assert checkin.status_code == 201, checkin.text
-    execution_id = checkin.json()["execution_id"]
-
-    response = client.get(
-        f"/executions/{execution_id}",
-        headers={"Authorization": f"Bearer {manager_token}"},
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["reassigned"] is True
-    history = body["assignment_history"]
-    assert [row["sequence"] for row in history] == [1, 2]
-    assert [row["field_worker_id"] for row in history] == [
-        str(seeded.worker.id),
-        str(substitute.id),
-    ]
-    assert [row["full_name"] for row in history] == ["João", "maria@empresa.com"]
-    assert all(row["assigned_by_name"] == "gerente" for row in history)
-    assert history[0]["outcome"] == "REASSIGNED"
-    assert history[0]["transfer_reason"] is None
-    assert history[1]["transfer_reason"] == "cobertura de ferias"
-    assert history[1]["outcome"] is None
 
 
 async def test_get_execution_detail_missing_404(

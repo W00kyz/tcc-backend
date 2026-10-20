@@ -1,17 +1,15 @@
-"""Room resolution (spec §4.4, Ruling 4) and the schedule-window flag (layer 4 of Ruling 2).
-Pure logic — no DB, no I/O. Task 4 wires this into the rewritten check-in write path."""
+"""Room resolution (spec §4.4, Ruling 4) and the clock-skew flag. Pure logic — no DB, no I/O.
+The schedule-window flag (layer 4 of Ruling 2) went with the planned arrival windows."""
 
 import math
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
 from app.domain.execution.models import GeoValidation
 
 # Validation-flag string constants — the subset the check-in/check-out write path may attach
 # (spec §3.7, §4.2). Task 4 imports these rather than retyping the literals.
 FLAG_OUT_OF_RADIUS = "OUT_OF_RADIUS"
-FLAG_OUTSIDE_SCHEDULE = "OUTSIDE_SCHEDULE"
 FLAG_QR_SUPERSEDED = "QR_SUPERSEDED"
 FLAG_GPS_UNAVAILABLE = "GPS_UNAVAILABLE"
 # LEGACY: no longer raised — points share their building's location, so picking the room is the
@@ -46,12 +44,6 @@ class Resolution:
     ambiguous: list[Candidate]  # populated only when resolved is None
     geo_validation: GeoValidation
     flags: list[str]
-
-
-@dataclass(frozen=True)
-class ScheduleWindow:
-    arrival_from: datetime | None
-    arrival_to: datetime | None
 
 
 def _sort_key(candidate: Candidate) -> tuple[float, str]:
@@ -140,17 +132,4 @@ def clock_skew_flag(offset_seconds: float | None) -> list[str]:
     `clock_skew_flag(600.0) == ["CLOCK_SKEW"]`; `clock_skew_flag(120.0) == []`."""
     if offset_seconds is not None and abs(offset_seconds) > _CLOCK_SKEW_THRESHOLD_SECONDS:
         return [FLAG_CLOCK_SKEW]
-    return []
-
-
-def schedule_flag(
-    window: ScheduleWindow, scanned_at: datetime, grace_minutes: int = 30
-) -> list[str]:
-    if window.arrival_from is None and window.arrival_to is None:
-        return []  # no window on the stop ⇒ the layer passes (spec §4.2 layer 4)
-    grace = timedelta(minutes=grace_minutes)
-    if window.arrival_from is not None and scanned_at < window.arrival_from - grace:
-        return [FLAG_OUTSIDE_SCHEDULE]
-    if window.arrival_to is not None and scanned_at > window.arrival_to + grace:
-        return [FLAG_OUTSIDE_SCHEDULE]
     return []
