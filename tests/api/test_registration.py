@@ -223,6 +223,22 @@ async def test_refresh_reflects_a_rejection_with_reason(
     assert (body["worker_status"], body["rejection_reason"]) == ("REJECTED", "Documento ilegível")
 
 
+async def test_public_privacy_notice_needs_no_auth(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    # The sign-up screen shows the notice it asks the worker to accept, before any account.
+    await seed_privacy_notice(db_session, version=3)
+
+    response = client.get("/public/privacy-notice")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "version": 3,
+        "title": "Aviso de Privacidade",
+        "body_markdown": "# Aviso",
+    }
+
+
 async def test_deactivated_worker_gets_403(client: TestClient, db_session: AsyncSession) -> None:
     company = await _company(db_session)
     await make_worker(db_session, company=company, email="ana@empresa.com", is_active=False)
