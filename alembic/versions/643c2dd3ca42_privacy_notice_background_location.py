@@ -11,8 +11,10 @@ the app in the background during a route, so the privacy notice must say so. The
 sentence — and makes it the current one, which is what makes the consent gate ask every user to
 accept again.
 
-The new body is built from the current row, not from a copy here: the author replaces the v1
-placeholder with the real text before the pilot, and that text must survive.
+The new body is built from the current row, not from a copy here: real text the author put in
+the v1 row before this ran must survive. After this revision runs, the current notice is the
+new row (v2): the author edits THAT row with the real text, not the v1 placeholder, which is no
+longer what anyone is asked to accept.
 """
 
 from collections.abc import Sequence

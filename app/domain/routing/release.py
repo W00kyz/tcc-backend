@@ -110,6 +110,12 @@ async def release_route(
         await release_route(db, route=route, reason=ReleaseReason.END_OF_DAY, at=now,
                             actor_id=None, close=True)
     """
+    # IMPORTANT: lock the route before its stops — the release scan's order (route, then the
+    # stops' UPDATE). Taking the stops first and the route only at the status flush, as the
+    # ROUTE_REMAINDER impediment did, could deadlock against the scan. The allocation locks the
+    # route too, so a batch it claims meanwhile is read below and released, never left live on a
+    # paused route.
+    await db.execute(select(Route.id).where(Route.id == route.id).with_for_update())
     live = await db.scalars(
         select(RouteStop).where(
             RouteStop.route_id == route.id, RouteStop.status.in_(LIVE_STOP_STATUSES)

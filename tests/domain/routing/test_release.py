@@ -2,9 +2,14 @@
 released, a released route is paused or closed, and the silence clock reads the latest sign of
 life of the route."""
 
+import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
+import pytest_asyncio
+from app.core.config import Settings
+from app.db.session import build_engine, build_session_factory
 from app.domain.catalog.models import FieldWorker
 from app.domain.monitoring.models import WorkerPosition
 from app.domain.routing.models import (
@@ -15,8 +20,9 @@ from app.domain.routing.models import (
     RouteStopStatus,
 )
 from app.domain.routing.release import last_activity_at, release_route, release_stops
-from sqlalchemy import update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.support.factories import (
     make_check_in,
@@ -146,3 +152,61 @@ async def test_last_activity_at_is_the_allocation_without_any_report(
     route = await _route(db_session, rooms=1)
 
     assert await last_activity_at(db_session, route=route) == route.last_allocated_at
+
+
+@pytest_asyncio.fixture
+async def own_sessions(
+    db_session: AsyncSession, test_settings: Settings
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Sessions on their own engine, so the lock order can be watched from outside. Depends on
+    `db_session` so its truncation runs after this engine is gone."""
+    engine = build_engine(test_settings.database_url)
+    yield build_session_factory(engine)
+    await engine.dispose()
+
+
+async def _until_waiting_on_a_lock(probe: AsyncSession) -> None:
+    for _ in range(200):
+        waiting = await probe.scalar(
+            text("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'")
+        )
+        await probe.rollback()
+        if waiting:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the release never waited on the held stop")
+
+
+async def test_release_route_locks_the_route_before_its_stops(
+    db_session: AsyncSession, own_sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """The release scan locks the route, then its stops; a release taking the stops first (the
+    ROUTE_REMAINDER impediment) could deadlock against it. While a stop is held elsewhere, a
+    release waiting on it must already hold its route."""
+    route = await _route(db_session, rooms=1)
+    route_id, stop_id = route.id, route.stops[0].id
+    await db_session.commit()
+
+    async with own_sessions() as holder, own_sessions() as releaser, own_sessions() as probe:
+        await holder.execute(select(RouteStop.id).where(RouteStop.id == stop_id).with_for_update())
+        releasing = await releaser.get_one(Route, route_id)
+        release = asyncio.create_task(
+            release_route(
+                releaser,
+                route=releasing,
+                reason=ReleaseReason.LOCATION_SILENCE,
+                at=_NOW,
+                actor_id=None,
+            )
+        )
+        await _until_waiting_on_a_lock(probe)
+        try:
+            with pytest.raises(DBAPIError, match="could not obtain lock"):
+                await probe.execute(
+                    select(Route.id).where(Route.id == route_id).with_for_update(nowait=True)
+                )
+        finally:
+            await probe.rollback()
+            await holder.rollback()
+            await asyncio.wait_for(release, timeout=10)
+            await releaser.rollback()

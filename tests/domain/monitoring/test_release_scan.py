@@ -407,3 +407,43 @@ async def test_released_point_back_in_pool(db_session: AsyncSession) -> None:
 
     pool = await free_points(db_session, company_id=company_id, day=_TODAY, exclude_point_ids=set())
     assert {point.id for point in pool} == {point.id for point in working.points}
+
+
+async def test_a_past_days_route_left_open_is_closed_by_the_next_scan(
+    db_session: AsyncSession,
+) -> None:
+    """The scheduler was down over Tuesday's 17:00: Wednesday morning's first pass closes the
+    routes Tuesday left open, their live stops released END_OF_DAY like the day's end does."""
+    working = await _working(db_session, rooms=2)
+    working.route.stops[0].status = RouteStopStatus.DONE
+    paused = await _working(db_session, rooms=1, service_type=working.service_type)
+    paused.route.status = RouteStatus.PAUSED
+    paused.route.stops[0].status = RouteStopStatus.RELEASED
+    paused.route.stops[0].release_reason = ReleaseReason.LEFT_CAMPUS
+    await db_session.commit()
+    wednesday_morning = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
+
+    await run_release_scan(db_session, now=wednesday_morning)
+
+    route_status, stops = await _route_state(db_session, working.route)
+    assert route_status is RouteStatus.DONE
+    assert [stop.status for stop in stops] == [RouteStopStatus.DONE, RouteStopStatus.RELEASED]
+    assert stops[1].release_reason is ReleaseReason.END_OF_DAY
+    assert stops[1].released_at == wednesday_morning
+    paused_status, paused_stops = await _route_state(db_session, paused.route)
+    assert paused_status is RouteStatus.DONE
+    assert paused_stops[0].release_reason is ReleaseReason.LEFT_CAMPUS
+
+
+async def test_a_fridays_route_left_open_is_closed_even_on_a_saturday(
+    db_session: AsyncSession,
+) -> None:
+    friday = datetime(2026, 10, 23, 13, 0, tzinfo=UTC)
+    working = await _working(db_session, now=friday, rooms=1)
+
+    alerts = await run_release_scan(db_session, now=_SATURDAY)
+
+    route_status, stops = await _route_state(db_session, working.route)
+    assert alerts == []
+    assert route_status is RouteStatus.DONE
+    _assert_released(stops, ReleaseReason.END_OF_DAY)

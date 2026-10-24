@@ -44,11 +44,14 @@ async def run_release_scan(
     db: AsyncSession, *, now: datetime, push: PushSender | None = None
 ) -> list[Alert]:
     """Release what nobody is serving any more, COMMIT, then notify; returns the alerts this pass
-    inserted. Nothing happens on a day outside `service_weekdays` (spec §7.3.1). Idempotent: a
+    inserted. Routes of a past day still open are closed first, whatever the day; besides
+    that, nothing happens on a day outside `service_weekdays` (spec §7.3.1). Idempotent: a
     released route is no longer IN_PROGRESS and the day alert is deduplicated per day."""
     settings = await get_settings_row(db)
     today = campus_today(now)
+    await _close_past_days(db, today=today, now=now)
     if not is_service_day(settings, today):
+        await db.commit()
         return []
 
     drafts: list[AlertDraft] = []
@@ -198,6 +201,25 @@ async def _close_the_day(db: AsyncSession, *, today: date, now: datetime) -> lis
             route_id=None,
         )
     ]
+
+
+async def _close_past_days(db: AsyncSession, *, today: date, now: datetime) -> None:
+    """Close the routes of a past day still open (live stops → RELEASED `END_OF_DAY`): the
+    scheduler was down over that day's end, so `_close_the_day` never ran for them, and the
+    allocation no longer serves them. A Friday missed is closed on Saturday too. No
+    POINTS_UNSERVED alert for that day: it is past, the managers see it in the reports."""
+    stale = await db.scalars(
+        select(Route)
+        .where(
+            Route.route_date < today,
+            Route.status.in_([RouteStatus.IN_PROGRESS, RouteStatus.PAUSED]),
+        )
+        .with_for_update(skip_locked=True)
+    )
+    for route in stale.all():
+        await release_route(
+            db, route=route, reason=ReleaseReason.END_OF_DAY, at=now, actor_id=None, close=True
+        )
 
 
 async def _unserved_per_type(db: AsyncSession, day: date) -> list[tuple[str, str, int]]:
