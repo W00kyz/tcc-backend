@@ -69,3 +69,25 @@ def test_downgrade_removes_only_the_new_version(pre_reset_database_url: str) -> 
         "SELECT n.version FROM consent_records c "
         "JOIN privacy_notices n ON n.id = c.privacy_notice_id",
     ) == [(1,)]
+
+
+def test_downgrade_never_removes_a_later_notice_it_did_not_insert(
+    pre_reset_database_url: str,
+) -> None:
+    url = pre_reset_database_url
+    _at_previous_head(url)
+    cfg = alembic_config(url)
+    command.upgrade(cfg, _REVISION)
+    # The author later publishes v3 by hand, also ending with the sentence.
+    run_sql(url, "UPDATE privacy_notices SET is_current = false")
+    run_sql(
+        url,
+        "INSERT INTO privacy_notices (id, version, title, body_markdown, published_at, "
+        "is_current) VALUES (gen_random_uuid(), 3, 'Aviso', "
+        f"'Novo texto.\n\n{_SENTENCE}', now(), true)",
+    )
+
+    command.downgrade(cfg, _PREVIOUS)
+
+    assert [row[0] for row in run_sql(url, _NOTICES)] == [1, 2, 3]
+    assert run_sql(url, _NOTICES)[2][2] is True

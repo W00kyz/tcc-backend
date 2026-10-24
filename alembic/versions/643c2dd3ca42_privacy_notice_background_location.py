@@ -49,20 +49,22 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
+    # Exactly the row upgrade() inserted: the latest version, whose body is its predecessor's
+    # body plus the sentence — never another notice that happens to mention it.
     added = (
-        "SELECT id FROM privacy_notices "
-        "WHERE version = (SELECT max(version) FROM privacy_notices) AND body_markdown LIKE :tail"
+        "SELECT n.id FROM privacy_notices n "
+        "JOIN privacy_notices p ON p.version = n.version - 1 "
+        "WHERE n.version = (SELECT max(version) FROM privacy_notices) "
+        "AND n.body_markdown = p.body_markdown || :suffix"
     )
-    # Acceptances of the removed version point at a row that is going away.
+    # The FK from consent_records would block the delete: acceptances of the removed version go.
     op.execute(
         sa.text(f"DELETE FROM consent_records WHERE privacy_notice_id IN ({added})").bindparams(
-            tail=f"%{_SENTENCE}"
+            suffix=_SUFFIX
         )
     )
     op.execute(
-        sa.text(f"DELETE FROM privacy_notices WHERE id IN ({added})").bindparams(
-            tail=f"%{_SENTENCE}"
-        )
+        sa.text(f"DELETE FROM privacy_notices WHERE id IN ({added})").bindparams(suffix=_SUFFIX)
     )
     _make_latest_current()
 
