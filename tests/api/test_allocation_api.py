@@ -22,7 +22,13 @@ from app.domain.catalog.models import (
     ServiceType,
 )
 from app.domain.privacy.service import record_consent
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from app.domain.routing.models import (
+    ReleaseReason,
+    Route,
+    RouteStop,
+    RouteStopStatus,
+)
+from app.domain.routing.release import release_route
 from app.domain.settings.service import get_settings_row
 from app.main import create_app
 from fastapi import FastAPI
@@ -40,6 +46,7 @@ _PASSWORD = "senha-forte-o-suficiente"
 _NOW = datetime(2026, 10, 20, 13, 0, tzinfo=UTC)
 _SATURDAY = datetime(2026, 10, 24, 13, 0, tzinfo=UTC)
 _FIVE_PM = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+_NEXT_MORNING = datetime(2026, 10, 21, 13, 0, tzinfo=UTC)
 _ON_CAMPUS = {"latitude": -7.2150, "longitude": -35.9100}
 _OFF_CAMPUS = {"latitude": -7.2300, "longitude": -35.9100}
 
@@ -172,20 +179,82 @@ async def test_start_refusals_leave_no_route(
     assert await db_session.scalar(select(Route.id)) is None
 
 
-async def test_start_on_a_done_route_is_route_done(
+async def test_start_on_a_done_route_with_an_empty_pool_is_not_an_error(
     client: TestClient, db_session: AsyncSession
 ) -> None:
+    seeded = await _seed(db_session, client, rooms=2)
+    route_id = _post(client, seeded.token, "/routes/start").json()["route"]["id"]
+    await _finish_batch(db_session, route_id)
+    assert _post(client, seeded.token, f"/routes/{route_id}/next-batch").json()["pool_empty"]
+
+    response = _post(client, seeded.token, "/routes/start")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["pool_empty"] is True
+    assert response.json()["route"]["status"] == "DONE"
+
+
+async def test_start_on_a_done_route_takes_a_point_released_since(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """Spec §1: João ran out of points; Maria's point goes back to the pool when she goes
+    silent, and João's "Verificar de novo" gets it."""
     seeded = await _seed(db_session, client)
-    await make_route(
+    company = await db_session.get_one(ContractorCompany, seeded.worker.contractor_company_id)
+    maria = await make_worker(db_session, company=company, email="maria@empresa.com")
+    await record_consent(db_session, user_id=maria.user_id, ip_address=None, user_agent=None)
+    await db_session.commit()
+    joao_route = _post(client, seeded.token, "/routes/start").json()["route"]["id"]
+    maria_start = _post(client, _login(client, "maria@empresa.com"), "/routes/start").json()
+    await _finish_batch(db_session, joao_route)
+    done = _post(client, seeded.token, f"/routes/{joao_route}/next-batch").json()
+    assert (done["pool_empty"], done["route"]["status"]) == (True, "DONE")
+    maria_route = await db_session.get_one(Route, maria_start["route"]["id"])
+    await release_route(
         db_session,
-        worker=seeded.worker,
-        day=campus_today(_NOW),
-        points=[],
-        status=RouteStatus.DONE,
+        route=maria_route,
+        reason=ReleaseReason.LOCATION_SILENCE,
+        at=_NOW,
+        actor_id=None,
     )
     await db_session.commit()
 
     response = _post(client, seeded.token, "/routes/start")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pool_empty"] is False
+    assert body["route"]["status"] == "IN_PROGRESS"
+    assert body["route"]["current_batch"] == 2
+    new_stops = [stop for stop in body["route"]["stops"] if stop["batch_number"] == 2]
+    assert [stop["service_point_id"] for stop in new_stops] == [
+        maria_start["route"]["stops"][0]["service_point_id"]
+    ]
+
+
+async def test_a_done_route_is_refused_after_the_workday(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seeded = await _seed(db_session, client, rooms=2)
+    route_id = _post(client, seeded.token, "/routes/start").json()["route"]["id"]
+    await _finish_batch(db_session, route_id)
+    _post(client, seeded.token, f"/routes/{route_id}/next-batch")
+    _freeze(client, _FIVE_PM)
+
+    response = _post(client, seeded.token, "/routes/start")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "WORKDAY_OVER"
+
+
+async def test_next_batch_on_a_past_days_route_is_route_done(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seeded = await _seed(db_session, client)
+    route_id = _post(client, seeded.token, "/routes/start").json()["route"]["id"]
+    _freeze(client, _NEXT_MORNING)
+
+    response = _post(client, seeded.token, f"/routes/{route_id}/next-batch")
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "ROUTE_DONE"
@@ -246,9 +315,11 @@ async def test_next_batch_with_an_empty_pool_closes_the_route(
     assert response.status_code == 200
     assert response.json()["pool_empty"] is True
     assert response.json()["route"]["status"] == "DONE"
+    # Asking again the same workday looks at the pool again: still empty, still no error.
     again = _post(client, seeded.token, f"/routes/{route_id}/next-batch")
-    assert again.status_code == 409
-    assert again.json()["detail"]["code"] == "ROUTE_DONE"
+    assert again.status_code == 200, again.text
+    assert again.json()["pool_empty"] is True
+    assert again.json()["route"]["status"] == "DONE"
 
 
 async def test_next_batch_outside_campus_is_refused(

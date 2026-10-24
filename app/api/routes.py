@@ -65,7 +65,8 @@ class AllocationBody(BaseModel):
 
 class AllocationOut(BaseModel):
     route: RouteOut
-    # True when there was nothing left to hand out: the route is now DONE for the day.
+    # True when nothing could be handed out. An empty pool leaves the route DONE, yet not for
+    # good: asking again the same workday reopens it when a point went back to the pool.
     pool_empty: bool
 
 
@@ -137,8 +138,9 @@ async def start_route(
     body: AllocationBody, worker: ApprovedWorker, db: _Db, now: Now, request: Request
 ) -> AllocationOut:
     """The "Iniciar rota" button: create or reopen today's route and hand out a batch; a retry
-    while the batch is open returns it unchanged. 409 with a machine code when no batch can be
-    given."""
+    while the batch is open returns it unchanged. A route DONE for an empty pool is looked at
+    again: reopened with the points released since, else `pool_empty=true`. 409 with a machine
+    code when the day or the position refuses any batch."""
     await ensure_location_consent(db, worker)
     settings = await get_settings_row(db)
     result = await _allocating(
@@ -166,7 +168,9 @@ async def next_route_batch(
     request: Request,
 ) -> AllocationOut:
     """The next batch once the current one has no open stop (unchanged while it has one). An
-    empty pool closes the route: `pool_empty=true`, status DONE."""
+    empty pool closes the route: `pool_empty=true`, status DONE; asking again the same workday
+    reopens it when a point went back to the pool. 409 `ROUTE_DONE` for a route of a past
+    day."""
     await ensure_location_consent(db, worker)
     route = await db.get(Route, route_id)
     if route is None or route.field_worker_id != worker.id:

@@ -53,13 +53,15 @@ class OutsideCampus(AllocationRefused):
 
 
 class RouteAlreadyDone(AllocationRefused):
-    """The route is closed for the day — the pool ran out, or the day is over."""
+    """The route belongs to a past campus day: it never hands out today's points. (Today's
+    route closed by an empty pool is not refused — asking again looks at the pool again.)"""
 
 
 @dataclass
 class AllocationResult:
     route: Route
-    # True when the worker asked for more and the pool had nothing left: the route is now DONE.
+    # True when the worker asked for more and nothing could be handed out. When the pool really
+    # was empty the route is DONE — until a point freed later is asked for again (spec §1).
     pool_empty: bool
 
 
@@ -75,8 +77,9 @@ async def start_or_resume(
     osrm: OsrmClient | None,
 ) -> AllocationResult:
     """The "Iniciar rota" button: create or reopen the worker's route of `today` and hand out a
-    batch. A retry while the batch is open returns it unchanged. Raises an `AllocationRefused`
-    before any route row is created or changed.
+    batch. A retry while the batch is open returns it unchanged; a route DONE for an empty pool
+    is reopened when points went back to the pool since. Raises an `AllocationRefused` before
+    any route row is created or changed.
 
         result = await start_or_resume(db, worker=w, today=d, now=n, lat=la, lng=lo,
                                        settings=s, osrm=osrm)
@@ -102,7 +105,9 @@ async def next_batch(
 ) -> AllocationResult:
     """The next batch from the worker's current position, once the current one has no open stop
     (while it has one, the route comes back unchanged). An empty pool closes the route (`DONE`,
-    `pool_empty=True`). Same refusals as `start_or_resume`.
+    `pool_empty=True`); asking again later the same workday looks at the pool again and reopens
+    the route when a point was released meanwhile (spec §1). Same refusals as
+    `start_or_resume`, plus `RouteAlreadyDone` for a route of a past day.
 
         result = await next_batch(db, route=route, now=n, lat=la, lng=lo, settings=s, osrm=osrm)
     """
@@ -192,20 +197,28 @@ async def _advance(
     osrm: OsrmClient | None,
 ) -> AllocationResult:
     if await _has_open_stop(db, route):  # an idempotent retry: the batch is still being worked
+        # A live batch is being worked, whatever a release that raced its claim left behind.
+        route.status = RouteStatus.IN_PROGRESS
+        await db.flush()
         await db.refresh(route, attribute_names=["stops"])
         return AllocationResult(route=route, pool_empty=False)
-    if route.status is RouteStatus.DONE:
-        raise RouteAlreadyDone(f"Route {route.id} of {route.route_date} is already DONE.")
-    claimed = await _claim(
+    # A DONE route of today asks the pool again (the guards already refused a closed workday):
+    # points released after it ran out are taken by whoever asks (spec §1).
+    pool = await free_points(
         db,
-        route=route,
         company_id=await _company_of(db, route),
-        origin=origin,
-        size=settings.allocation_batch_size,
-        exclude=await _impeded_by_worker(db, route),
+        day=route.route_date,
+        exclude_point_ids=await _impeded_by_worker(db, route),
+    )
+    claimed = await _claim(
+        db, route=route, pool=pool, origin=origin, size=settings.allocation_batch_size
     )
     if not claimed:
-        route.status = RouteStatus.DONE
+        # Only a truly empty pool closes the route. Candidates all held by claims still in
+        # flight (SKIP LOCKED) are not "nothing left": the route keeps its status and the app's
+        # retry gets them, or finds the pool empty and closes it then.
+        if not pool:
+            route.status = RouteStatus.DONE
         await db.flush()
         await db.refresh(route, attribute_names=["stops"])
         return AllocationResult(route=route, pool_empty=True)
@@ -253,20 +266,17 @@ async def _claim(
     db: AsyncSession,
     *,
     route: Route,
-    company_id: uuid.UUID,
+    pool: list[ServicePoint],
     origin: tuple[float, float],
     size: int,
-    exclude: set[uuid.UUID],
 ) -> list[RouteStop]:
-    """Take up to `size` of the nearest free points as PENDING stops of a new batch (spec §6.3).
+    """Take up to `size` of the nearest points of `pool` as PENDING stops of a new batch (spec
+    §6.3).
 
     The candidates are row-locked with SKIP LOCKED, so a concurrent claim skips the points this
     one is taking instead of waiting on them. The exclusivity index is the last barrier: a point
     a concurrent claim committed after the pool was read is refused by it and skipped.
     """
-    pool = await free_points(
-        db, company_id=company_id, day=route.route_date, exclude_point_ids=exclude
-    )
     candidates = _nearest_first(pool, origin)
     batch_number, first_index = await _next_batch_slot(db, route)
     tried: set[uuid.UUID] = set()

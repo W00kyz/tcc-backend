@@ -38,6 +38,7 @@ from app.domain.routing.models import (
     RouteStop,
     RouteStopStatus,
 )
+from app.domain.routing.release import release_route
 from app.domain.settings.models import SystemSettings
 from app.domain.settings.service import get_settings_row
 from sqlalchemy import func, select
@@ -410,6 +411,31 @@ async def test_point_taken_after_the_pool_was_read_is_skipped(
     assert _names(result.route.stops) == ["A2"]
 
 
+async def test_a_pool_held_by_a_concurrent_claim_does_not_close_the_route(
+    db_session: AsyncSession, own_sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Every candidate is row-locked by a claim still in flight: nothing is handed out, but the
+    pool is not empty — the route must not be closed for it."""
+    first_id, second_id, _ = await _two_workers_one_building(db_session)
+    (await get_settings_row(db_session)).allocation_batch_size = 6
+    await db_session.commit()
+
+    async with own_sessions() as first_session, own_sessions() as second_session:
+        first = await _start_in(first_session, first_id)
+        second_worker = await second_session.get_one(FieldWorker, second_id)
+        second = await asyncio.wait_for(
+            _start(second_session, second_worker, await get_settings_row(second_session)),
+            timeout=10,
+        )
+        await first_session.commit()
+        await second_session.commit()
+
+    assert len(first) == 6
+    assert second.pool_empty is True
+    assert second.route.stops == []
+    assert second.route.status is RouteStatus.IN_PROGRESS
+
+
 # --- batches over the day --------------------------------------------------------------------
 
 
@@ -513,8 +539,87 @@ async def test_empty_pool_marks_route_done(db_session: AsyncSession) -> None:
     assert result.pool_empty is True
     assert result.route.status is RouteStatus.DONE
     assert len(result.route.stops) == 2
-    with pytest.raises(allocation.RouteAlreadyDone):
-        await _start(db_session, worker, settings)
+    # Asking again while the workday lasts is not an error: the pool is still empty.
+    again = await _start(db_session, worker, settings)
+    assert again.pool_empty is True
+    assert again.route.status is RouteStatus.DONE
+    assert len(again.route.stops) == 2
+
+
+async def test_done_route_takes_a_point_released_later(db_session: AsyncSession) -> None:
+    """Spec §1: a released point goes back to the pool and another worker takes it — also one
+    whose route already ran out of points earlier that day."""
+    own = await _company(db_session)
+    await _building(
+        db_session,
+        "Bloco A",
+        (-7.2150, -35.9095),
+        [("Térreo", "A1"), ("Térreo", "A2")],
+        own.service_type,
+    )
+    ana = await make_worker(db_session, company=own.company, full_name="Ana")
+    bruno = await make_worker(db_session, company=own.company, full_name="Bruno")
+    settings = await _settings(db_session, batch_size=1)
+    ana_start = await _start(db_session, ana, settings)
+    bruno_start = await _start(db_session, bruno, settings)
+    await _finish(db_session, ana_start.route.stops)
+    ana_done = await _next(db_session, ana_start.route, settings)
+    assert (ana_done.pool_empty, ana_done.route.status) == (True, RouteStatus.DONE)
+    await release_route(
+        db_session,
+        route=bruno_start.route,
+        reason=ReleaseReason.LOCATION_SILENCE,
+        at=_NOW,
+        actor_id=None,
+    )
+    later = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
+
+    result = await _next(db_session, ana_start.route, settings, now=later)
+
+    assert result.pool_empty is False
+    assert result.route.status is RouteStatus.IN_PROGRESS
+    assert _names(_batch(result.route, 2)) == _names(bruno_start.route.stops)
+    assert result.route.last_allocated_at == later
+
+
+async def test_done_route_stays_closed_outside_the_workday(db_session: AsyncSession) -> None:
+    worker, settings = await _one_point_world(db_session)
+    started = await _start(db_session, worker, settings)
+    await _finish(db_session, started.route.stops)
+    await _next(db_session, started.route, settings)
+    assert started.route.status is RouteStatus.DONE
+
+    with pytest.raises(WorkdayOver):
+        await _next(db_session, started.route, settings, now=_FIVE_PM)
+    with pytest.raises(WorkdayOver):
+        await _start(db_session, worker, settings, now=_FIVE_PM)
+    with pytest.raises(NotAServiceDay):
+        await _next(db_session, started.route, settings, now=_SATURDAY_NOW)
+    assert started.route.status is RouteStatus.DONE
+
+
+async def test_paused_route_holding_a_live_batch_is_back_in_progress(
+    db_session: AsyncSession,
+) -> None:
+    own = await _company(db_session)
+    await _building(
+        db_session,
+        "Bloco A",
+        (-7.2150, -35.9095),
+        [("Térreo", "A1"), ("Térreo", "A2")],
+        own.service_type,
+    )
+    worker = await make_worker(db_session, company=own.company)
+    settings = await _settings(db_session, batch_size=2)
+    started = await _start(db_session, worker, settings)
+    stop_ids = [stop.id for stop in started.route.stops]
+    started.route.status = RouteStatus.PAUSED  # a release that raced the claim left it so
+    await db_session.flush()
+
+    result = await _start(db_session, worker, settings)
+
+    assert result.route.status is RouteStatus.IN_PROGRESS
+    assert [stop.id for stop in result.route.stops] == stop_ids
 
 
 async def test_paused_route_resumes_with_new_batch_same_route(db_session: AsyncSession) -> None:
