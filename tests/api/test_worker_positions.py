@@ -240,6 +240,7 @@ async def test_worker_without_consent_403(
     response = _post(client, token, route_id=str(seeded.route.id))
 
     assert response.status_code == 403, response.text
+    assert response.json()["detail"]["code"] == "CONSENT_REQUIRED"
     assert (await db_session.execute(select(WorkerPosition))).scalars().first() is None
 
 

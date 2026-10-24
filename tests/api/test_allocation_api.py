@@ -197,6 +197,8 @@ async def test_start_requires_consent(client: TestClient, db_session: AsyncSessi
     response = _post(client, seeded.token, "/routes/start")
 
     assert response.status_code == 403
+    # A machine code, so the app sends an already-logged-in worker to the consent screen.
+    assert response.json()["detail"]["code"] == "CONSENT_REQUIRED"
     assert await db_session.scalar(select(Route.id)) is None
 
 

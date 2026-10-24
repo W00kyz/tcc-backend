@@ -78,16 +78,20 @@ ApprovedWorker = Annotated[FieldWorker, Depends(get_approved_worker)]
 
 
 async def ensure_location_consent(db: AsyncSession, worker: FieldWorker) -> None:
-    """403 until the worker has accepted the current privacy notice: no location data is
-    accepted before that (RNF10).
+    """403 `CONSENT_REQUIRED` until the worker has accepted the current privacy notice: no
+    location data is accepted before that (RNF10). The machine code lets the app send a worker
+    who logged in before a new notice was published to the consent screen.
 
     Example: ``await ensure_location_consent(db, worker)``
     """
     if not await has_consented(db, user_id=worker.user_id):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "Consent to the current privacy notice is required before location data can be "
-            "collected.",
+            detail={
+                "code": "CONSENT_REQUIRED",
+                "detail": "Consent to the current privacy notice is required before location "
+                "data can be collected.",
+            },
         )
 
 

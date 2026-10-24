@@ -84,6 +84,8 @@ class RefreshRequest(BaseModel):
 class AccessTokenResponse(WorkerStanding):
     access_token: str
     token_type: str = "bearer"
+    # Like login's: a notice published while the worker was logged in reaches them here.
+    consent_required: bool
 
 
 async def _worker_standing(db: AsyncSession, user: User) -> WorkerStanding:
@@ -198,6 +200,7 @@ async def refresh(
             secret=settings.jwt_secret_key,
             minutes=settings.jwt_access_token_minutes,
         ),
+        consent_required=not await has_consented(db, user_id=user.id),
         **standing.model_dump(),
     )
 
