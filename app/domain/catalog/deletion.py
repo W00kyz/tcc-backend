@@ -16,6 +16,7 @@ from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.object_store import ObjectStore, ObjectStoreError
+from app.domain.appeals.models import Appeal
 from app.domain.catalog.models import Building, Floor, ServicePoint
 from app.domain.execution.models import (
     Answer,
@@ -44,6 +45,7 @@ class DeletionImpact:
     routes: int
     executions: int
     photos: int
+    appeals: int
 
 
 async def _ids(db: AsyncSession, query: Select[Any]) -> list[uuid.UUID]:
@@ -73,12 +75,14 @@ async def _impact(db: AsyncSession, point_ids: Ids, floors: int) -> DeletionImpa
             EvidenceItem.execution_id.in_(execution_ids), EvidenceItem.kind == EvidenceKind.PHOTO
         )
     )
+    appeals = await db.scalar(select(func.count()).where(Appeal.route_stop_id.in_(stop_ids)))
     return DeletionImpact(
         points=len(point_ids),
         floors=floors,
         routes=int(routes or 0),
         executions=len(execution_ids),
         photos=int(photos or 0),
+        appeals=int(appeals or 0),
     )
 
 
@@ -136,8 +140,9 @@ async def delete_form_of_type(db: AsyncSession, service_type_id: uuid.UUID) -> N
 
 
 async def _delete_stops(db: AsyncSession, stop_ids: Ids) -> list[str]:
+    # An accepted appeal's APPEAL execution references the stop like any other: it goes above.
     photo_keys = await _delete_executions(db, await _ids(db, _executions_of_stops(stop_ids)))
-    for model in (Alert, Impediment):
+    for model in (Alert, Impediment, Appeal):
         await db.execute(delete(model).where(model.route_stop_id.in_(stop_ids)))
     await db.execute(delete(RouteStop).where(RouteStop.id.in_(stop_ids)))
     return photo_keys

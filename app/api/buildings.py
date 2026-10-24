@@ -65,6 +65,7 @@ class DeletionImpactOut(BaseModel):
     routes: int
     executions: int
     photos: int
+    appeals: int
 
 
 def _to_out(building: Building) -> BuildingOut:
