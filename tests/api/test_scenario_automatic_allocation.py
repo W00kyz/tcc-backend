@@ -151,6 +151,10 @@ async def test_automatic_allocation_day_end_to_end(
     points = await make_points(
         db, service_type=service_type, names=[f"Sala {i}" for i in range(1, 9)], at=_POINT
     )
+    # The report counts a point from the campus day it was created; the scenario's day is fixed,
+    # so the points must predate it whatever the wall clock says when the test runs.
+    for point in points:
+        point.created_at = _at(0) - timedelta(days=30)
     qr = sign_qr_payload(
         floor_id=points[0].floor_id,
         version=1,
