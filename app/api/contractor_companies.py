@@ -30,6 +30,7 @@ class CompanyServiceTypeOut(BaseModel):
     id: UUID
     name: str
     average_duration_minutes: int
+    requires_evidence: bool
 
 
 class ServiceTypeRow(BaseModel):
@@ -38,6 +39,7 @@ class ServiceTypeRow(BaseModel):
     id: UUID | None = None
     name: str = Field(min_length=1, max_length=100)
     average_duration_minutes: int = Field(default=30, gt=0)
+    requires_evidence: bool = False
 
 
 class ContractorCompanyOut(BaseModel):
@@ -66,7 +68,10 @@ def _to_out(company: ContractorCompany) -> ContractorCompanyOut:
         cnpj=company.cnpj,
         service_types=[
             CompanyServiceTypeOut(
-                id=item.id, name=item.name, average_duration_minutes=item.average_duration_minutes
+                id=item.id,
+                name=item.name,
+                average_duration_minutes=item.average_duration_minutes,
+                requires_evidence=item.requires_evidence,
             )
             for item in sorted(company.service_types, key=lambda item: item.name)
         ],
@@ -127,7 +132,11 @@ async def _reconcile_service_types(
     for row in rows:
         if row.id is None:
             company.service_types.append(
-                ServiceType(name=row.name, average_duration_minutes=row.average_duration_minutes)
+                ServiceType(
+                    name=row.name,
+                    average_duration_minutes=row.average_duration_minutes,
+                    requires_evidence=row.requires_evidence,
+                )
             )
             continue
         found = owned.get(row.id) or await db.get(ServiceType, row.id)
@@ -142,6 +151,7 @@ async def _reconcile_service_types(
             )
         service_type.name = row.name
         service_type.average_duration_minutes = row.average_duration_minutes
+        service_type.requires_evidence = row.requires_evidence
         if service_type.contractor_company_id is None:
             company.service_types.append(service_type)
     try:

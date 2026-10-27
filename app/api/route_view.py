@@ -47,6 +47,8 @@ class RouteStopOut(BaseModel):
     # The service type executed here; both are null for a stop with no `service_type_id`.
     service_type_id: UUID | None
     service_type_name: str | None
+    # Whether finishing this stop needs evidence; fixed when the stop was allocated.
+    requires_evidence: bool
 
 
 class RouteOut(BaseModel):
@@ -82,6 +84,7 @@ def _to_stop_out(stop: RouteStop) -> RouteStopOut:
         leg_geometry=stop.leg_geometry,
         service_type_id=stop.service_type_id,
         service_type_name=stop.service_type.name if stop.service_type is not None else None,
+        requires_evidence=stop.requires_evidence,
     )
 
 

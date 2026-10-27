@@ -51,6 +51,9 @@ class ServiceType(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     contractor_company: Mapped["ContractorCompany | None"] = relationship(
         back_populates="service_types"
     )
+    # Whether finishing a stop of this type needs a photo or file as evidence (spec
+    # 2026-10-26-exige-evidencias). Copied to each stop when it is allocated.
+    requires_evidence: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
 
 
 class FieldWorkerStatus(enum.StrEnum):

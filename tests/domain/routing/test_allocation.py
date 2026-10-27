@@ -210,6 +210,35 @@ async def test_start_allocates_batch_of_configured_size_nearest_first(
     assert route.stops[1].leg_geometry is not None  # legs recomputed over the batch
 
 
+async def test_allocation_copies_requires_evidence_to_stop(db_session: AsyncSession) -> None:
+    own = await _company(db_session)
+    own.service_type.requires_evidence = True
+    await _building(
+        db_session, "Bloco A", (-7.2150, -35.9095), [("Térreo", "A1")], own.service_type
+    )
+    worker = await make_worker(db_session, company=own.company)
+    settings = await _settings(db_session)
+
+    result = await _start(db_session, worker, settings)
+
+    assert [stop.requires_evidence for stop in result.route.stops] == [True]
+
+
+async def test_allocated_stop_does_not_require_evidence_by_default(
+    db_session: AsyncSession,
+) -> None:
+    own = await _company(db_session)
+    await _building(
+        db_session, "Bloco A", (-7.2150, -35.9095), [("Térreo", "A1")], own.service_type
+    )
+    worker = await make_worker(db_session, company=own.company)
+    settings = await _settings(db_session)
+
+    result = await _start(db_session, worker, settings)
+
+    assert [stop.requires_evidence for stop in result.route.stops] == [False]
+
+
 async def test_only_points_of_the_worker_company_types(db_session: AsyncSession) -> None:
     own = await _company(db_session, "Limpa Tudo")
     other = await _company(db_session, "Jardins SA")

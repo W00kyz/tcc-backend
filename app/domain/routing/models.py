@@ -122,6 +122,9 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     service_type_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("service_types.id"), nullable=True
     )
+    # Copy of the service type's flag taken at allocation, so a later change to the type does not
+    # alter stops already handed out.
+    requires_evidence: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     status: Mapped[RouteStopStatus] = mapped_column(
         ROUTE_STOP_STATUS_ENUM, default=RouteStopStatus.PENDING
     )

@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import contains_eager, selectinload
 
 from app.core.campus_clock import campus_today
 from app.domain.catalog.models import FieldWorker, Floor, ServicePoint, ServiceType
@@ -137,7 +137,10 @@ async def free_points(
         select(ServicePoint)
         .join(ServiceType, ServicePoint.service_type_id == ServiceType.id)
         .where(ServiceType.contractor_company_id == company_id, ~taken)
-        .options(selectinload(ServicePoint.floor).selectinload(Floor.building))
+        .options(
+            contains_eager(ServicePoint.service_type),
+            selectinload(ServicePoint.floor).selectinload(Floor.building),
+        )
     )
     if exclude_point_ids:
         stmt = stmt.where(ServicePoint.id.not_in(exclude_point_ids))
@@ -342,6 +345,7 @@ def _new_stop(
         route_id=route.id,
         service_point=point,
         service_type_id=point.service_type_id,
+        requires_evidence=point.service_type.requires_evidence if point.service_type else False,
         order_index=order_index,
         batch_number=batch_number,
         service_date=route.route_date,

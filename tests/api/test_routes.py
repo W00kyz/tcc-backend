@@ -177,6 +177,22 @@ async def test_routes_me_stop_has_no_form_key(client: TestClient, db_session: As
     assert all("form" not in stop for stop in stops)
 
 
+async def test_routes_me_stop_carries_requires_evidence(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    route = await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points)
+    route.stops[0].requires_evidence = True
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    response = client.get("/routes/me", headers=_auth(token))
+
+    assert response.status_code == 200
+    stops = response.json()["route"]["stops"]
+    assert [stop["requires_evidence"] for stop in stops] == [True, False, False]
+
+
 async def test_routes_me_follows_the_campus_day_not_the_server_date(
     client: TestClient, db_session: AsyncSession
 ) -> None:

@@ -93,7 +93,10 @@ async def seed() -> None:
         await db.flush()
 
         service_type = ServiceType(
-            name="Limpeza", average_duration_minutes=30, contractor_company_id=company.id
+            name="Limpeza",
+            average_duration_minutes=30,
+            contractor_company_id=company.id,
+            requires_evidence=True,
         )
         db.add(service_type)
         await db.flush()

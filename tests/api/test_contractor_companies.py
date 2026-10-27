@@ -154,6 +154,78 @@ async def test_company_saves_its_service_types(
     assert sorted(t["name"] for t in all_types) == ["Limpeza geral", "Pintura"]
 
 
+async def test_create_company_service_type_with_requires_evidence(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+
+    created = client.post(
+        "/contractor-companies",
+        json=_body(
+            service_types=[
+                {"name": "Limpeza", "requires_evidence": True},
+                {"name": "Jardinagem", "requires_evidence": False},
+            ]
+        ),
+        headers=headers,
+    )
+
+    assert created.status_code == 201, created.text
+    flags = {t["name"]: t["requires_evidence"] for t in created.json()["service_types"]}
+    assert flags == {"Limpeza": True, "Jardinagem": False}
+    listed = client.get("/service-types", headers=headers).json()
+    assert {t["name"]: t["requires_evidence"] for t in listed} == flags
+
+
+async def test_update_service_type_toggles_requires_evidence(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    created = client.post(
+        "/contractor-companies",
+        json=_body(service_types=[{"name": "Limpeza"}]),
+        headers=headers,
+    )
+    service_type = created.json()["service_types"][0]
+
+    on = client.patch(
+        f"/contractor-companies/{created.json()['id']}",
+        json=_body(
+            service_types=[{"id": service_type["id"], "name": "Limpeza", "requires_evidence": True}]
+        ),
+        headers=headers,
+    )
+    off = client.patch(
+        f"/contractor-companies/{created.json()['id']}",
+        json=_body(
+            service_types=[
+                {"id": service_type["id"], "name": "Limpeza", "requires_evidence": False}
+            ]
+        ),
+        headers=headers,
+    )
+
+    assert on.status_code == 200, on.text
+    assert on.json()["service_types"][0]["requires_evidence"] is True
+    assert off.status_code == 200, off.text
+    assert off.json()["service_types"][0]["requires_evidence"] is False
+
+
+async def test_service_type_requires_evidence_defaults_false(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+
+    created = client.post(
+        "/contractor-companies",
+        json=_body(service_types=[{"name": "Limpeza"}]),
+        headers=headers,
+    )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["service_types"][0]["requires_evidence"] is False
+
+
 async def test_removing_a_type_in_use_is_blocked_with_count(
     client: TestClient, db_session: AsyncSession
 ) -> None:
