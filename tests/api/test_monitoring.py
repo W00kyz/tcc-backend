@@ -1,18 +1,24 @@
-"""Etapa 9 — the monitoring board HTTP surface. The derived `is_delayed`, the OPEN-alert
-count and the latest-position-per-worker fold are pinned here against a real testcontainer;
-RBAC too."""
+"""Etapa 9 — the monitoring board HTTP surface. The OPEN-alert count, the open-route scope and
+the latest-position-per-worker fold are pinned here against a real testcontainer; RBAC too."""
 
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
-from app.core.campus_clock import campus_today, campus_wall_clock
+from app.core.campus_clock import campus_today
 from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
 from app.domain.audit.models import AuditTrail
-from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    FieldWorker,
+    FieldWorkerStatus,
+    Floor,
+    ServicePoint,
+)
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import (
     Alert,
@@ -21,13 +27,13 @@ from app.domain.monitoring.models import (
     AlertStatus,
     WorkerPosition,
 )
-from app.domain.routing.models import Route, RouteStatus, RouteStopStatus, RouteType
-from app.domain.routing.service import StopInput, create_route
+from app.domain.routing.models import Route, RouteStatus
 from app.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.factories import make_route
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -81,7 +87,10 @@ async def _seed_actors(db: AsyncSession) -> _Fixture:
     db.add_all([manager, worker_user, company])
     await db.flush()
     worker = FieldWorker(
-        full_name="Joao da Silva", contractor_company_id=company.id, user_id=worker_user.id
+        full_name="Joao da Silva",
+        contractor_company_id=company.id,
+        user_id=worker_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     db.add(worker)
     await db.flush()
@@ -115,24 +124,12 @@ async def _make_route(
     fx: _Fixture,
     *,
     point_count: int = 1,
-    status: RouteStatus = RouteStatus.PLANNED,
+    status: RouteStatus = RouteStatus.IN_PROGRESS,
     route_date: date = _TODAY,
-    scheduled_start_at: datetime | None = None,
 ) -> Route:
+    # One route per worker per day: a test with several routes gives each its own day.
     points = await _points(db, point_count)
-    route = await create_route(
-        db,
-        field_worker_id=fx.worker.id,
-        route_date=route_date,
-        route_type=RouteType.REGULAR,
-        scheduled_start_at=scheduled_start_at,
-        stops=[StopInput(service_point_id=p.id) for p in points],
-        actor_id=fx.manager.id,
-        osrm=FakeOsrmClient(),
-    )
-    route.status = status
-    await db.flush()
-    return route
+    return await make_route(db, worker=fx.worker, day=route_date, points=points, status=status)
 
 
 def _get_board(client: TestClient, token: str) -> dict[str, Any]:
@@ -158,87 +155,17 @@ async def test_empty_board(client: TestClient, db_session: AsyncSession) -> None
     assert body["generated_at"] is not None
 
 
-# --- is_delayed derivation ----------------------------------------------------------------
+# --- routes on the board ---------------------------------------------------------------
 
 
-async def test_planned_route_past_scheduled_start_is_delayed(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed_actors(db_session)
-    route = await _make_route(
-        db_session,
-        fx,
-        status=RouteStatus.PLANNED,
-        scheduled_start_at=datetime.now(UTC) - timedelta(hours=1),
-    )
-    await db_session.commit()
-    token = _login(client, fx.manager.email)
-
-    body = _get_board(client, token)
-
-    assert len(body["routes"]) == 1
-    assert body["routes"][0]["route_id"] == str(route.id)
-    assert body["routes"][0]["is_delayed"] is True
-    assert body["routes"][0]["open_alert_count"] == 0
-
-
-async def test_pending_stop_past_arrival_window_is_delayed(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed_actors(db_session)
-    route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
-    stop = route.stops[0]
-    stop.expected_arrival_to = campus_wall_clock(datetime.now(UTC)) - timedelta(minutes=30)
-    await db_session.commit()
-    token = _login(client, fx.manager.email)
-
-    body = _get_board(client, token)
-
-    assert body["routes"][0]["is_delayed"] is True
-
-
-async def test_pending_stop_within_arrival_window_is_not_delayed(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed_actors(db_session)
-    route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
-    route.stops[0].expected_arrival_to = campus_wall_clock(datetime.now(UTC)) + timedelta(hours=2)
-    await db_session.commit()
-    token = _login(client, fx.manager.email)
-
-    body = _get_board(client, token)
-
-    assert body["routes"][0]["is_delayed"] is False
-
-
-async def test_pending_stop_window_is_read_as_campus_wall_clock(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    """Regression: windows are campus wall-clock tagged UTC. A window ending 30 min from now
-    (local) used to read as already past, because it was compared with the real UTC instant."""
-    fx = await _seed_actors(db_session)
-    route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
-    route.stops[0].expected_arrival_to = campus_wall_clock(datetime.now(UTC)) + timedelta(
-        minutes=30
-    )
-    await db_session.commit()
-    token = _login(client, fx.manager.email)
-
-    body = _get_board(client, token)
-
-    assert body["routes"][0]["is_delayed"] is False
-
-
-async def test_open_late_stop_alert_marks_route_delayed_and_counts(
-    client: TestClient, db_session: AsyncSession
-) -> None:
+async def test_open_alert_counts_on_its_route(client: TestClient, db_session: AsyncSession) -> None:
     fx = await _seed_actors(db_session)
     route = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
     alert = Alert(
-        kind=AlertKind.LATE_STOP,
-        severity=AlertSeverity.WARNING,
-        dedup_key=f"LATE_STOP:{route.stops[0].id}",
-        description="Ponto atrasado",
+        kind=AlertKind.NO_EVIDENCE,
+        severity=AlertSeverity.INFO,
+        dedup_key=f"NO_EVIDENCE:{route.stops[0].id}",
+        description="Execução sem evidência",
         route_id=route.id,
         route_stop_id=route.stops[0].id,
         field_worker_id=fx.worker.id,
@@ -250,39 +177,28 @@ async def test_open_late_stop_alert_marks_route_delayed_and_counts(
 
     body = _get_board(client, token)
 
-    assert body["routes"][0]["is_delayed"] is True
     assert body["routes"][0]["open_alert_count"] == 1
+    assert "is_delayed" not in body["routes"][0]
     assert len(body["open_alerts"]) == 1
-    assert body["open_alerts"][0]["kind"] == "LATE_STOP"
+    assert body["open_alerts"][0]["kind"] == "NO_EVIDENCE"
     assert body["open_alerts"][0]["route_id"] == str(route.id)
 
 
-async def test_done_and_cancelled_routes_are_absent(
-    client: TestClient, db_session: AsyncSession
-) -> None:
+async def test_board_shows_open_routes_only(client: TestClient, db_session: AsyncSession) -> None:
     fx = await _seed_actors(db_session)
-    await _make_route(db_session, fx, status=RouteStatus.DONE)
-    await _make_route(db_session, fx, status=RouteStatus.CANCELLED)
-    kept = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    await _make_route(
+        db_session, fx, status=RouteStatus.DONE, route_date=_TODAY - timedelta(days=2)
+    )
+    paused = await _make_route(
+        db_session, fx, status=RouteStatus.PAUSED, route_date=_TODAY - timedelta(days=1)
+    )
+    in_progress = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
     await db_session.commit()
     token = _login(client, fx.manager.email)
 
     body = _get_board(client, token)
 
-    assert [r["route_id"] for r in body["routes"]] == [str(kept.id)]
-
-
-async def test_stop_counts_reflect_done_stops(client: TestClient, db_session: AsyncSession) -> None:
-    fx = await _seed_actors(db_session)
-    route = await _make_route(db_session, fx, point_count=3, status=RouteStatus.IN_PROGRESS)
-    route.stops[0].status = RouteStopStatus.DONE
-    await db_session.commit()
-    token = _login(client, fx.manager.email)
-
-    body = _get_board(client, token)
-
-    assert body["routes"][0]["stop_total"] == 3
-    assert body["routes"][0]["stop_done"] == 1
+    assert [r["route_id"] for r in body["routes"]] == [str(paused.id), str(in_progress.id)]
 
 
 # --- worker positions -------------------------------------------------------------------
@@ -341,14 +257,14 @@ async def _make_alert(
     fx: _Fixture,
     route: Route,
     *,
-    kind: AlertKind = AlertKind.LATE_STOP,
+    kind: AlertKind = AlertKind.BATCH_RELEASED,
     status: AlertStatus = AlertStatus.OPEN,
 ) -> Alert:
     alert = Alert(
         kind=kind,
         severity=AlertSeverity.WARNING,
         dedup_key=f"{kind.value}:{route.id}:{status.value}",
-        description="Ponto atrasado",
+        description="Pontos liberados",
         route_id=route.id,
         route_stop_id=route.stops[0].id,
         field_worker_id=fx.worker.id,
@@ -363,8 +279,8 @@ async def test_get_alerts_filters_by_status_and_route(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     fx = await _seed_actors(db_session)
-    route_a = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
-    route_b = await _make_route(db_session, fx, status=RouteStatus.IN_PROGRESS)
+    route_a = await _make_route(db_session, fx, route_date=_TODAY - timedelta(days=1))
+    route_b = await _make_route(db_session, fx)
     await _make_alert(db_session, fx, route_a, status=AlertStatus.OPEN)
     await _make_alert(db_session, fx, route_a, status=AlertStatus.RESOLVED)
     await _make_alert(db_session, fx, route_b, status=AlertStatus.OPEN)
@@ -380,6 +296,26 @@ async def test_get_alerts_filters_by_status_and_route(
 
     by_route = client.get(f"/alerts?route_id={route_a.id}", headers=_auth(token))
     assert {row["route_id"] for row in by_route.json()} == {str(route_a.id)}
+
+
+async def test_day_level_alert_is_listed_without_a_route(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    db_session.add(
+        Alert(
+            kind=AlertKind.POINTS_UNSERVED,
+            severity=AlertSeverity.WARNING,
+            dedup_key=f"POINTS_UNSERVED:{_TODAY}",
+            description="3 pontos não atendidos hoje",
+        )
+    )
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    rows = client.get("/alerts", headers=_auth(token)).json()
+
+    assert [(row["kind"], row["route_id"]) for row in rows] == [("POINTS_UNSERVED", None)]
 
 
 async def test_acknowledge_sets_status_and_actor_and_audits(
@@ -465,7 +401,7 @@ async def test_alert_endpoints_forbid_field_worker(
 # --- configurable alert rules (spec §2 Ruling 8) ---------------------------------------
 
 
-async def test_get_alert_rules_returns_four_rows(
+async def test_get_alert_rules_returns_one_row_per_kind(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     fx = await _seed_actors(db_session)
@@ -476,7 +412,13 @@ async def test_get_alert_rules_returns_four_rows(
 
     assert response.status_code == 200, response.text
     kinds = {row["rule_kind"] for row in response.json()}
-    assert kinds == {"LATE_START", "WORKER_ABSENT", "LATE_STOP", "NO_EVIDENCE"}
+    assert kinds == {
+        "NO_EVIDENCE",
+        "POINT_IMPEDED",
+        "BATCH_RELEASED",
+        "POINTS_UNSERVED",
+        "APPEAL_FILED",
+    }
     assert all(row["enabled"] for row in response.json())
 
 
@@ -487,26 +429,26 @@ async def test_patch_alert_rule_persists_enabled_and_threshold(
     await db_session.commit()
     token = _login(client, fx.manager.email)
 
-    off = client.patch("/alert-rules/LATE_STOP", json={"enabled": False}, headers=_auth(token))
+    off = client.patch("/alert-rules/NO_EVIDENCE", json={"enabled": False}, headers=_auth(token))
     assert off.status_code == 200, off.text
     assert off.json()["enabled"] is False
 
     thr = client.patch(
-        "/alert-rules/LATE_STOP", json={"threshold_minutes": 5}, headers=_auth(token)
+        "/alert-rules/NO_EVIDENCE", json={"threshold_minutes": 5}, headers=_auth(token)
     )
     assert thr.json()["threshold_minutes"] == 5
     # The earlier toggle is untouched by the partial patch.
     assert thr.json()["enabled"] is False
 
     rules = client.get("/alert-rules", headers=_auth(token)).json()
-    late_stop = next(row for row in rules if row["rule_kind"] == "LATE_STOP")
-    assert late_stop == {
-        "rule_kind": "LATE_STOP",
+    no_evidence = next(row for row in rules if row["rule_kind"] == "NO_EVIDENCE")
+    assert no_evidence == {
+        "rule_kind": "NO_EVIDENCE",
         "enabled": False,
         "threshold_minutes": 5,
-        "updated_at": late_stop["updated_at"],
+        "updated_at": no_evidence["updated_at"],
     }
-    assert late_stop["updated_at"] is not None
+    assert no_evidence["updated_at"] is not None
 
 
 async def test_patch_alert_rule_explicit_null_threshold_restores_the_global_default(
@@ -517,17 +459,17 @@ async def test_patch_alert_rule_explicit_null_threshold_restores_the_global_defa
     fx = await _seed_actors(db_session)
     await db_session.commit()
     token = _login(client, fx.manager.email)
-    client.patch("/alert-rules/LATE_STOP", json={"threshold_minutes": 5}, headers=_auth(token))
+    client.patch("/alert-rules/NO_EVIDENCE", json={"threshold_minutes": 5}, headers=_auth(token))
 
     cleared = client.patch(
-        "/alert-rules/LATE_STOP", json={"threshold_minutes": None}, headers=_auth(token)
+        "/alert-rules/NO_EVIDENCE", json={"threshold_minutes": None}, headers=_auth(token)
     )
     assert cleared.status_code == 200, cleared.text
     assert cleared.json()["threshold_minutes"] is None
 
     # A patch that does not mention the threshold still leaves it alone.
-    client.patch("/alert-rules/LATE_STOP", json={"threshold_minutes": 7}, headers=_auth(token))
-    toggled = client.patch("/alert-rules/LATE_STOP", json={"enabled": True}, headers=_auth(token))
+    client.patch("/alert-rules/NO_EVIDENCE", json={"threshold_minutes": 7}, headers=_auth(token))
+    toggled = client.patch("/alert-rules/NO_EVIDENCE", json={"enabled": True}, headers=_auth(token))
     assert toggled.json()["threshold_minutes"] == 7
 
 
@@ -549,7 +491,7 @@ async def test_patch_alert_rule_rejects_a_negative_threshold(
     token = _login(client, fx.manager.email)
 
     response = client.patch(
-        "/alert-rules/LATE_STOP", json={"threshold_minutes": -5}, headers=_auth(token)
+        "/alert-rules/NO_EVIDENCE", json={"threshold_minutes": -5}, headers=_auth(token)
     )
 
     assert response.status_code == 422

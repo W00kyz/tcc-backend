@@ -30,14 +30,18 @@ if TYPE_CHECKING:
 
 
 class AlertKind(enum.StrEnum):
-    # LATE_START: route still PLANNED past its scheduled start + tolerance.
-    # WORKER_ABSENT: same, with a larger tolerance + CRITICAL severity (RF52).
-    # LATE_STOP: a PENDING stop past its arrival window + tolerance on an IN_PROGRESS route.
+    # Spec 2026-10-20-alocacao-automatica §8.7. The schedule-based kinds (late start, worker
+    # absent, late stop) went with the planned times.
     # NO_EVIDENCE: a DONE app stop with no evidence past the grace period.
-    LATE_START = "LATE_START"
-    WORKER_ABSENT = "WORKER_ABSENT"
-    LATE_STOP = "LATE_STOP"
+    # POINT_IMPEDED: a worker reported an impediment; the point went back to the pool.
+    # BATCH_RELEASED: a worker's batch was released (left campus / location silence).
+    # POINTS_UNSERVED: the workday ended with points not served (one per day, no route).
+    # APPEAL_FILED: a worker contested a released stop.
     NO_EVIDENCE = "NO_EVIDENCE"
+    POINT_IMPEDED = "POINT_IMPEDED"
+    BATCH_RELEASED = "BATCH_RELEASED"
+    POINTS_UNSERVED = "POINTS_UNSERVED"
+    APPEAL_FILED = "APPEAL_FILED"
 
 
 class AlertSeverity(enum.StrEnum):
@@ -57,14 +61,15 @@ class Alert(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     kind: Mapped[AlertKind] = mapped_column(Enum(AlertKind, name="alert_kind"))
     severity: Mapped[AlertSeverity] = mapped_column(Enum(AlertSeverity, name="alert_severity"))
-    # Deterministic per violation (e.g. "LATE_STOP:{route_stop_id}"): the UNIQUE constraint is
+    # Deterministic per violation (e.g. "NO_EVIDENCE:{route_stop_id}"): the UNIQUE constraint is
     # what makes the scan idempotent — a resolved violation that still holds does not reopen.
     dedup_key: Mapped[str] = mapped_column(String(200), unique=True)
     description: Mapped[str] = mapped_column(String(500))
-    route_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("routes.id"), index=True
+    # NULL for a day-level alert that belongs to no route (POINTS_UNSERVED).
+    route_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("routes.id"), index=True, nullable=True
     )
-    # NULL for route-level alerts (LATE_START / WORKER_ABSENT).
+    # NULL for route-level alerts.
     route_stop_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("route_stops.id"), nullable=True
     )
@@ -83,7 +88,7 @@ class Alert(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    route: Mapped["Route"] = relationship()
+    route: Mapped["Route | None"] = relationship()
     route_stop: Mapped["RouteStop | None"] = relationship()
     field_worker: Mapped["FieldWorker | None"] = relationship()
 
@@ -108,8 +113,8 @@ class Notification(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "notifications"
 
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
-    # 'ALERT' | 'ROUTE_ASSIGNED' | 'ROUTE_MODIFIED' | 'STOP_REASSIGNED' — a plain string, not an
-    # enum: the set grows as features land and none of it drives a schema decision.
+    # 'ALERT' | 'IMPEDIMENT_REPORTED' | 'APPEAL_FILED' — a plain string, not an enum: the set
+    # grows as features land and none of it drives a schema decision.
     kind: Mapped[str] = mapped_column(String(50))
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(String(1000))

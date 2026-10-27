@@ -16,3 +16,6 @@ class FakeObjectStore:
 
     async def delete(self, key: str) -> None:
         self.objects.pop(key, None)
+
+    async def list_keys(self) -> list[str]:
+        return list(self.objects)

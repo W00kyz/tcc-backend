@@ -1,25 +1,20 @@
 """Notification helpers against the real testcontainer: rows are persisted first (flush, not
 commit), the push seam is best-effort (a raising sender never undoes a row), `notify_alert`
-targets exactly MANAGER + ADMIN, and `notify_route_assigned` no-ops for a field worker without
-app access."""
+targets exactly MANAGER + ADMIN and carries the route only when the alert has one."""
 
 import uuid
 
-import pytest
 from app.core.security import hash_password
-from app.domain.catalog.models import ContractorCompany, FieldWorker
+from app.domain.catalog.models import ContractorCompany
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity, Notification
-from app.domain.monitoring.notifications import (
-    notify_alert,
-    notify_route_assigned,
-    notify_users,
-)
-from app.domain.routing.models import Route, RouteStatus
+from app.domain.monitoring.notifications import notify_alert, notify_users
+from app.domain.routing.models import Route
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
+from tests.support.factories import make_worker
 
 
 class RecordingPushSender:
@@ -51,19 +46,12 @@ async def _user(db: AsyncSession, role: UserRole) -> User:
     return user
 
 
-async def _route_with_worker(db: AsyncSession, *, with_user: bool) -> Route:
+async def _route_with_worker(db: AsyncSession) -> Route:
     company = ContractorCompany(name="Co", cnpj=str(uuid.uuid4().int)[:14])
     db.add(company)
     await db.flush()
-    user_id = (await _user(db, UserRole.FIELD_WORKER)).id if with_user else None
-    worker = FieldWorker(full_name="W", contractor_company_id=company.id, user_id=user_id)
-    db.add(worker)
-    await db.flush()
-    route = Route(
-        field_worker_id=worker.id,
-        route_date=today_on_campus(),
-        status=RouteStatus.PLANNED,
-    )
+    worker = await make_worker(db, company=company, full_name="W")
+    route = Route(field_worker_id=worker.id, route_date=today_on_campus())
     db.add(route)
     await db.flush()
     return route
@@ -126,12 +114,12 @@ async def test_notify_alert_targets_manager_and_admin_only(db_session: AsyncSess
     manager = await _user(db_session, UserRole.MANAGER)
     admin = await _user(db_session, UserRole.ADMIN)
     field_worker = await _user(db_session, UserRole.FIELD_WORKER)
-    route = await _route_with_worker(db_session, with_user=False)
+    route = await _route_with_worker(db_session)
     alert = Alert(
-        kind=AlertKind.LATE_STOP,
+        kind=AlertKind.BATCH_RELEASED,
         severity=AlertSeverity.WARNING,
-        dedup_key=f"LATE_STOP:{uuid.uuid4()}",
-        description="Ponto fora da janela de chegada",
+        dedup_key=f"BATCH_RELEASED:{uuid.uuid4()}",
+        description="Pontos liberados: saiu do campus",
         route_id=route.id,
     )
     db_session.add(alert)
@@ -141,39 +129,25 @@ async def test_notify_alert_targets_manager_and_admin_only(db_session: AsyncSess
 
     assert {r.user_id for r in rows} == {manager.id, admin.id}
     assert field_worker.id not in {r.user_id for r in rows}
-    assert all(r.kind == "ALERT" and r.title == "Ponto atrasado" for r in rows)
-    assert rows[0].data["alert_id"] == str(alert.id)
+    assert all(r.kind == "ALERT" and r.title == "Pontos liberados" for r in rows)
+    assert rows[0].data == {"alert_id": str(alert.id), "route_id": str(route.id)}
 
 
-async def test_notify_route_assigned_with_user(db_session: AsyncSession) -> None:
-    route = await _route_with_worker(db_session, with_user=True)
-    worker = await db_session.get(FieldWorker, route.field_worker_id)
-    assert worker is not None
-
-    rows = await notify_route_assigned(
-        db_session, route=route, kind="ROUTE_ASSIGNED", push=RecordingPushSender()
+async def test_notify_alert_without_route_carries_only_the_alert(
+    db_session: AsyncSession,
+) -> None:
+    manager = await _user(db_session, UserRole.MANAGER)
+    alert = Alert(
+        kind=AlertKind.POINTS_UNSERVED,
+        severity=AlertSeverity.WARNING,
+        dedup_key="POINTS_UNSERVED:2026-10-20",
+        description="3 pontos não atendidos hoje",
     )
+    db_session.add(alert)
+    await db_session.flush()
 
-    assert len(rows) == 1
-    assert rows[0].user_id == worker.user_id
-    assert rows[0].kind == "ROUTE_ASSIGNED"
-    assert rows[0].data["route_id"] == str(route.id)
+    rows = await notify_alert(db_session, alert=alert, push=RecordingPushSender())
 
-
-async def test_notify_route_assigned_no_op_without_user(db_session: AsyncSession) -> None:
-    route = await _route_with_worker(db_session, with_user=False)
-
-    rows = await notify_route_assigned(
-        db_session, route=route, kind="ROUTE_ASSIGNED", push=RecordingPushSender()
-    )
-
-    assert rows == []
-    assert (await db_session.scalars(select(Notification))).all() == []
-
-
-async def test_notify_route_assigned_rejects_unknown_kind(db_session: AsyncSession) -> None:
-    route = await _route_with_worker(db_session, with_user=True)
-    with pytest.raises(ValueError, match="Unknown route-assignment notification kind"):
-        await notify_route_assigned(
-            db_session, route=route, kind="BOGUS", push=RecordingPushSender()
-        )
+    assert [r.user_id for r in rows] == [manager.id]
+    assert rows[0].title == "Pontos não atendidos"
+    assert rows[0].data == {"alert_id": str(alert.id)}

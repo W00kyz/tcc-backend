@@ -3,7 +3,8 @@
 Transaction discipline: these functions flush, never commit. The endpoint owns the
 transaction boundary (spec §7 — "service flushes, never commits")."""
 
-from datetime import UTC, datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime, time
 from uuid import UUID
 
 from sqlalchemy import select
@@ -12,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.settings.models import SystemSettings
 
 _DEFAULT_RADIUS_M = 50
+
+# Every column type an admin can edit on the settings row.
+SettingValue = int | float | time | list[int]
 
 
 async def get_settings_row(db: AsyncSession) -> SystemSettings:
@@ -26,32 +30,16 @@ async def get_settings_row(db: AsyncSession) -> SystemSettings:
 
 
 async def update_settings(
-    db: AsyncSession,
-    *,
-    actor_id: UUID,
-    check_radius_meters: int | None = None,
-    alert_scan_interval_seconds: int | None = None,
-    late_start_tolerance_min: int | None = None,
-    absence_tolerance_min: int | None = None,
-    late_stop_tolerance_min: int | None = None,
-    no_evidence_grace_min: int | None = None,
-    position_report_interval_seconds: int | None = None,
+    db: AsyncSession, *, actor_id: UUID, changes: Mapping[str, SettingValue]
 ) -> SystemSettings:
-    """Write only the fields the caller passed (a None means "leave unchanged"), then stamp
-    the actor and timestamp. Flushes; the endpoint owns the commit."""
+    """Write only the fields in `changes` (an absent field is left unchanged), then stamp the
+    actor and timestamp. Flushes; the endpoint owns the commit.
+
+        await update_settings(db, actor_id=admin.id, changes={"check_radius_meters": 80})
+    """
     row = await get_settings_row(db)
-    updates: dict[str, int | None] = {
-        "check_radius_meters": check_radius_meters,
-        "alert_scan_interval_seconds": alert_scan_interval_seconds,
-        "late_start_tolerance_min": late_start_tolerance_min,
-        "absence_tolerance_min": absence_tolerance_min,
-        "late_stop_tolerance_min": late_stop_tolerance_min,
-        "no_evidence_grace_min": no_evidence_grace_min,
-        "position_report_interval_seconds": position_report_interval_seconds,
-    }
-    for field, value in updates.items():
-        if value is not None:
-            setattr(row, field, value)
+    for field, value in changes.items():
+        setattr(row, field, value)
     row.updated_by = actor_id
     row.updated_at = datetime.now(UTC)
     await db.flush()

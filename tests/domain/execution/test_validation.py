@@ -1,5 +1,4 @@
 import uuid
-from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.domain.execution.models import GeoValidation
@@ -7,13 +6,10 @@ from app.domain.execution.validation import (
     FLAG_CLOCK_SKEW,
     FLAG_GPS_UNAVAILABLE,
     FLAG_OUT_OF_RADIUS,
-    FLAG_OUTSIDE_SCHEDULE,
     Candidate,
     ChosenStopNotOnFloor,
-    ScheduleWindow,
     clock_skew_flag,
     resolve_room,
-    schedule_flag,
 )
 
 
@@ -119,33 +115,6 @@ def test_chosen_stop_id_not_a_candidate_raises() -> None:
     only = _candidate("Sala 1", distance_m=5.0)
     with pytest.raises(ChosenStopNotOnFloor):
         resolve_room([only], radius_m=50, has_gps=True, chosen_route_stop_id=uuid.uuid4())
-
-
-def test_schedule_flag_inside_window_is_empty() -> None:
-    now = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
-    window = ScheduleWindow(
-        arrival_from=now - timedelta(hours=1), arrival_to=now + timedelta(hours=1)
-    )
-    assert schedule_flag(window, now) == []
-
-
-def test_schedule_flag_before_window_minus_grace_flags() -> None:
-    start = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
-    window = ScheduleWindow(arrival_from=start, arrival_to=start + timedelta(hours=1))
-    scanned_at = start - timedelta(minutes=45)  # earlier than 30 min grace
-    assert schedule_flag(window, scanned_at) == [FLAG_OUTSIDE_SCHEDULE]
-
-
-def test_schedule_flag_after_window_plus_grace_flags() -> None:
-    start = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
-    window = ScheduleWindow(arrival_from=start, arrival_to=start + timedelta(hours=1))
-    scanned_at = start + timedelta(hours=1, minutes=45)
-    assert schedule_flag(window, scanned_at) == [FLAG_OUTSIDE_SCHEDULE]
-
-
-def test_schedule_flag_no_window_is_empty() -> None:
-    window = ScheduleWindow(arrival_from=None, arrival_to=None)
-    assert schedule_flag(window, datetime(2026, 9, 1, 10, 0, tzinfo=UTC)) == []
 
 
 def test_clock_skew_flag_none_is_empty() -> None:

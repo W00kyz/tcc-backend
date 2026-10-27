@@ -1,5 +1,5 @@
 """RF43 — the manager execution-history read model: a filterable, paginated list, a detail
-row that carries the scans/evidence/manual-completion, and review resolution."""
+row that carries the scans/evidence/form answers, and review resolution."""
 
 import uuid
 from dataclasses import dataclass
@@ -9,7 +9,6 @@ import pytest
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
-    FieldWorker,
     Floor,
     ServicePoint,
     ServiceType,
@@ -44,6 +43,8 @@ from app.domain.qr.models import QrCode
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.support.factories import make_worker
+
 # Anchored to a fixed noon so every relative offset below (-1h, -25h) lands on its
 # intended UTC calendar day no matter the wall-clock time the suite runs at — a bare
 # `datetime.now(UTC)` makes `test_filter_by_date_range` flaky just after UTC midnight.
@@ -60,7 +61,7 @@ class _World:
     point_b: uuid.UUID
     exec_today_a: uuid.UUID  # worker_a, building_a, PENDING_REVIEW, OUT_OF_RADIUS scan
     exec_old_b: uuid.UUID  # worker_a, building_b, yesterday, VALIDATED scan
-    exec_manual_a: uuid.UUID  # worker_b, building_a, MANAGER_MANUAL, no scan
+    exec_appeal_a: uuid.UUID  # worker_b, building_a, APPEAL over a RELEASED stop, no scan
 
 
 async def _floor_with_point(
@@ -89,7 +90,12 @@ async def _execution(
     stop_status: RouteStopStatus = RouteStopStatus.DONE,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     stop = RouteStop(
-        route_id=route_id, service_point_id=point_id, order_index=1, status=stop_status
+        route_id=route_id,
+        service_point_id=point_id,
+        order_index=1,
+        batch_number=1,
+        service_date=checked_in_at.date(),
+        status=stop_status,
     )
     db.add(stop)
     await db.flush()
@@ -138,8 +144,8 @@ async def _seed_world(db: AsyncSession) -> _World:
     floor_a, point_a = await _floor_with_point(db, building_a.id, "Térreo", "Sala A")
     floor_b, point_b = await _floor_with_point(db, building_b.id, "Térreo", "Sala B")
 
-    worker_a = FieldWorker(full_name="Ana", contractor_company_id=company.id)
-    worker_b = FieldWorker(full_name="Bruno", contractor_company_id=company.id)
+    worker_a = await make_worker(db, company=company, full_name="Ana")
+    worker_b = await make_worker(db, company=company, full_name="Bruno")
     qr_a = QrCode(floor_id=floor_a, public_code="qr-a", secret=b"s", version=1)
     qr_b = QrCode(floor_id=floor_b, public_code="qr-b", secret=b"s", version=1)
     db.add_all([worker_a, worker_b, qr_a, qr_b])
@@ -180,14 +186,16 @@ async def _seed_world(db: AsyncSession) -> _World:
         db, execution_id=exec_old_b, qr_code_id=qr_b.id, geo=GeoValidation.VALIDATED
     )
 
-    exec_manual_a, _ = await _execution(
+    # The stop was released (worker_b left campus) and the manager accepted the appeal.
+    exec_appeal_a, _ = await _execution(
         db,
         worker_id=worker_b.id,
         route_id=route_b.id,
         point_id=point_a,
         checked_in_at=_NOW - timedelta(hours=1),
-        source=ExecutionSource.MANAGER_MANUAL,
+        source=ExecutionSource.APPEAL,
         review_status=ExecutionReviewStatus.NONE,
+        stop_status=RouteStopStatus.RELEASED,
     )
 
     db.add(
@@ -208,7 +216,7 @@ async def _seed_world(db: AsyncSession) -> _World:
         point_b=point_b,
         exec_today_a=exec_today_a,
         exec_old_b=exec_old_b,
-        exec_manual_a=exec_manual_a,
+        exec_appeal_a=exec_appeal_a,
     )
 
 
@@ -220,7 +228,7 @@ async def test_no_filter_returns_all_newest_first(db_session: AsyncSession) -> N
     assert total == 3
     assert [r.execution_id for r in rows] == [
         world.exec_today_a,
-        world.exec_manual_a,
+        world.exec_appeal_a,
         world.exec_old_b,
     ]
 
@@ -238,9 +246,9 @@ async def test_row_carries_denormalised_columns(db_session: AsyncSession) -> Non
     assert today.geo_validation == "OUT_OF_RADIUS"
     assert today.evidence_count == 1
     assert today.source == "APP"
-    # A MANAGER_MANUAL execution has no check-in scan, so no geo verdict.
-    assert by_id[world.exec_manual_a].geo_validation is None
-    assert by_id[world.exec_manual_a].evidence_count == 0
+    # An APPEAL execution has no check-in scan, so no geo verdict.
+    assert by_id[world.exec_appeal_a].geo_validation is None
+    assert by_id[world.exec_appeal_a].evidence_count == 0
 
 
 async def test_filter_by_field_worker(db_session: AsyncSession) -> None:
@@ -262,7 +270,7 @@ async def test_filter_by_building(db_session: AsyncSession) -> None:
     )
 
     assert total == 2
-    assert {r.execution_id for r in rows} == {world.exec_today_a, world.exec_manual_a}
+    assert {r.execution_id for r in rows} == {world.exec_today_a, world.exec_appeal_a}
 
 
 async def test_filter_by_service_point(db_session: AsyncSession) -> None:
@@ -291,11 +299,11 @@ async def test_filter_by_source(db_session: AsyncSession) -> None:
     world = await _seed_world(db_session)
 
     rows, total = await list_executions(
-        db_session, ExecutionFilters(source="MANAGER_MANUAL"), page=1, page_size=50
+        db_session, ExecutionFilters(source="APPEAL"), page=1, page_size=50
     )
 
     assert total == 1
-    assert rows[0].execution_id == world.exec_manual_a
+    assert rows[0].execution_id == world.exec_appeal_a
 
 
 async def test_filter_by_geo_validation(db_session: AsyncSession) -> None:
@@ -324,7 +332,7 @@ async def test_filter_by_date_range(db_session: AsyncSession) -> None:
     )
 
     assert from_total == 2
-    assert {r.execution_id for r in from_today} == {world.exec_today_a, world.exec_manual_a}
+    assert {r.execution_id for r in from_today} == {world.exec_today_a, world.exec_appeal_a}
     assert to_total == 1
     assert to_yesterday[0].execution_id == world.exec_old_b
 
@@ -338,9 +346,13 @@ async def test_filter_by_route_stop_status(db_session: AsyncSession) -> None:
     _, progress_total = await list_executions(
         db_session, ExecutionFilters(route_stop_status="IN_PROGRESS"), page=1, page_size=50
     )
+    _, released_total = await list_executions(
+        db_session, ExecutionFilters(route_stop_status="RELEASED"), page=1, page_size=50
+    )
 
-    assert done_total == 3
+    assert done_total == 2
     assert progress_total == 0
+    assert released_total == 1
 
 
 async def test_filter_by_service_type(db_session: AsyncSession) -> None:
@@ -349,7 +361,8 @@ async def test_filter_by_service_type(db_session: AsyncSession) -> None:
     db_session.add_all([company, building])
     await db_session.flush()
     _, point = await _floor_with_point(db_session, building.id, "Térreo", "Sala A")
-    worker = FieldWorker(full_name="Ana", contractor_company_id=company.id)
+    _, other_point = await _floor_with_point(db_session, building.id, "1º andar", "Sala B")
+    worker = await make_worker(db_session, company=company, full_name="Ana")
     windows = ServiceType(name="Limpeza de vidros", average_duration_minutes=30)
     floors = ServiceType(name="Limpeza de pisos", average_duration_minutes=45)
     db_session.add_all([worker, windows, floors])
@@ -371,7 +384,7 @@ async def test_filter_by_service_type(db_session: AsyncSession) -> None:
         db_session,
         worker_id=worker.id,
         route_id=route.id,
-        point_id=point,
+        point_id=other_point,
         checked_in_at=_NOW - timedelta(hours=1),
         source=ExecutionSource.APP,
         review_status=ExecutionReviewStatus.NONE,
@@ -412,8 +425,12 @@ async def test_pagination_is_stable_with_equal_timestamps(db_session: AsyncSessi
     building = Building(name="Bloco A", campus_area="CCT")
     db_session.add_all([company, building])
     await db_session.flush()
-    _, point = await _floor_with_point(db_session, building.id, "Térreo", "Sala A")
-    worker = FieldWorker(full_name="Ana", contractor_company_id=company.id)
+    # A point is live on one stop per day, so each same-instant execution gets its own point.
+    points = [
+        (await _floor_with_point(db_session, building.id, f"Andar {i}", f"Sala {i}"))[1]
+        for i in range(3)
+    ]
+    worker = await make_worker(db_session, company=company, full_name="Ana")
     db_session.add(worker)
     await db_session.flush()
     route = Route(field_worker_id=worker.id, route_date=_NOW.date(), status=RouteStatus.IN_PROGRESS)
@@ -422,7 +439,7 @@ async def test_pagination_is_stable_with_equal_timestamps(db_session: AsyncSessi
 
     same_instant = _NOW
     ids = set()
-    for _ in range(3):
+    for point in points:
         execution_id, _ = await _execution(
             db_session,
             worker_id=worker.id,
@@ -465,7 +482,6 @@ async def test_get_execution_detail_bundles_scans_and_evidence(
     assert [s.kind for s in detail.scans] == ["CHECK_IN"]
     assert detail.scans[0].geo_validation == "OUT_OF_RADIUS"
     assert [e.kind for e in detail.evidence] == ["NOTE"]
-    assert detail.manual_completion is None
 
 
 async def _seed_form_version(db: AsyncSession, *, known_key: uuid.UUID) -> uuid.UUID:

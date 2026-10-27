@@ -1,10 +1,21 @@
-import uuid
-
 from app.core.security import hash_password
-from app.domain.catalog.models import ContractorCompany, ServiceType
+from app.domain.audit.models import AuditTrail
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    FieldWorker,
+    FieldWorkerStatus,
+    Floor,
+    ServicePoint,
+)
 from app.domain.identity.models import User, UserRole
+from app.domain.routing.models import RouteStopStatus
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tests.support.clock import today_on_campus
+from tests.support.factories import make_route, make_worker
 
 
 def _login(client: TestClient, email: str) -> str:
@@ -14,302 +25,233 @@ def _login(client: TestClient, email: str) -> str:
     return str(response.json()["access_token"])
 
 
-async def _seed(db_session: AsyncSession) -> tuple[User, ContractorCompany, ServiceType, User]:
+async def _seed(
+    db_session: AsyncSession, role: UserRole = UserRole.MANAGER
+) -> tuple[User, ContractorCompany]:
     manager = User(
         name="Larissa",
         email="larissa@pu.ufcg.edu.br",
         password_hash=hash_password("senha-forte-o-suficiente"),
-        role=UserRole.MANAGER,
+        role=role,
     )
     company = ContractorCompany(name="Limpa Tudo", cnpj="12345678000199")
-    service_type = ServiceType(name="Limpeza", average_duration_minutes=30)
-    worker_login = User(
-        name="João",
-        email="joao@empresa.com",
-        password_hash=hash_password("senha-forte-o-suficiente"),
-        role=UserRole.FIELD_WORKER,
-    )
-    db_session.add_all([manager, company, service_type, worker_login])
+    db_session.add_all([manager, company])
     await db_session.commit()
-    return manager, company, service_type, worker_login
+    return manager, company
 
 
-async def test_manager_creates_a_field_worker_with_company_and_service_types(
+async def _headers(client: TestClient, user: User) -> dict[str, str]:
+    return {"Authorization": f"Bearer {_login(client, user.email)}"}
+
+
+async def _audit_actions(db_session: AsyncSession, worker_id: object) -> list[str]:
+    rows = await db_session.scalars(
+        select(AuditTrail.action).where(AuditTrail.entity_id == worker_id)
+    )
+    return list(rows)
+
+
+async def test_list_includes_company_and_status(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    manager, company, service_type, _ = await _seed(db_session)
-    token = _login(client, manager.email)
+    manager, company = await _seed(db_session)
+    pending = await make_worker(
+        db_session,
+        company=company,
+        full_name="Ana",
+        email="ana@empresa.com",
+        status=FieldWorkerStatus.PENDING_APPROVAL,
+    )
+    await db_session.commit()
+
+    response = client.get("/field-workers", headers=await _headers(client, manager))
+
+    assert response.status_code == 200
+    [item] = response.json()
+    assert item["id"] == str(pending.id)
+    assert item["full_name"] == "Ana"
+    assert item["email"] == "ana@empresa.com"
+    assert item["contractor_company_id"] == str(company.id)
+    assert item["contractor_company_name"] == "Limpa Tudo"
+    assert (item["status"], item["is_active"], item["rejection_reason"]) == (
+        "PENDING_APPROVAL",
+        True,
+        None,
+    )
+    assert item["created_at"]
+    assert item["done_today"] == 0
+
+
+async def test_done_today_counts_only_todays_finished_stops(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, company = await _seed(db_session)
+    worker = await make_worker(db_session, company=company)
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add(building)
+    await db_session.flush()
+    floor = Floor(building_id=building.id, label="Térreo")
+    db_session.add(floor)
+    await db_session.flush()
+    points = [
+        ServicePoint(
+            floor_id=floor.id, name=f"Sala {n}", description="", latitude=-7.2, longitude=-35.9
+        )
+        for n in range(3)
+    ]
+    db_session.add_all(points)
+    await db_session.flush()
+    route = await make_route(db_session, worker=worker, day=today_on_campus(), points=points)
+    route.stops[0].status = RouteStopStatus.DONE
+    route.stops[1].status = RouteStopStatus.DONE
+    await db_session.commit()
+
+    [item] = client.get("/field-workers", headers=await _headers(client, manager)).json()
+
+    assert item["done_today"] == 2
+
+
+async def test_manager_approves_a_pending_worker(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, company = await _seed(db_session)
+    worker = await make_worker(
+        db_session, company=company, status=FieldWorkerStatus.PENDING_APPROVAL
+    )
+    await db_session.commit()
 
     response = client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": None,
-        },
-        headers={"Authorization": f"Bearer {token}"},
+        f"/field-workers/{worker.id}/approve", headers=await _headers(client, manager)
     )
 
-    assert response.status_code == 201
-    body = response.json()
-    assert body["full_name"] == "João da Silva"
-    assert body["service_type_ids"] == [str(service_type.id)]
-    assert body["user_id"] is None
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "APPROVED"
+    await db_session.refresh(worker)
+    assert (worker.reviewed_by, worker.reviewed_at is not None) == (manager.id, True)
+    assert await _audit_actions(db_session, worker.id) == ["approve"]
 
 
-async def test_manager_links_a_field_worker_to_a_login_user(
+async def test_reject_records_the_reason_and_approve_can_reverse_it(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    manager, company, service_type, worker_login = await _seed(db_session)
-    token = _login(client, manager.email)
-    created = client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": None,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    ).json()
+    manager, company = await _seed(db_session)
+    worker = await make_worker(
+        db_session, company=company, status=FieldWorkerStatus.PENDING_APPROVAL
+    )
+    await db_session.commit()
+    headers = await _headers(client, manager)
 
-    response = client.patch(
-        f"/field-workers/{created['id']}",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(worker_login.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
+    rejected = client.post(
+        f"/field-workers/{worker.id}/reject", json={"reason": "Empresa errada"}, headers=headers
+    )
+    assert rejected.status_code == 200, rejected.text
+    assert (rejected.json()["status"], rejected.json()["rejection_reason"]) == (
+        "REJECTED",
+        "Empresa errada",
+    )
+
+    approved = client.post(f"/field-workers/{worker.id}/approve", headers=headers)
+    assert approved.status_code == 200
+    assert (approved.json()["status"], approved.json()["rejection_reason"]) == ("APPROVED", None)
+    assert await _audit_actions(db_session, worker.id) == ["reject", "approve"]
+
+
+async def test_reject_without_a_reason(client: TestClient, db_session: AsyncSession) -> None:
+    manager, company = await _seed(db_session)
+    worker = await make_worker(
+        db_session, company=company, status=FieldWorkerStatus.PENDING_APPROVAL
+    )
+    await db_session.commit()
+
+    response = client.post(
+        f"/field-workers/{worker.id}/reject", json={}, headers=await _headers(client, manager)
     )
 
     assert response.status_code == 200
-    assert response.json()["user_id"] == str(worker_login.id)
+    assert response.json()["rejection_reason"] is None
 
 
-async def test_a_login_user_already_linked_to_another_worker_is_rejected(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    manager, company, service_type, worker_login = await _seed(db_session)
-    token = _login(client, manager.email)
-    client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(worker_login.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    response = client.post(
-        "/field-workers",
-        json={
-            "full_name": "Outro Profissional",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(worker_login.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    assert response.status_code == 409
-
-
-async def test_a_patch_cannot_steal_a_user_already_linked_to_another_worker(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    manager, company, service_type, worker_login = await _seed(db_session)
-    token = _login(client, manager.email)
-    linked = client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(worker_login.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    ).json()
-    unlinked = client.post(
-        "/field-workers",
-        json={
-            "full_name": "Outro Profissional",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": None,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    ).json()
-
-    response = client.patch(
-        f"/field-workers/{unlinked['id']}",
-        json={
-            "full_name": "Outro Profissional",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(worker_login.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    assert response.status_code == 409
-    unchanged = client.get("/field-workers", headers={"Authorization": f"Bearer {token}"}).json()
-    still_linked = next(item for item in unchanged if item["id"] == linked["id"])
-    assert still_linked["user_id"] == str(worker_login.id)
-
-
-async def test_linking_a_non_field_worker_role_user_is_rejected(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    """Regression test for Finding I1: _assert_user_available used to check only that a
-    user_id wasn't already claimed by another field worker, never that the User actually has
-    role FIELD_WORKER — linking an ADMIN's or MANAGER's user_id used to succeed (201)."""
-    manager, company, service_type, _ = await _seed(db_session)
-    other_manager = User(
-        name="Outro Gestor",
-        email="outro-gestor@pu.ufcg.edu.br",
-        password_hash=hash_password("senha-forte-o-suficiente"),
-        role=UserRole.MANAGER,
-    )
-    db_session.add(other_manager)
+async def test_deactivate_and_reactivate(client: TestClient, db_session: AsyncSession) -> None:
+    manager, company = await _seed(db_session)
+    worker = await make_worker(db_session, company=company)
     await db_session.commit()
-    token = _login(client, manager.email)
+    headers = await _headers(client, manager)
 
-    response = client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(other_manager.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
+    off = client.post(f"/field-workers/{worker.id}/deactivate", headers=headers)
+    assert (off.status_code, off.json()["is_active"], off.json()["status"]) == (
+        200,
+        False,
+        "APPROVED",
     )
+    on = client.post(f"/field-workers/{worker.id}/reactivate", headers=headers)
+    assert (on.status_code, on.json()["is_active"]) == (200, True)
+    assert await _audit_actions(db_session, worker.id) == ["deactivate", "reactivate"]
 
-    assert response.status_code == 409
 
-
-async def test_linking_an_unknown_user_id_returns_404(
+async def test_decisions_that_do_not_fit_the_status_are_refused(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    manager, company, service_type, _ = await _seed(db_session)
-    token = _login(client, manager.email)
+    manager, company = await _seed(db_session)
+    approved = await make_worker(db_session, company=company)
+    pending = await make_worker(
+        db_session, company=company, status=FieldWorkerStatus.PENDING_APPROVAL
+    )
+    await db_session.commit()
+    headers = await _headers(client, manager)
+
+    attempts = [
+        client.post(f"/field-workers/{approved.id}/approve", headers=headers),
+        client.post(f"/field-workers/{approved.id}/reject", json={}, headers=headers),
+        client.post(f"/field-workers/{pending.id}/deactivate", headers=headers),
+        client.post(f"/field-workers/{pending.id}/reactivate", headers=headers),
+    ]
+
+    assert [(r.status_code, r.json()["detail"]["code"]) for r in attempts] == [
+        (409, "INVALID_WORKER_STATUS")
+    ] * 4
+
+
+async def test_unknown_worker_returns_404(client: TestClient, db_session: AsyncSession) -> None:
+    manager, _company = await _seed(db_session)
 
     response = client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(uuid.uuid4()),
-        },
-        headers={"Authorization": f"Bearer {token}"},
+        "/field-workers/00000000-0000-0000-0000-000000000001/approve",
+        headers=await _headers(client, manager),
     )
 
     assert response.status_code == 404
 
 
-async def test_creating_a_field_worker_for_an_unknown_contractor_company_returns_404(
+async def test_a_field_worker_cannot_review_anyone(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    """Regression test for Finding I2.3."""
-    manager, _company, service_type, _ = await _seed(db_session)
-    token = _login(client, manager.email)
-
-    response = client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(uuid.uuid4()),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": None,
-        },
-        headers={"Authorization": f"Bearer {token}"},
+    _manager, company = await _seed(db_session)
+    worker = await make_worker(
+        db_session, company=company, email="ana@empresa.com", status=FieldWorkerStatus.APPROVED
     )
-
-    assert response.status_code == 404
-
-
-async def test_manager_lists_linkable_users(client: TestClient, db_session: AsyncSession) -> None:
-    """Finding C2: GET /field-workers/linkable-users returns only FIELD_WORKER-role users not
-    yet linked to a FieldWorker, and a Manager (not just an Admin) can call it."""
-    manager, company, service_type, unlinked_worker = await _seed(db_session)
-    linked_worker = User(
-        name="Maria",
-        email="maria@empresa.com",
-        password_hash=hash_password("senha-forte-o-suficiente"),
-        role=UserRole.FIELD_WORKER,
-    )
-    db_session.add(linked_worker)
     await db_session.commit()
-    token = _login(client, manager.email)
-    client.post(
-        "/field-workers",
-        json={
-            "full_name": "Maria Souza",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type.id)],
-            "user_id": str(linked_worker.id),
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    user = await db_session.get(User, worker.user_id)
+    assert user is not None
+    headers = await _headers(client, user)
 
-    response = client.get(
-        "/field-workers/linkable-users", headers={"Authorization": f"Bearer {token}"}
-    )
+    responses = [
+        client.get("/field-workers", headers=headers),
+        client.post(f"/field-workers/{worker.id}/approve", headers=headers),
+        client.post(f"/field-workers/{worker.id}/reject", json={}, headers=headers),
+        client.post(f"/field-workers/{worker.id}/deactivate", headers=headers),
+        client.post(f"/field-workers/{worker.id}/reactivate", headers=headers),
+    ]
 
-    assert response.status_code == 200
-    ids = [item["id"] for item in response.json()]
-    assert str(unlinked_worker.id) in ids
-    assert str(linked_worker.id) not in ids
-    assert str(manager.id) not in ids
+    assert [r.status_code for r in responses] == [403] * 5
+    assert (await db_session.get(FieldWorker, worker.id)) is not None
 
 
-async def test_patch_response_reflects_a_disjoint_service_type_set(
+async def test_the_old_create_edit_and_link_endpoints_are_gone(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    """Regression test for a stale-collection bug: the session has expire_on_commit=False, and
-    _sync_service_types() mutates FieldWorkerServiceType rows through a separately queried set,
-    which never touches a `worker` instance's already-cached `service_type_links` collection
-    sitting in the session's identity map. The PATCH response used to echo the pre-update set
-    even though the database write itself was correct — only surfaced by moving to a fully
-    disjoint set, since every other test here reuses the same single service type across create
-    and update."""
-    manager, company, service_type_a, _ = await _seed(db_session)
-    service_type_b = ServiceType(name="Jardinagem", average_duration_minutes=45)
-    service_type_c = ServiceType(name="Manutenção", average_duration_minutes=60)
-    db_session.add_all([service_type_b, service_type_c])
-    await db_session.commit()
-    token = _login(client, manager.email)
+    manager, _company = await _seed(db_session)
+    headers = await _headers(client, manager)
 
-    created = client.post(
-        "/field-workers",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type_a.id), str(service_type_b.id)],
-            "user_id": None,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    ).json()
-    assert sorted(created["service_type_ids"]) == sorted(
-        [str(service_type_a.id), str(service_type_b.id)]
-    )
-
-    response = client.patch(
-        f"/field-workers/{created['id']}",
-        json={
-            "full_name": "João da Silva",
-            "contractor_company_id": str(company.id),
-            "service_type_ids": [str(service_type_c.id)],
-            "user_id": None,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["service_type_ids"] == [str(service_type_c.id)]
+    assert client.post("/field-workers", json={}, headers=headers).status_code == 405
+    assert client.patch("/field-workers/x", json={}, headers=headers).status_code == 404
+    assert client.get("/field-workers/linkable-users", headers=headers).status_code == 404

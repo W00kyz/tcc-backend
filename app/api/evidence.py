@@ -27,8 +27,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api._execution_common import current_worker
-from app.api.deps import require_role
+from app.api._execution_common import current_worker, stop_released_conflict
+from app.api.deps import ApprovedWorker, Now, require_role
 from app.core.object_store import ObjectStore
 from app.db.session import get_db
 from app.domain.audit.service import record_personal_data_access
@@ -43,6 +43,7 @@ from app.domain.execution.evidence_service import (
     load_content,
 )
 from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution
+from app.domain.execution.service import StopReleased, ensure_stop_not_released
 from app.domain.identity.models import User, UserRole
 
 router = APIRouter(tags=["evidence"])
@@ -107,14 +108,20 @@ async def _load_execution(db: AsyncSession, execution_id: UUID) -> Execution:
     return execution
 
 
-async def _require_owning_worker(db: AsyncSession, user: User, execution: Execution) -> UUID:
-    """The caller must be the field worker who owns `execution`; returns their worker id."""
-    worker = await current_worker(db, user)
+async def _refuse_released_stop(db: AsyncSession, execution: Execution, now: datetime) -> None:
+    """Evidence synced after its stop went back to the pool gets the late check-out's 409."""
+    try:
+        await ensure_stop_not_released(db, execution=execution, now=now)
+    except StopReleased as exc:
+        raise stop_released_conflict(exc) from exc
+
+
+def _require_owner(worker: FieldWorker | None, execution: Execution) -> None:
+    """The caller must be the field worker who owns `execution`."""
     if worker is None or worker.id != execution.field_worker_id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Only the execution's own field worker may do this."
         )
-    return worker.id
 
 
 async def _authorize_read(db: AsyncSession, user: User, execution: Execution) -> None:
@@ -132,7 +139,7 @@ async def _authorize_read(db: AsyncSession, user: User, execution: Execution) ->
             )
             await db.commit()
         return
-    await _require_owning_worker(db, user, execution)
+    _require_owner(await current_worker(db, user), execution)
 
 
 @router.post(
@@ -144,15 +151,17 @@ async def upload_photo(
     execution_id: UUID,
     request: Request,
     response: Response,
-    user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
+    worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
+    now: Now,
     file: Annotated[UploadFile, File()],
     sha256: Annotated[str, Form()],
     captured_at: Annotated[datetime, Form()],
     idempotency_key: Annotated[UUID, Form()],
 ) -> EvidenceItemOut:
     execution = await _load_execution(db, execution_id)
-    worker_id = await _require_owning_worker(db, user, execution)
+    _require_owner(worker, execution)
+    await _refuse_released_stop(db, execution, now)
 
     # Read one byte past the ceiling — enough to know it is over the limit without
     # buffering an arbitrarily large upload into memory.
@@ -171,7 +180,7 @@ async def upload_photo(
             db,
             store,
             execution=execution,
-            uploader_worker_id=worker_id,
+            uploader_worker_id=worker.id,
             data=data,
             declared_sha256=sha256,
             captured_at=captured_at,
@@ -197,11 +206,13 @@ async def upload_note(
     execution_id: UUID,
     body: EvidenceNoteRequest,
     response: Response,
-    user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
+    worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
+    now: Now,
 ) -> EvidenceItemOut:
     execution = await _load_execution(db, execution_id)
-    worker_id = await _require_owning_worker(db, user, execution)
+    _require_owner(worker, execution)
+    await _refuse_released_stop(db, execution, now)
 
     if not body.text_body.strip():
         raise HTTPException(
@@ -211,7 +222,7 @@ async def upload_note(
     item, created = await add_note(
         db,
         execution=execution,
-        uploader_worker_id=worker_id,
+        uploader_worker_id=worker.id,
         text_body=body.text_body,
         captured_at=body.captured_at,
         idempotency_key=body.idempotency_key,

@@ -11,7 +11,7 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import InstrumentedAttribute, selectinload
+from sqlalchemy.orm import InstrumentedAttribute
 
 from app.domain.catalog.models import FieldWorker
 from app.domain.execution.models import EvidenceItem, Execution
@@ -37,7 +37,6 @@ class FieldWorkerData:
     id: uuid.UUID
     full_name: str
     contractor_company_id: uuid.UUID
-    service_type_ids: list[uuid.UUID]
 
 
 @dataclass(frozen=True)
@@ -89,11 +88,7 @@ async def build_personal_data(db: AsyncSession, user: User) -> PersonalData:
 
     data = await build_personal_data(db, current_user)
     """
-    worker = await db.scalar(
-        select(FieldWorker)
-        .where(FieldWorker.user_id == user.id)
-        .options(selectinload(FieldWorker.service_type_links))
-    )
+    worker = await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
 
     return PersonalData(
         profile=ProfileData(
@@ -125,7 +120,6 @@ def _field_worker_data(worker: FieldWorker | None) -> FieldWorkerData | None:
         id=worker.id,
         full_name=worker.full_name,
         contractor_company_id=worker.contractor_company_id,
-        service_type_ids=[link.service_type_id for link in worker.service_type_links],
     )
 
 

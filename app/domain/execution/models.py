@@ -27,7 +27,8 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 class ExecutionSource(enum.StrEnum):
     APP = "APP"
-    MANAGER_MANUAL = "MANAGER_MANUAL"
+    # Created when a manager accepts a worker's appeal over a released stop (spec §5.4).
+    APPEAL = "APPEAL"
 
 
 class QrScanKind(enum.StrEnum):
@@ -72,7 +73,7 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     # default= only, no server_default: the migration drops the transient server default it
     # used to backfill existing rows, so the ORM's Python-side default is the sole source of
-    # truth — matches routing.models RouteStatus / route_type.
+    # truth — matches routing.models RouteStatus.
     review_status: Mapped[ExecutionReviewStatus] = mapped_column(
         Enum(ExecutionReviewStatus, name="execution_review_status"),
         default=ExecutionReviewStatus.NONE,
@@ -161,15 +162,3 @@ class Answer(UUIDPrimaryKeyMixin, Base):
     question_stable_key: Mapped[str] = mapped_column(String(64))
     value_json: Mapped[Any] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-class ManualCompletion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "manual_completions"
-
-    route_stop_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("route_stops.id"), unique=True
-    )
-    execution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("executions.id"))
-    completed_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
-    reason: Mapped[str] = mapped_column(String(500))
-    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

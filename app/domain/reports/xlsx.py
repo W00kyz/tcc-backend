@@ -9,10 +9,11 @@ real number for the reader to sort or chart.
 """
 
 import io
+from dataclasses import fields
 
 import xlsxwriter
 
-from app.domain.reports.compliance import ComplianceReport, ReportGranularity
+from app.domain.reports.compliance import ComplianceCounts, ComplianceReport, ReportGranularity
 
 _GRANULARITY_LABELS: dict[ReportGranularity, str] = {
     ReportGranularity.DAILY: "Diário",
@@ -22,37 +23,25 @@ _GRANULARITY_LABELS: dict[ReportGranularity, str] = {
 
 _HEADERS: tuple[str, ...] = (
     "Período",
-    "Rotas",
-    "Rotas iniciadas",
-    "Rotas concluídas",
-    "Rotas canceladas",
     "Pontos",
     "Pontos feitos",
-    "Pontos pendentes",
-    "Pontos reatribuídos",
+    "Feitos por recurso",
+    "Pontos não atendidos",
+    "Pontos liberados",
+    "Impedidos",
+    "Liberados: resto da rota",
+    "Liberados: saiu do campus",
+    "Liberados: sem localização",
+    "Liberados: fim do expediente",
     "Execuções",
     "Execuções com evidência",
     "Execuções sinalizadas",
-    "Impedimentos",
     "Alertas",
     "% de conclusão",
 )
-_METRIC_FIELDS: tuple[str, ...] = (
-    "routes_total",
-    "routes_started",
-    "routes_completed",
-    "routes_cancelled",
-    "stops_total",
-    "stops_done",
-    "stops_pending",
-    "stops_reassigned",
-    "executions_total",
-    "executions_with_evidence",
-    "executions_flagged",
-    "impediments_total",
-    "alerts_total",
-)
-_LAST_COL = len(_HEADERS) - 1  # 14
+# The fields of `ComplianceCounts`, in the order of the headers between "Período" and the rate.
+_METRIC_FIELDS: tuple[str, ...] = tuple(field.name for field in fields(ComplianceCounts))
+_LAST_COL = len(_HEADERS) - 1  # 15
 
 
 def _metadata_line(report: ComplianceReport) -> str:
@@ -63,12 +52,14 @@ def _metadata_line(report: ComplianceReport) -> str:
     applied = report.filters_applied
     if applied.field_worker_name is not None:
         parts.append(f"Profissional: {applied.field_worker_name}")
+    if applied.company_name is not None:
+        parts.append(f"Empresa: {applied.company_name}")
     if applied.service_type_name is not None:
         parts.append(f"Tipo de serviço: {applied.service_type_name}")
     if applied.building_name is not None:
         parts.append(f"Prédio: {applied.building_name}")
-    if applied.route_status is not None:
-        parts.append(f"Status da rota: {applied.route_status}")
+    if applied.outcome is not None:
+        parts.append(f"Situação: {applied.outcome}")
     parts.append(f"Gerado em: {report.generated_at:%d/%m/%Y %H:%M}")
     return " | ".join(parts)
 

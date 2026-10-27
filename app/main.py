@@ -5,6 +5,7 @@ import httpx2
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.appeals import router as appeals_router
 from app.api.auth import router as auth_router
 from app.api.buildings import router as buildings_router
 from app.api.checkins import router as checkins_router
@@ -20,9 +21,9 @@ from app.api.impediments import router as impediments_router
 from app.api.me import router as me_router
 from app.api.monitoring import router as monitoring_router
 from app.api.notifications import router as notifications_router
+from app.api.public import router as public_router
 from app.api.qr_codes import router as qr_codes_router
 from app.api.reports import reports_router
-from app.api.route_templates import router as route_templates_router
 from app.api.routes import router as routes_router
 from app.api.service_points import router as service_points_router
 from app.api.service_types import router as service_types_router
@@ -153,8 +154,8 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(public_router)
     app.include_router(routes_router)
-    app.include_router(route_templates_router)
     app.include_router(checkins_router)
     app.include_router(checkouts_router)
     app.include_router(evidence_router)
@@ -170,6 +171,7 @@ def create_app(
     app.include_router(settings_router)
     app.include_router(forms_router)
     app.include_router(impediments_router)
+    app.include_router(appeals_router)
     app.include_router(me_router)
     app.include_router(monitoring_router)
     app.include_router(notifications_router)

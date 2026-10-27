@@ -1,8 +1,9 @@
-"""The alert-scan scheduler is wired into the app lifespan (spec §2 Ruling 1): off when
+"""The release + alert scan scheduler is wired into the app lifespan (spec §2 Ruling 1): off when
 `alerts_scheduler_enabled` is False, and on (one registered job) when it is True."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import pytest
 from app.core.config import Settings
@@ -68,24 +69,32 @@ async def test_run_scan_once_swallows_and_logs_scan_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opened: list[bool] = []
+    ran: list[str] = []
 
     @asynccontextmanager
     async def fake_session_ctx() -> AsyncIterator[object]:
         opened.append(True)
         yield object()
 
-    async def boom(session: object) -> None:
+    async def release_boom(session: object, *, now: datetime) -> None:
+        ran.append("release")
+        raise RuntimeError("release scan exploded")
+
+    async def alert_boom(session: object) -> None:
+        ran.append("alert")
         raise RuntimeError("scan exploded")
 
-    monkeypatch.setattr(scheduler_module, "run_alert_scan", boom)
+    monkeypatch.setattr(scheduler_module, "run_release_scan", release_boom)
+    monkeypatch.setattr(scheduler_module, "run_alert_scan", alert_boom)
 
     logged: list[str] = []
     monkeypatch.setattr(
         scheduler_module.logger, "exception", lambda msg, *a, **kw: logged.append(msg)
     )
 
-    # A scan that raises must not propagate out of the job wrapper.
+    # A scan that raises must not propagate out of the job wrapper, nor stop the next scan.
     await run_scan_once(fake_session_ctx)  # type: ignore[arg-type]
 
-    assert opened == [True]
-    assert logged == ["alert scan failed"]
+    assert ran == ["release", "alert"]
+    assert opened == [True, True]
+    assert logged == ["release scan failed", "alert scan failed"]

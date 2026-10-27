@@ -125,3 +125,14 @@ async def update_alert_rule(
     rule.updated_at = datetime.now(UTC)
     await db.flush()
     return rule
+
+
+async def alert_rule_enabled(db: AsyncSession, kind: AlertKind) -> bool:
+    """Whether the manager left the `kind` rule switched on (RF50) — a missing row means the
+    seed default, on. The alerts raised where a release happens honour the same switch as the
+    periodic rules.
+
+        if await alert_rule_enabled(db, AlertKind.POINT_IMPEDED): ...
+    """
+    rule = await db.get(AlertRule, kind)
+    return rule is None or rule.enabled

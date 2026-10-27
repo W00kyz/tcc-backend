@@ -16,7 +16,7 @@ from app.domain.forms.service import add_question, get_or_create_form, publish_f
 from app.domain.identity.models import UserRole
 from app.domain.qr.crypto import sign_qr_payload
 from app.domain.qr.models import QrCodeStatus
-from app.domain.routing.models import RouteStopStatus
+from app.domain.routing.models import ReleaseReason, RouteStop, RouteStopStatus
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy import select
@@ -31,7 +31,9 @@ from tests.api.test_checkins import (
     _add_user,
     _login,
     _post,
+    _release_stop,
     _seed_route,
+    _stop_released,
 )
 
 
@@ -345,3 +347,80 @@ async def test_check_out_field_worker_role_required(
     manager_token = _login(client, email="gerente@empresa.com")
     forbidden = _post_check_out(client, manager_token, seeded.qr_code.public_code)
     assert forbidden.status_code == 403, forbidden.text
+
+
+# --- a check-out that lands after the stop was released (spec §7.5) -------------------------
+
+
+async def test_checkout_after_release_is_409(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # The check-in reached the server; the worker then lost signal, left the campus with the
+    # form filled in, and the release ran before the check-out synced.
+    seeded = await _seed_route(db_session, test_settings)
+    token = _login(client)
+    checkin = _post(client, token, seeded.qr_code.public_code)
+    assert checkin.status_code == 201, checkin.text
+    stop_id = seeded.stops[0].id
+    await _release_stop(db_session, stop_id, ReleaseReason.LEFT_CAMPUS)
+
+    response = _post_check_out(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _stop_released(
+        stop_id, ReleaseReason.LEFT_CAMPUS, appealable=True
+    )
+    # Nothing is lost server-side: the check-in stands, still open, for the appeal to build on.
+    execution = await db_session.get(Execution, uuid.UUID(checkin.json()["execution_id"]))
+    assert execution is not None
+    await db_session.refresh(execution)
+    assert execution.checked_out_at is None
+    stop = await db_session.get(RouteStop, stop_id)
+    assert stop is not None
+    await db_session.refresh(stop)
+    assert stop.status is RouteStopStatus.RELEASED
+
+
+async def test_checkout_without_checkin_on_a_released_stop_is_409(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # Both scans were offline: the check-in already answered 409, and the check-out queued
+    # behind it must say the same thing rather than "no open check-in".
+    seeded = await _seed_route(db_session, test_settings)
+    await _release_stop(db_session, seeded.stops[0].id, ReleaseReason.LOCATION_SILENCE)
+    token = _login(client)
+
+    response = _post_check_out(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "STOP_RELEASED"
+    assert response.json()["detail"]["appealable"] is True
+
+
+async def test_impeded_stop_not_appealable(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    # The worker released the stop themselves: there is nothing to contest.
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    token = _login(client)
+    stop_id = seeded.stops[0].id
+    checkin = _post(client, token, seeded.qr_code.public_code, route_stop_id=str(stop_id))
+    assert checkin.status_code == 201, checkin.text
+    impediment = client.post(
+        f"/routes/{seeded.route.id}/impediments",
+        json={
+            "route_stop_id": str(stop_id),
+            "scope": "STOP",
+            "reason": "ACCESS_BLOCKED",
+            "reported_at": datetime.now(UTC).isoformat(),
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert impediment.status_code == 201, impediment.text
+
+    response = _post_check_out(client, token, seeded.qr_code.public_code)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == _stop_released(
+        stop_id, ReleaseReason.IMPEDIMENT, appealable=False
+    )

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.domain.catalog.models import ContractorCompany, FieldWorker
+from app.domain.catalog.models import ContractorCompany, FieldWorker, FieldWorkerStatus
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import WorkerPosition
 from app.domain.privacy.models import ConsentRecord, PrivacyNotice
@@ -47,7 +47,12 @@ async def _seed(
     )
     db_session.add_all([company, user])
     await db_session.flush()
-    worker = FieldWorker(full_name=email, contractor_company_id=company.id, user_id=user.id)
+    worker = FieldWorker(
+        full_name=email,
+        contractor_company_id=company.id,
+        user_id=user.id,
+        status=FieldWorkerStatus.APPROVED,
+    )
     db_session.add(worker)
     await db_session.flush()
 
@@ -65,6 +70,7 @@ async def _seed(
             full_name=route_worker_email,
             contractor_company_id=company.id,
             user_id=other_user.id,
+            status=FieldWorkerStatus.APPROVED,
         )
         db_session.add(other)
         await db_session.flush()
@@ -165,10 +171,10 @@ async def test_route_of_a_different_worker_409(
     assert response.status_code == 409, response.text
 
 
-async def test_planned_route_409(
+async def test_paused_route_409(
     client: TestClient, db_session: AsyncSession, test_settings: Settings
 ) -> None:
-    seeded = await _seed(db_session, status=RouteStatus.PLANNED)
+    seeded = await _seed(db_session, status=RouteStatus.PAUSED)
     token = _login(client)
 
     response = _post(client, token, route_id=str(seeded.route.id))
@@ -234,6 +240,7 @@ async def test_worker_without_consent_403(
     response = _post(client, token, route_id=str(seeded.route.id))
 
     assert response.status_code == 403, response.text
+    assert response.json()["detail"]["code"] == "CONSENT_REQUIRED"
     assert (await db_session.execute(select(WorkerPosition))).scalars().first() is None
 
 

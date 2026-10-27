@@ -20,6 +20,13 @@ class ObjectStore(Protocol):
     async def delete(self, key: str) -> None: ...
 
 
+class ListableObjectStore(ObjectStore, Protocol):
+    """A store that can also enumerate its keys — only the maintenance scripts need it
+    (app/scripts/purge_orphan_evidence.py), so the request path keeps the narrower seam."""
+
+    async def list_keys(self) -> list[str]: ...
+
+
 class MinioObjectStore:
     def __init__(
         self,
@@ -79,3 +86,13 @@ class MinioObjectStore:
             await asyncio.to_thread(_delete)
         except S3Error as exc:  # pragma: no cover
             raise ObjectStoreError(f"delete {key!r} failed: {exc}") from exc
+
+    async def list_keys(self) -> list[str]:
+        def _list() -> list[str]:
+            objects = self._client.list_objects(self.bucket, recursive=True)
+            return [obj.object_name for obj in objects if obj.object_name is not None]
+
+        try:
+            return await asyncio.to_thread(_list)
+        except S3Error as exc:  # pragma: no cover - network failure path
+            raise ObjectStoreError(f"listing bucket {self.bucket!r} failed: {exc}") from exc

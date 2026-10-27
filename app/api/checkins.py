@@ -20,10 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api._execution_common import (
     NoActiveRoute,
     RouteStopMissing,
-    current_worker,
     resolve_route,
+    stop_released_conflict,
 )
-from app.api.deps import CampusToday, require_role
+from app.api.deps import ApprovedWorker, CampusToday, Now
 from app.db.session import get_db
 from app.domain.execution.models import QrScan, QrScanKind
 from app.domain.execution.service import (
@@ -32,13 +32,12 @@ from app.domain.execution.service import (
     QrCodeUnknown,
     QrRevoked,
     QrSignatureInvalid,
-    RouteCancelled,
     RouteNotStarted,
     StopNotAssignedToWorker,
+    StopReleased,
     check_in,
 )
 from app.domain.execution.validation import ChosenStopNotOnFloor
-from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import derive_public_key_hex
 from app.domain.settings.service import get_settings_row
 
@@ -52,7 +51,6 @@ _DOMAIN_ERROR_STATUS: dict[type[Exception], int] = {
     ChosenStopNotOnFloor: status.HTTP_422_UNPROCESSABLE_ENTITY,
     StopNotAssignedToWorker: status.HTTP_403_FORBIDDEN,
     RouteNotStarted: status.HTTP_409_CONFLICT,
-    RouteCancelled: status.HTTP_409_CONFLICT,
 }
 
 
@@ -86,14 +84,11 @@ class CheckInResponse(BaseModel):
 async def create_check_in(
     body: CheckInRequest,
     request: Request,
-    user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
+    worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
     today: CampusToday,
+    now: Now,
 ) -> CheckInResponse:
-    worker = await current_worker(db, user)
-    if worker is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has no field worker profile.")
-
     try:
         route = await resolve_route(
             db, worker_id=worker.id, route_stop_id=body.route_stop_id, today=today
@@ -124,6 +119,7 @@ async def create_check_in(
             idempotency_key=body.idempotency_key,
             chosen_route_stop_id=body.route_stop_id,
             radius_m=radius_m,
+            now=now,
             execution_id=body.execution_id,
             client_clock_offset_seconds=body.client_clock_offset_seconds,
         )
@@ -143,6 +139,8 @@ async def create_check_in(
                 ],
             },
         ) from exc
+    except StopReleased as exc:
+        raise stop_released_conflict(exc) from exc
     except tuple(_DOMAIN_ERROR_STATUS) as exc:
         raise HTTPException(_DOMAIN_ERROR_STATUS[type(exc)], str(exc)) from exc
 

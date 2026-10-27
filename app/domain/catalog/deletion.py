@@ -16,20 +16,20 @@ from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.object_store import ObjectStore, ObjectStoreError
+from app.domain.appeals.models import Appeal
 from app.domain.catalog.models import Building, Floor, ServicePoint
 from app.domain.execution.models import (
     Answer,
     EvidenceItem,
     EvidenceKind,
     Execution,
-    ManualCompletion,
     QrScan,
 )
+from app.domain.forms.models import Form, FormQuestion, FormVersion
 from app.domain.impediments.models import Impediment
 from app.domain.monitoring.models import Alert, Notification, WorkerPosition
 from app.domain.qr.models import QrCode
-from app.domain.routing.models import Route, RouteStop, StopAssignment
-from app.domain.routing.templates import RouteTemplate, RouteTemplateStop
+from app.domain.routing.models import Route, RouteStop
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class DeletionImpact:
     routes: int
     executions: int
     photos: int
+    appeals: int
 
 
 async def _ids(db: AsyncSession, query: Select[Any]) -> list[uuid.UUID]:
@@ -74,12 +75,14 @@ async def _impact(db: AsyncSession, point_ids: Ids, floors: int) -> DeletionImpa
             EvidenceItem.execution_id.in_(execution_ids), EvidenceItem.kind == EvidenceKind.PHOTO
         )
     )
+    appeals = await db.scalar(select(func.count()).where(Appeal.route_stop_id.in_(stop_ids)))
     return DeletionImpact(
         points=len(point_ids),
         floors=floors,
         routes=int(routes or 0),
         executions=len(execution_ids),
         photos=int(photos or 0),
+        appeals=int(appeals or 0),
     )
 
 
@@ -102,16 +105,44 @@ async def _delete_executions(db: AsyncSession, execution_ids: Ids) -> list[str]:
         )
     )
     photo_keys = [key for key in keys if key is not None]
-    for model in (Answer, EvidenceItem, QrScan, ManualCompletion):
+    for model in (Answer, EvidenceItem, QrScan):
         await db.execute(delete(model).where(model.execution_id.in_(execution_ids)))
     await db.execute(delete(Execution).where(Execution.id.in_(execution_ids)))
     return photo_keys
 
 
+async def service_type_has_history(db: AsyncSession, service_type_id: uuid.UUID) -> bool:
+    """True when a route stop was made for the type or an execution answered one of its form
+    versions: removing the type would orphan that history.
+
+    Example: ``if await service_type_has_history(db, service_type.id): ...``
+    """
+    version_ids = select(FormVersion.id).join(Form).where(Form.service_type_id == service_type_id)
+    stop = await db.scalar(
+        select(RouteStop.id).where(RouteStop.service_type_id == service_type_id).limit(1)
+    )
+    execution = await db.scalar(
+        select(Execution.id).where(Execution.form_version_id.in_(version_ids)).limit(1)
+    )
+    return stop is not None or execution is not None
+
+
+async def delete_form_of_type(db: AsyncSession, service_type_id: uuid.UUID) -> None:
+    """Drop the form built for a type (versions and questions with it), which has no history.
+
+    Example: ``await delete_form_of_type(db, service_type.id)``
+    """
+    form_ids = select(Form.id).where(Form.service_type_id == service_type_id)
+    version_ids = select(FormVersion.id).where(FormVersion.form_id.in_(form_ids))
+    await db.execute(delete(FormQuestion).where(FormQuestion.form_version_id.in_(version_ids)))
+    await db.execute(delete(FormVersion).where(FormVersion.form_id.in_(form_ids)))
+    await db.execute(delete(Form).where(Form.service_type_id == service_type_id))
+
+
 async def _delete_stops(db: AsyncSession, stop_ids: Ids) -> list[str]:
+    # An accepted appeal's APPEAL execution references the stop like any other: it goes above.
     photo_keys = await _delete_executions(db, await _ids(db, _executions_of_stops(stop_ids)))
-    await db.execute(delete(ManualCompletion).where(ManualCompletion.route_stop_id.in_(stop_ids)))
-    for model in (StopAssignment, Alert, Impediment):
+    for model in (Alert, Impediment, Appeal):
         await db.execute(delete(model).where(model.route_stop_id.in_(stop_ids)))
     await db.execute(delete(RouteStop).where(RouteStop.id.in_(stop_ids)))
     return photo_keys
@@ -147,29 +178,6 @@ async def _settle_routes(db: AsyncSession, route_ids: Ids) -> None:
     await _delete_routes(db, empty)
 
 
-async def _delete_template_stops(db: AsyncSession, point_ids: Ids) -> None:
-    """Template stops of the points go; a template left with no stop goes too."""
-    template_ids = await _ids(
-        db,
-        select(RouteTemplateStop.route_template_id)
-        .where(RouteTemplateStop.service_point_id.in_(point_ids))
-        .distinct(),
-    )
-    await db.execute(
-        delete(RouteTemplateStop).where(RouteTemplateStop.service_point_id.in_(point_ids))
-    )
-    still_used = select(RouteTemplateStop.route_template_id)
-    empty = await _ids(
-        db,
-        select(RouteTemplate.id).where(
-            RouteTemplate.id.in_(template_ids), RouteTemplate.id.not_in(still_used)
-        ),
-    )
-    # Routes materialised from a removed template keep existing, without the link.
-    await db.execute(update(Route).where(Route.template_id.in_(empty)).values(template_id=None))
-    await db.execute(delete(RouteTemplate).where(RouteTemplate.id.in_(empty)))
-
-
 async def _delete_points(db: AsyncSession, point_ids: Ids) -> list[str]:
     stop_ids = await _ids(db, _stops_of_points(point_ids))
     route_ids = await _ids(
@@ -177,7 +185,6 @@ async def _delete_points(db: AsyncSession, point_ids: Ids) -> list[str]:
     )
     photo_keys = await _delete_stops(db, stop_ids)
     await _settle_routes(db, route_ids)
-    await _delete_template_stops(db, point_ids)
     await db.execute(delete(QrScan).where(QrScan.service_point_id.in_(point_ids)))
     await db.execute(delete(ServicePoint).where(ServicePoint.id.in_(point_ids)))
     return photo_keys

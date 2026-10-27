@@ -17,23 +17,17 @@ from app.domain.catalog.models import FieldWorker, ServicePoint
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import Alert, AlertKind, Notification
 from app.domain.monitoring.push import PushSender
-from app.domain.routing.models import Route, RouteStop, RouteStopStatus
+from app.domain.routing.models import Route, RouteStop
 
 logger = logging.getLogger(__name__)
 
 # pt-BR title per alert kind — the notification body carries the full description.
 _ALERT_TITLE_PT_BR: dict[AlertKind, str] = {
-    AlertKind.LATE_START: "Rota atrasada",
-    AlertKind.WORKER_ABSENT: "Profissional ausente",
-    AlertKind.LATE_STOP: "Ponto atrasado",
     AlertKind.NO_EVIDENCE: "Execução sem evidência",
-}
-
-# pt-BR title/body per route-assignment notification kind (RF49).
-_ROUTE_ASSIGNED_TEXT_PT_BR: dict[str, tuple[str, str]] = {
-    "ROUTE_ASSIGNED": ("Nova rota atribuída", "Uma nova rota foi atribuída para você."),
-    "ROUTE_MODIFIED": ("Rota modificada", "Sua rota foi modificada."),
-    "STOP_REASSIGNED": ("Ponto reatribuído", "Um ponto foi reatribuído para você."),
+    AlertKind.POINT_IMPEDED: "Ponto impedido",
+    AlertKind.BATCH_RELEASED: "Pontos liberados",
+    AlertKind.POINTS_UNSERVED: "Pontos não atendidos",
+    AlertKind.APPEAL_FILED: "Novo recurso",
 }
 
 
@@ -92,21 +86,19 @@ async def _manager_ids(db: AsyncSession) -> list[uuid.UUID]:
     )
 
 
-async def notify_impediment_reported(
+async def describe_impediment(
     db: AsyncSession,
     *,
-    impediment_id: uuid.UUID,
     route: Route,
     route_stop: RouteStop | None,
     reason: str,
-    push: PushSender,
-) -> list[Notification]:
-    """Tell every manager that a field worker cannot go on (RF17), naming the pending point(s)
-    that now need a new owner. Same audience as `notify_alert`: a route has no single owning
-    manager (spec §2 Ruling 6). Flush, never commit.
+    released_count: int,
+) -> str:
+    """The pt-BR sentence naming who cannot go on, which point(s) went back to the pool and
+    why — the body of the impediment notification and the POINT_IMPEDED alert alike.
 
-        await notify_impediment_reported(db, impediment_id=imp.id, route=route,
-                                         route_stop=stop, reason="ACCESS_BLOCKED", push=push)
+        text = await describe_impediment(db, route=route, route_stop=None,
+                                         reason="HEALTH_ISSUE", released_count=3)
     """
     field_worker = await db.get(FieldWorker, route.field_worker_id)
     worker_name = field_worker.full_name if field_worker is not None else "Profissional"
@@ -115,19 +107,52 @@ async def notify_impediment_reported(
         point = await db.get(ServicePoint, route_stop.service_point_id)
         affected = f"o ponto {point.name if point is not None else ''}".rstrip()
     else:
-        open_stops = await db.scalars(
-            select(RouteStop).where(
-                RouteStop.route_id == route.id, RouteStop.status != RouteStopStatus.DONE
-            )
-        )
-        affected = f"o restante da rota ({len(open_stops.all())} ponto(s) pendente(s))"
+        affected = f"o restante da rota ({released_count} ponto(s) de volta ao pool)"
+    return f"{worker_name} não pode executar {affected}: {reason_text}."
+
+
+async def notify_impediment_reported(
+    db: AsyncSession,
+    *,
+    impediment_id: uuid.UUID,
+    route: Route,
+    description: str,
+    push: PushSender,
+) -> list[Notification]:
+    """Tell every manager that a field worker cannot go on (RF17); `description` comes from
+    `describe_impediment`. Same audience as `notify_alert`: a route has no single owning
+    manager (spec §2 Ruling 6). Flush, never commit.
+
+        await notify_impediment_reported(db, impediment_id=imp.id, route=route,
+                                         description=text, push=push)
+    """
     return await notify_users(
         db,
         user_ids=await _manager_ids(db),
         kind="IMPEDIMENT_REPORTED",
         title="Impossibilidade sinalizada",
-        body=f"{worker_name} não pode executar {affected}: {reason_text}. Reatribua os pontos.",
+        body=description,
         data={"impediment_id": str(impediment_id), "route_id": str(route.id)},
+        push=push,
+    )
+
+
+async def notify_appeal_filed(
+    db: AsyncSession, *, appeal_id: uuid.UUID, description: str, push: PushSender
+) -> list[Notification]:
+    """Tell every manager that a worker contested a released stop (spec §8.4: the managers
+    receive the appeals), whether or not the APPEAL_FILED alert rule is on — same audience and
+    reasoning as `notify_impediment_reported`. Flush, never commit.
+
+        await notify_appeal_filed(db, appeal_id=appeal.id, description=text, push=push)
+    """
+    return await notify_users(
+        db,
+        user_ids=await _manager_ids(db),
+        kind="APPEAL_FILED",
+        title=_ALERT_TITLE_PT_BR[AlertKind.APPEAL_FILED],
+        body=description,
+        data={"appeal_id": str(appeal_id)},
         push=push,
     )
 
@@ -149,36 +174,13 @@ async def notify_alert(db: AsyncSession, *, alert: Alert, push: PushSender) -> l
         kind="ALERT",
         title=title,
         body=alert.description,
-        data={"alert_id": str(alert.id), "route_id": str(alert.route_id)},
+        data=_alert_data(alert),
         push=push,
     )
 
 
-async def notify_route_assigned(
-    db: AsyncSession, *, route: Route, kind: str, push: PushSender
-) -> list[Notification]:
-    """Notify the route's field worker that their route was assigned/modified (RF49).
-
-    `kind` is one of ROUTE_ASSIGNED / ROUTE_MODIFIED / STOP_REASSIGNED. A field worker without
-    app access has `FieldWorker.user_id is None` (RF08) — that is a no-op, not a crash."""
-    if kind not in _ROUTE_ASSIGNED_TEXT_PT_BR:
-        raise ValueError(
-            f"Unknown route-assignment notification kind {kind!r}; "
-            f"expected one of {sorted(_ROUTE_ASSIGNED_TEXT_PT_BR)}."
-        )
-    # db.get hits the identity map first, so an already-loaded FieldWorker costs no query;
-    # reading route.field_worker directly would risk a lazy-load on the async session.
-    field_worker = await db.get(FieldWorker, route.field_worker_id)
-    if field_worker is None or field_worker.user_id is None:
-        return []
-
-    title, body = _ROUTE_ASSIGNED_TEXT_PT_BR[kind]
-    return await notify_users(
-        db,
-        user_ids=[field_worker.user_id],
-        kind=kind,
-        title=title,
-        body=body,
-        data={"route_id": str(route.id)},
-        push=push,
-    )
+def _alert_data(alert: Alert) -> dict[str, object]:
+    # A day-level alert (POINTS_UNSERVED) belongs to no route.
+    if alert.route_id is None:
+        return {"alert_id": str(alert.id)}
+    return {"alert_id": str(alert.id), "route_id": str(alert.route_id)}

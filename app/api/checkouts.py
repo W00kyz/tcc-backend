@@ -20,11 +20,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api._execution_common import (
     NoActiveRoute,
     RouteStopMissing,
-    current_worker,
     resolve_route,
+    stop_released_conflict,
 )
 from app.api.checkins import CandidateOut
-from app.api.deps import CampusToday, require_role
+from app.api.deps import ApprovedWorker, CampusToday, Now
 from app.db.session import get_db
 from app.domain.execution.answers import AnswerIn, AnswerValidationError
 from app.domain.execution.service import (
@@ -34,12 +34,11 @@ from app.domain.execution.service import (
     QrCodeUnknown,
     QrRevoked,
     QrSignatureInvalid,
-    RouteCancelled,
     StopNotAssignedToWorker,
+    StopReleased,
     check_out,
 )
 from app.domain.execution.validation import ChosenStopNotOnFloor
-from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import derive_public_key_hex
 from app.domain.settings.service import get_settings_row
 
@@ -54,7 +53,6 @@ _DOMAIN_ERROR_STATUS: dict[type[Exception], int] = {
     AnswerValidationError: status.HTTP_422_UNPROCESSABLE_ENTITY,
     FormVersionMismatch: status.HTTP_422_UNPROCESSABLE_ENTITY,
     StopNotAssignedToWorker: status.HTTP_403_FORBIDDEN,
-    RouteCancelled: status.HTTP_409_CONFLICT,
 }
 
 
@@ -108,14 +106,11 @@ def _ambiguous_conflict(exc: AmbiguousRoom) -> HTTPException:
 async def create_check_out(
     body: CheckOutRequest,
     request: Request,
-    user: Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))],
+    worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
     today: CampusToday,
+    now: Now,
 ) -> CheckOutResponse:
-    worker = await current_worker(db, user)
-    if worker is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has no field worker profile.")
-
     try:
         route = await resolve_route(
             db, worker_id=worker.id, route_stop_id=body.route_stop_id, today=today
@@ -144,6 +139,7 @@ async def create_check_out(
             checkout_idempotency_key=body.checkout_idempotency_key,
             chosen_route_stop_id=body.route_stop_id,
             radius_m=radius_m,
+            now=now,
             execution_id=body.execution_id,
             client_clock_offset_seconds=body.client_clock_offset_seconds,
             form_version_id=body.form_version_id,
@@ -155,6 +151,8 @@ async def create_check_out(
         )
     except AmbiguousRoom as exc:
         raise _ambiguous_conflict(exc) from exc
+    except StopReleased as exc:
+        raise stop_released_conflict(exc) from exc
     except tuple(_DOMAIN_ERROR_STATUS) as exc:
         raise HTTPException(_DOMAIN_ERROR_STATUS[type(exc)], str(exc)) from exc
 

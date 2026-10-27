@@ -82,11 +82,64 @@ async def test_get_settings_includes_etapa_9_defaults(
     body = client.get("/settings", headers=_auth(token)).json()
 
     assert body["alert_scan_interval_seconds"] == 60
-    assert body["late_start_tolerance_min"] == 15
-    assert body["absence_tolerance_min"] == 30
-    assert body["late_stop_tolerance_min"] == 15
     assert body["no_evidence_grace_min"] == 30
     assert body["position_report_interval_seconds"] == 60
+    assert not {"late_start_tolerance_min", "absence_tolerance_min", "late_stop_tolerance_min"} & (
+        set(body)
+    )
+
+
+async def test_get_settings_includes_allocation_defaults(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "gerente@empresa.com", UserRole.MANAGER)
+    token = _login(client, "gerente@empresa.com")
+
+    body = client.get("/settings", headers=_auth(token)).json()
+
+    assert body["allocation_batch_size"] == 4
+    assert (body["campus_min_lat"], body["campus_max_lat"]) == (-7.2250, -7.2050)
+    assert (body["campus_min_lng"], body["campus_max_lng"]) == (-35.9200, -35.8980)
+    assert body["outside_campus_release_minutes"] == 10
+    assert body["location_silence_warning_minutes"] == 30
+    assert body["location_silence_release_minutes"] == 45
+    assert body["workday_end_time"] == "17:00:00"
+    assert body["service_weekdays"] == [0, 1, 2, 3, 4]
+    assert body["appeal_window_hours"] == 48
+
+
+async def test_put_settings_updates_allocation_fields_and_audits_them_as_json(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "admin@empresa.com", UserRole.ADMIN)
+    token = _login(client, "admin@empresa.com")
+
+    response = client.put(
+        "/settings",
+        json={
+            "allocation_batch_size": 6,
+            "workday_end_time": "16:30",
+            "service_weekdays": [5, 0, 0, 2],
+            "campus_min_lat": -7.23,
+        },
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["allocation_batch_size"] == 6
+    assert body["workday_end_time"] == "16:30:00"
+    assert body["service_weekdays"] == [0, 2, 5]  # sorted, duplicates dropped
+    assert body["campus_min_lat"] == -7.23
+    assert body["appeal_window_hours"] == 48  # untouched
+    audit = await db_session.scalar(
+        select(AuditTrail).where(AuditTrail.action == "update_settings")
+    )
+    assert audit is not None
+    assert audit.after_data is not None
+    assert audit.after_data["workday_end_time"] == "16:30:00"
+    assert audit.before_data is not None
+    assert audit.before_data["service_weekdays"] == [0, 1, 2, 3, 4]
 
 
 async def test_put_settings_updates_etapa_9_fields_and_audits(
@@ -97,19 +150,19 @@ async def test_put_settings_updates_etapa_9_fields_and_audits(
 
     response = client.put(
         "/settings",
-        json={"late_stop_tolerance_min": 25, "position_report_interval_seconds": 30},
+        json={"no_evidence_grace_min": 25, "position_report_interval_seconds": 30},
         headers=_auth(token),
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["late_stop_tolerance_min"] == 25
+    assert response.json()["no_evidence_grace_min"] == 25
     assert response.json()["position_report_interval_seconds"] == 30
     # Untouched fields keep their defaults (partial patch).
     assert response.json()["check_radius_meters"] == 50
-    assert response.json()["absence_tolerance_min"] == 30
+    assert response.json()["alert_scan_interval_seconds"] == 60
 
     getr = client.get("/settings", headers=_auth(token)).json()
-    assert getr["late_stop_tolerance_min"] == 25
+    assert getr["no_evidence_grace_min"] == 25
 
     audit_count = await db_session.scalar(
         select(func.count())
@@ -136,10 +189,30 @@ async def test_put_settings_etapa_9_bounds_rejected_422(
     )
     assert (
         client.put(
-            "/settings", json={"late_start_tolerance_min": -1}, headers=_auth(token)
+            "/settings", json={"no_evidence_grace_min": -1}, headers=_auth(token)
         ).status_code
         == 422
     )
+
+
+async def test_put_settings_allocation_bounds_rejected_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "admin@empresa.com", UserRole.ADMIN)
+    token = _login(client, "admin@empresa.com")
+
+    bad_bodies: list[dict[str, object]] = [
+        {"allocation_batch_size": 0},
+        {"campus_max_lat": 91},
+        {"campus_min_lng": -181},
+        {"location_silence_release_minutes": 0},
+        {"service_weekdays": []},
+        {"service_weekdays": [7]},
+        {"appeal_window_hours": 0},
+        {"workday_end_time": "25:00"},
+    ]
+    for body in bad_bodies:
+        assert client.put("/settings", json=body, headers=_auth(token)).status_code == 422, body
 
 
 async def test_put_settings_out_of_range_422(client: TestClient, db_session: AsyncSession) -> None:
@@ -193,7 +266,7 @@ async def test_update_settings_stamps_actor_and_timestamp(db_session: AsyncSessi
     db_session.add(actor)
     await db_session.flush()
 
-    row = await update_settings(db_session, actor_id=actor.id, check_radius_meters=250)
+    row = await update_settings(db_session, actor_id=actor.id, changes={"check_radius_meters": 250})
     await db_session.commit()
 
     assert row.check_radius_meters == 250
@@ -201,7 +274,7 @@ async def test_update_settings_stamps_actor_and_timestamp(db_session: AsyncSessi
     assert row.updated_at is not None
 
 
-async def test_update_settings_writes_only_the_passed_alert_field(
+async def test_update_settings_writes_only_the_passed_fields(
     db_session: AsyncSession,
 ) -> None:
     actor = User(
@@ -213,14 +286,15 @@ async def test_update_settings_writes_only_the_passed_alert_field(
     db_session.add(actor)
     await db_session.flush()
 
-    row = await update_settings(db_session, actor_id=actor.id, late_stop_tolerance_min=20)
+    row = await update_settings(
+        db_session, actor_id=actor.id, changes={"no_evidence_grace_min": 20}
+    )
     await db_session.commit()
 
-    assert row.late_stop_tolerance_min == 20
-    # The other five Etapa 9 defaults and the radius stay untouched.
+    assert row.no_evidence_grace_min == 20
+    # Everything else keeps its default.
     assert row.check_radius_meters == 50
     assert row.alert_scan_interval_seconds == 60
-    assert row.late_start_tolerance_min == 15
-    assert row.absence_tolerance_min == 30
-    assert row.no_evidence_grace_min == 30
     assert row.position_report_interval_seconds == 60
+    assert row.allocation_batch_size == 4
+    assert row.service_weekdays == [0, 1, 2, 3, 4]

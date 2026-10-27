@@ -1,219 +1,88 @@
-"""Route CRUD for managers/admins (RF11, RF13, RF14, RF24) plus the two field-worker
-endpoints (`GET /routes/me` — RF27 "rota do dia", `POST /routes/{id}/start` — RF34). The
-`RouteOut` read model is shared with the template router through `app.api.route_view` so a
-route looks the same on mobile and the dashboard. Business rules live in
-`app.domain.routing.service` / `app.domain.execution.service`; this router validates input,
-owns the transaction, and records the audit trail."""
+"""Routes: the manager list and detail (RF41), the field worker's day (`GET /routes/me` — RF27)
+and the automatic allocation that creates them (`POST /routes/start`, `POST
+/routes/{id}/next-batch` — spec 2026-10-20-alocacao-automatica §6.2); nobody builds a route by
+hand. The `RouteOut` read model lives in `app.api.route_view` so a route looks the same on mobile
+and the dashboard."""
 
-from datetime import UTC, date, datetime
+from collections.abc import Coroutine
+from datetime import date, datetime
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CampusToday, require_role
-from app.api.route_view import (
-    _ROUTE_LOADERS,
-    RouteOut,
-    _load_route,
-    _reload,
-    _to_route_out,
+from app.api.deps import (
+    ApprovedWorker,
+    CampusToday,
+    Now,
+    ensure_location_consent,
+    require_role,
 )
+from app.api.route_view import _ROUTE_LOADERS, RouteOut, _load_route, _to_route_out
+from app.core.campus_clock import campus_today
 from app.db.session import get_db
-from app.domain.audit.service import record_audit_trail
-from app.domain.catalog.models import FieldWorker
-from app.domain.execution.service import (
-    RouteAlreadyStarted,
-    RouteCancelled,
-    RouteNotStartable,
-    StopAlreadyDone,
-    StopAlreadyManuallyCompleted,
-    StopNotOnRoute,
-    complete_manually,
-    start_route,
-)
 from app.domain.identity.models import User, UserRole
-from app.domain.monitoring.notifications import notify_route_assigned
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteType
-from app.domain.routing.osrm import OsrmUnavailable
-from app.domain.routing.service import (
-    DoneStopRemoved,
-    RouteNotEditable,
-    StopInput,
-    UnknownFieldWorker,
-    UnknownServicePoint,
-    cancel_route,
-    create_route,
-    optimize_route,
-    reassign_route,
-    replace_route_stops,
+from app.domain.routing.allocation import (
+    AllocationRefused,
+    AllocationResult,
+    NotAServiceDay,
+    OutsideCampus,
+    RouteAlreadyDone,
+    WorkdayOver,
+    next_batch,
+    start_or_resume,
 )
+from app.domain.routing.models import Route, RouteStatus
+from app.domain.settings.campus import is_service_day
+from app.domain.settings.service import get_settings_row
 
 router = APIRouter(prefix="/routes", tags=["routes"])
 
 _Manager = Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))]
-_FieldWorker = Annotated[User, Depends(require_role(UserRole.FIELD_WORKER))]
 _Db = Annotated[AsyncSession, Depends(get_db)]
 
-
-class StopBody(BaseModel):
-    service_point_id: UUID
-    expected_arrival_from: datetime | None = None
-    expected_arrival_to: datetime | None = None
-    service_type_id: UUID | None = None
-
-
-class RouteCreateBody(BaseModel):
-    field_worker_id: UUID
-    route_date: date
-    route_type: Literal["REGULAR", "OCCASIONAL"] = "REGULAR"
-    scheduled_start_at: datetime | None = None
-    stops: list[StopBody]
+_REFUSAL_CODES: dict[type[AllocationRefused], str] = {
+    NotAServiceDay: "NOT_A_SERVICE_DAY",
+    WorkdayOver: "WORKDAY_OVER",
+    OutsideCampus: "OUTSIDE_CAMPUS",
+    RouteAlreadyDone: "ROUTE_DONE",
+}
 
 
-class OccasionalRouteBody(BaseModel):
-    field_worker_ids: list[UUID] = Field(min_length=1)
-    route_date: date
-    scheduled_start_at: datetime | None = None
-    stops: list[StopBody]
+class AllocationBody(BaseModel):
+    """Where the worker is when asking for a batch: the nearest free points are measured from
+    here, and it must be inside the campus."""
 
-
-class RouteUpdateBody(BaseModel):
-    field_worker_id: UUID | None = None
-    route_date: date | None = None
-    scheduled_start_at: datetime | None = None
-    stops: list[StopBody] | None = None
-
-
-class ReassignBody(BaseModel):
-    field_worker_id: UUID
-    reason: str = Field(min_length=1, max_length=300)
-
-
-class CancelBody(BaseModel):
-    reason: str = Field(min_length=1, max_length=300)
-
-
-class CompleteManuallyBody(BaseModel):
-    reason: str = Field(min_length=1, max_length=500)
-
-
-class StartRouteRequest(BaseModel):
     latitude: float
     longitude: float
-    started_at: datetime
+    # Device clock of the fix — informational; the server clock decides the day and the hour.
+    captured_at: datetime
 
 
-def _to_stop_input(body: StopBody) -> StopInput:
-    return StopInput(
-        service_point_id=body.service_point_id,
-        expected_arrival_from=body.expected_arrival_from,
-        expected_arrival_to=body.expected_arrival_to,
-        service_type_id=body.service_type_id,
-    )
+class AllocationOut(BaseModel):
+    route: RouteOut
+    # True when nothing could be handed out. An empty pool leaves the route DONE, yet not for
+    # good: asking again the same workday reopens it when a point went back to the pool.
+    pool_empty: bool
 
 
-@router.post("", response_model=RouteOut, status_code=status.HTTP_201_CREATED)
-async def create_route_endpoint(
-    body: RouteCreateBody, request: Request, actor: _Manager, db: _Db
-) -> RouteOut:
-    try:
-        route = await create_route(
-            db,
-            field_worker_id=body.field_worker_id,
-            route_date=body.route_date,
-            route_type=RouteType(body.route_type),
-            scheduled_start_at=body.scheduled_start_at,
-            stops=[_to_stop_input(stop) for stop in body.stops],
-            actor_id=actor.id,
-            osrm=request.app.state.osrm_client,
-        )
-    except UnknownFieldWorker as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except UnknownServicePoint as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+class MyDayOut(BaseModel):
+    """The worker's day for the app: today's route, if any, and the location-silence limits it
+    warns the worker about (spec §7.3)."""
 
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="route",
-        entity_id=route.id,
-        action="create",
-        before=None,
-        after={
-            "field_worker_id": str(body.field_worker_id),
-            "route_date": body.route_date.isoformat(),
-            "route_type": route.route_type.value,
-            "stop_count": len(route.stops),
-        },
-    )
-    # RF49 — notify the assigned worker. In the same transaction as the route write (the
-    # brief's call: the Notification row is cheap and one transaction is simpler); the
-    # best-effort `push.send` is already isolated inside `notify_route_assigned`.
-    await notify_route_assigned(
-        db, route=route, kind="ROUTE_ASSIGNED", push=request.app.state.push_sender
-    )
-    await db.commit()
-    reloaded = await _reload(db, route.id)
-    return await _to_route_out(db, reloaded)
-
-
-@router.post("/occasional", response_model=list[RouteOut], status_code=status.HTTP_201_CREATED)
-async def create_occasional_routes(
-    body: OccasionalRouteBody, request: Request, actor: _Manager, db: _Db
-) -> list[RouteOut]:
-    """RF23 / spec §3.5 Ruling 2 — an occasional route assigned to N workers is N independent
-    routes, one per worker, each a copy of the same stops. One transaction: if any worker id
-    is unknown, nothing is committed."""
-    created: list[Route] = []
-    try:
-        for field_worker_id in body.field_worker_ids:
-            route = await create_route(
-                db,
-                field_worker_id=field_worker_id,
-                route_date=body.route_date,
-                route_type=RouteType.OCCASIONAL,
-                scheduled_start_at=body.scheduled_start_at,
-                stops=[_to_stop_input(stop) for stop in body.stops],
-                actor_id=actor.id,
-                osrm=request.app.state.osrm_client,
-            )
-            created.append(route)
-    except UnknownFieldWorker as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except UnknownServicePoint as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-
-    for route in created:
-        await record_audit_trail(
-            db,
-            actor_id=actor.id,
-            entity_type="route",
-            entity_id=route.id,
-            action="create",
-            before=None,
-            after={
-                "field_worker_id": str(route.field_worker_id),
-                "route_date": body.route_date.isoformat(),
-                "route_type": route.route_type.value,
-                "stop_count": len(route.stops),
-            },
-        )
-        # RF49 — one ROUTE_ASSIGNED per created route (each route is one worker's copy).
-        await notify_route_assigned(
-            db, route=route, kind="ROUTE_ASSIGNED", push=request.app.state.push_sender
-        )
-    await db.commit()
-    reloaded = [await _reload(db, route.id) for route in created]
-    return [await _to_route_out(db, r) for r in reloaded]
+    service_day: bool
+    route: RouteOut | None
+    position_report_interval_seconds: int
+    location_silence_warning_minutes: int
+    location_silence_release_minutes: int
 
 
 def _parse_enum[FilterEnum: Enum](enum_cls: type[FilterEnum], value: str, param: str) -> FilterEnum:
-    """Turn a raw `?route_type=` / `?status=` string into its enum member, or answer 422 naming
+    """Turn a raw `?status=` string into its enum member, or answer 422 naming
     the offending value and the allowed set — an unknown filter is a client error, not an
     excuse to silently return an empty list (Task-4 review)."""
     try:
@@ -232,7 +101,6 @@ async def list_routes(
     db: _Db,
     route_date: Annotated[date | None, Query(alias="date")] = None,
     field_worker_id: UUID | None = None,
-    route_type: str | None = None,
     route_status: Annotated[str | None, Query(alias="status")] = None,
 ) -> list[RouteOut]:
     stmt = select(Route).options(*_ROUTE_LOADERS).order_by(Route.route_date, Route.created_at)
@@ -240,39 +108,105 @@ async def list_routes(
         stmt = stmt.where(Route.route_date == route_date)
     if field_worker_id is not None:
         stmt = stmt.where(Route.field_worker_id == field_worker_id)
-    if route_type is not None:
-        stmt = stmt.where(Route.route_type == _parse_enum(RouteType, route_type, "route_type"))
     if route_status is not None:
         stmt = stmt.where(Route.status == _parse_enum(RouteStatus, route_status, "status"))
     routes = (await db.scalars(stmt)).all()
     return [await _to_route_out(db, route) for route in routes]
 
 
-@router.get("/me", response_model=list[RouteOut])
-async def list_my_routes(
-    user: _FieldWorker,
-    db: _Db,
-    today: CampusToday,
-    route_date: Annotated[date | None, Query(alias="date")] = None,
-) -> list[RouteOut]:
-    """RF27 "rota do dia": the mobile feed for the signed-in worker. Same `RouteOut` shape the
-    manager endpoints return, so mobile and the dashboard render a route identically. Without
-    `?date=` it defaults to today; CANCELLED routes are never shown."""
-    worker = await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
-    if worker is None:
-        return []
-    stmt = (
+@router.get("/me", response_model=MyDayOut)
+async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday) -> MyDayOut:
+    """RF27 "rota do dia": the signed-in worker's route of today (or none yet). Same `RouteOut`
+    shape the manager endpoints return, so mobile and the dashboard render a route identically."""
+    settings = await get_settings_row(db)
+    route = await db.scalar(
         select(Route)
-        .where(
-            Route.field_worker_id == worker.id,
-            Route.route_date == (route_date or today),
-            Route.status != RouteStatus.CANCELLED,
-        )
+        .where(Route.field_worker_id == worker.id, Route.route_date == today)
         .options(*_ROUTE_LOADERS)
-        .order_by(Route.created_at)
     )
-    routes = (await db.scalars(stmt)).all()
-    return [await _to_route_out(db, route) for route in routes]
+    return MyDayOut(
+        service_day=is_service_day(settings, today),
+        route=await _to_route_out(db, route) if route is not None else None,
+        position_report_interval_seconds=settings.position_report_interval_seconds,
+        location_silence_warning_minutes=settings.location_silence_warning_minutes,
+        location_silence_release_minutes=settings.location_silence_release_minutes,
+    )
+
+
+@router.post("/start", response_model=AllocationOut)
+async def start_route(
+    body: AllocationBody, worker: ApprovedWorker, db: _Db, now: Now, request: Request
+) -> AllocationOut:
+    """The "Iniciar rota" button: create or reopen today's route and hand out a batch; a retry
+    while the batch is open returns it unchanged. A route DONE for an empty pool is looked at
+    again: reopened with the points released since, else `pool_empty=true`. 409 with a machine
+    code when the day or the position refuses any batch."""
+    await ensure_location_consent(db, worker)
+    settings = await get_settings_row(db)
+    result = await _allocating(
+        start_or_resume(
+            db,
+            worker=worker,
+            today=campus_today(now),
+            now=now,
+            lat=body.latitude,
+            lng=body.longitude,
+            settings=settings,
+            osrm=request.app.state.osrm_client,
+        )
+    )
+    return await _allocation_out(db, result)
+
+
+@router.post("/{route_id}/next-batch", response_model=AllocationOut)
+async def next_route_batch(
+    route_id: UUID,
+    body: AllocationBody,
+    worker: ApprovedWorker,
+    db: _Db,
+    now: Now,
+    request: Request,
+) -> AllocationOut:
+    """The next batch once the current one has no open stop (unchanged while it has one). An
+    empty pool closes the route: `pool_empty=true`, status DONE; asking again the same workday
+    reopens it when a point went back to the pool. 409 `ROUTE_DONE` for a route of a past
+    day."""
+    await ensure_location_consent(db, worker)
+    route = await db.get(Route, route_id)
+    if route is None or route.field_worker_id != worker.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
+    settings = await get_settings_row(db)
+    result = await _allocating(
+        next_batch(
+            db,
+            route=route,
+            now=now,
+            lat=body.latitude,
+            lng=body.longitude,
+            settings=settings,
+            osrm=request.app.state.osrm_client,
+        )
+    )
+    return await _allocation_out(db, result)
+
+
+async def _allocating(allocation: Coroutine[None, None, AllocationResult]) -> AllocationResult:
+    """Await an allocation, turning its refusal into a 409 with the machine code."""
+    try:
+        return await allocation
+    except AllocationRefused as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": _REFUSAL_CODES[type(exc)], "detail": str(exc)},
+        ) from exc
+
+
+async def _allocation_out(db: AsyncSession, result: AllocationResult) -> AllocationOut:
+    """Commit the batch (releasing the claim's row locks), then read the route back whole."""
+    await db.commit()
+    route = await _load_route(db, result.route.id)
+    assert route is not None  # just written in this session
+    return AllocationOut(route=await _to_route_out(db, route), pool_empty=result.pool_empty)
 
 
 @router.get("/{route_id}", response_model=RouteOut)
@@ -282,279 +216,3 @@ async def get_route(route_id: UUID, _actor: _Manager, db: _Db) -> RouteOut:
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
     return await _to_route_out(db, route)
-
-
-@router.patch("/{route_id}", response_model=RouteOut)
-async def patch_route(
-    route_id: UUID, body: RouteUpdateBody, request: Request, actor: _Manager, db: _Db
-) -> RouteOut:
-    route = await _load_route(db, route_id)
-    if route is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-    if route.status in (RouteStatus.CANCELLED, RouteStatus.DONE):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f'Route "{route_id}" is {route.status.value} and cannot be edited.',
-        )
-
-    # A changed field_worker_id here would bypass the append-only stop_assignments chain that
-    # POST /routes/{id}/reassign maintains (spec §3.4 Ruling 1 / RF21), leaving route and
-    # assignments pointing at different workers. Reject it before any write; an unchanged value
-    # (dashboard edit forms echo it back) is a no-op and is not validated.
-    if body.field_worker_id is not None and body.field_worker_id != route.field_worker_id:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f'Route "{route_id}" worker cannot be changed here; '
-            f"use POST /routes/{route_id}/reassign.",
-        )
-
-    before = _route_snapshot(route)
-    if body.route_date is not None:
-        route.route_date = body.route_date
-    if body.scheduled_start_at is not None:
-        route.scheduled_start_at = body.scheduled_start_at
-    if body.stops is not None:
-        try:
-            await replace_route_stops(
-                db,
-                route=route,
-                stops=[_to_stop_input(stop) for stop in body.stops],
-                actor_id=actor.id,
-                osrm=request.app.state.osrm_client,
-            )
-        except RouteNotEditable as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-        except (DoneStopRemoved, UnknownServicePoint) as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-
-    await db.flush()
-    reloaded = await _reload(db, route_id)
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="route",
-        entity_id=route_id,
-        action="update",
-        before=before,
-        after=_route_snapshot(reloaded),
-    )
-    # RF49 — always notify ROUTE_MODIFIED on a successful PATCH. A manager editing a route is
-    # a real event for the worker; distinguishing a "meaningful" change from a no-op echo is
-    # not worth the complexity for this etapa, and a pure-no-op PATCH is already rare.
-    await notify_route_assigned(
-        db, route=reloaded, kind="ROUTE_MODIFIED", push=request.app.state.push_sender
-    )
-    await db.commit()
-    return await _to_route_out(db, reloaded)
-
-
-@router.post("/{route_id}/optimize", response_model=RouteOut)
-async def optimize_route_endpoint(
-    route_id: UUID, request: Request, actor: _Manager, db: _Db
-) -> RouteOut:
-    route = await _load_route(db, route_id)
-    if route is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-
-    before = {"stop_order": _stop_order(route)}
-    try:
-        await optimize_route(db, route=route, osrm=request.app.state.osrm_client)
-    except OsrmUnavailable as exc:
-        # Unlike a plain save, the optimise endpoint has nothing to show without OSRM — the
-        # visiting order IS the OSRM answer (spec §4.2, Ruling 6).
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Route optimization is unavailable: the OSRM service did not respond.",
-        ) from exc
-    except RouteNotEditable as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-
-    reloaded = await _reload(db, route_id)
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="route",
-        entity_id=route_id,
-        action="optimize",
-        before=before,
-        after={"stop_order": _stop_order(reloaded)},
-    )
-    await db.commit()
-    return await _to_route_out(db, reloaded)
-
-
-@router.post("/{route_id}/reassign", response_model=RouteOut)
-async def reassign_route_endpoint(
-    route_id: UUID, body: ReassignBody, request: Request, actor: _Manager, db: _Db
-) -> RouteOut:
-    route = await _load_route(db, route_id)
-    if route is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-
-    before = {"field_worker_id": str(route.field_worker_id)}
-    try:
-        await reassign_route(
-            db,
-            route=route,
-            new_field_worker_id=body.field_worker_id,
-            reason=body.reason,
-            actor_id=actor.id,
-        )
-    except RouteNotEditable as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except UnknownFieldWorker as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-
-    reloaded = await _reload(db, route_id)
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="route",
-        entity_id=route_id,
-        action="reassign",
-        before=before,
-        after={"field_worker_id": str(body.field_worker_id), "reason": body.reason},
-    )
-    # RF49 — the route's field_worker_id is already the new worker; notify them.
-    await notify_route_assigned(
-        db, route=reloaded, kind="ROUTE_ASSIGNED", push=request.app.state.push_sender
-    )
-    await db.commit()
-    return await _to_route_out(db, reloaded)
-
-
-@router.post("/{route_id}/cancel", response_model=RouteOut)
-async def cancel_route_endpoint(
-    route_id: UUID, body: CancelBody, actor: _Manager, db: _Db
-) -> RouteOut:
-    route = await _load_route(db, route_id)
-    if route is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-
-    before = {"status": route.status.value}
-    try:
-        await cancel_route(db, route=route, reason=body.reason)
-    except RouteNotEditable as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-
-    reloaded = await _reload(db, route_id)
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="route",
-        entity_id=route_id,
-        action="cancel",
-        before=before,
-        after={"status": reloaded.status.value, "reason": body.reason},
-    )
-    await db.commit()
-    return await _to_route_out(db, reloaded)
-
-
-@router.post("/{route_id}/start", response_model=RouteOut)
-async def start_route_endpoint(
-    route_id: UUID, body: StartRouteRequest, user: _FieldWorker, db: _Db
-) -> RouteOut:
-    route = await _load_route(db, route_id)
-    if route is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-
-    worker = await db.scalar(select(FieldWorker).where(FieldWorker.user_id == user.id))
-    if worker is None or route.field_worker_id != worker.id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "This route is not assigned to you.")
-
-    prior_status = route.status.value
-    try:
-        route = await start_route(
-            db,
-            route=route,
-            latitude=body.latitude,
-            longitude=body.longitude,
-            started_at=body.started_at,
-        )
-    except (RouteAlreadyStarted, RouteNotStartable) as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-
-    # `start_route` commits internally (the documented execution-module exception); the audit
-    # row is appended in a second transaction, exactly as `complete_stop_manually` does.
-    assert route.started_at is not None
-    await record_audit_trail(
-        db,
-        actor_id=user.id,
-        entity_type="route",
-        entity_id=route_id,
-        action="start",
-        before={"status": prior_status},
-        after={"status": route.status.value, "started_at": route.started_at.isoformat()},
-    )
-    await db.commit()
-    reloaded = await _reload(db, route_id)
-    return await _to_route_out(db, reloaded)
-
-
-@router.post(
-    "/{route_id}/stops/{stop_id}/complete-manually",
-    response_model=RouteOut,
-    status_code=status.HTTP_201_CREATED,
-)
-async def complete_stop_manually(
-    route_id: UUID, stop_id: UUID, body: CompleteManuallyBody, actor: _Manager, db: _Db
-) -> RouteOut:
-    """RF53 — a manager closes a stop the worker could not reach, with a reason and no
-    evidence. `complete_manually` owns and commits its own transaction (the execution module
-    exception to "service flushes, never commits"); the audit trail is appended in a second
-    transaction afterwards, exactly as `start_route` does."""
-    route = await _load_route(db, route_id)
-    if route is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-
-    stop = await db.scalar(select(RouteStop).where(RouteStop.id == stop_id))
-    if stop is None or stop.route_id != route_id:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            f'Route stop "{stop_id}" not found on route "{route_id}".',
-        )
-
-    prior_status = stop.status.value
-    try:
-        await complete_manually(
-            db,
-            route=route,
-            stop=stop,
-            actor_id=actor.id,
-            reason=body.reason,
-            completed_at=datetime.now(UTC),
-        )
-    except StopNotOnRoute as exc:  # defensive — the check above already 404s a mismatched pair
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except (RouteCancelled, StopAlreadyDone, StopAlreadyManuallyCompleted) as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-
-    await record_audit_trail(
-        db,
-        actor_id=actor.id,
-        entity_type="route_stop",
-        entity_id=stop_id,
-        action="complete_manually",
-        before={"status": prior_status},
-        after={"status": "DONE", "reason": body.reason},
-    )
-    await db.commit()
-    reloaded = await _reload(db, route_id)
-    return await _to_route_out(db, reloaded)
-
-
-def _route_snapshot(route: Route) -> dict[str, object]:
-    return {
-        "field_worker_id": str(route.field_worker_id),
-        "route_date": route.route_date.isoformat(),
-        "route_type": route.route_type.value,
-        "status": route.status.value,
-        "stop_count": len(route.stops),
-    }
-
-
-def _stop_order(route: Route) -> list[str]:
-    """The visiting order as service-point ids — the audit `before`/`after` for optimise, whose
-    only effect is a reordering."""
-    return [str(stop.service_point_id) for stop in route.stops]

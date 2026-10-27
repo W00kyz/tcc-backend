@@ -61,7 +61,13 @@ async def _seed_many_floor_stops(
         )
         db_session.add(QrCode(floor_id=floor.id, public_code=payload, secret=b"sig", version=1))
         db_session.add(
-            RouteStop(route_id=seeded.route.id, service_point_id=point.id, order_index=index)
+            RouteStop(
+                route_id=seeded.route.id,
+                service_point_id=point.id,
+                order_index=index,
+                batch_number=1,
+                service_date=seeded.route.route_date,
+            )
         )
         payloads.append(payload)
 

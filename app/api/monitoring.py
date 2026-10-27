@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.api.deps import require_role
+from app.api.deps import Now, require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
 from app.domain.identity.models import User, UserRole
@@ -45,7 +45,8 @@ _KEEPALIVE_SECONDS = 15.0
 
 # Fields left out of the change digest. `generated_at` and each position's `age_seconds` advance
 # on every poll from clock drift alone, so hashing them would re-emit a snapshot every 2s. The
-# digest covers only the meaningful state — routes, alerts, and each fix's coordinates/reported_at.
+# digest covers only the meaningful state — routes, pool, alerts, and each fix's
+# coordinates/reported_at.
 _DIGEST_EXCLUDE: dict[str, object] = {
     "generated_at": True,
     "worker_positions": {"__all__": {"age_seconds"}},
@@ -60,10 +61,11 @@ def _snapshot_digest(snapshot: BoardSnapshot) -> str:
 
 
 @router.get("/monitoring/board", response_model=BoardSnapshot)
-async def get_board(_actor: _Manager, db: _Db) -> BoardSnapshot:
-    """RF41 — the coloured route board: every open route with its derived `is_delayed` flag and
-    OPEN alert count, the board's alert list, and the latest GPS fix per worker."""
-    return await build_board(db, now=datetime.now(UTC))
+async def get_board(_actor: _Manager, db: _Db, now: Now) -> BoardSnapshot:
+    """RF41 — the board of the day: per-type pool KPIs, today's routes with their current
+    batch and OPEN alert count, who has not started, today's releases, the board's alert list,
+    and the latest GPS fix per worker."""
+    return await build_board(db, now=now)
 
 
 async def board_event_stream(
@@ -125,7 +127,7 @@ class AlertOut(BaseModel):
     kind: AlertKind
     severity: str
     description: str
-    route_id: UUID
+    route_id: UUID | None  # null for a day-level alert (POINTS_UNSERVED)
     route_stop_id: UUID | None
     field_worker_id: UUID | None
     status: AlertStatus

@@ -1,22 +1,22 @@
-"""Route start (RF34), check-in (RF29), check-out (RF31), manager manual completion (RF33).
-Check-in is floor-QR-first: the QR identifies a floor, `resolve_room` picks the room from
-the worker's PENDING stops there, and the five anti-fraud layers (signature, QR status, GPS
-radius, room match, schedule window) attach flags without blocking a reviewable check-in
-(spec §4.2, §4.4).
+"""Check-in (RF29) and check-out (RF31). Check-in is floor-QR-first: the QR identifies a
+floor, `resolve_room` picks the room from the worker's PENDING stops there, and the anti-fraud
+layers (signature, QR status, GPS radius, room match, clock skew) attach flags without blocking
+a reviewable check-in (spec §4.2, §4.4). The schedule-window layer went with the planned arrival
+windows (spec 2026-10-20-alocacao-automatica §2.1).
 
 DO NOT CHANGE: this module is the documented exception to "service layer flushes, never
-commits" — check-in/check-out/manual-completion each own and commit a transaction, as
-`start_route` already does."""
+commits" — check-in and check-out each own and commit a transaction."""
 
 import uuid
-from collections.abc import Sequence
-from datetime import UTC, datetime
+from collections.abc import Collection, Sequence
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.domain.appeals.service import is_appealable, stop_has_appeal
 from app.domain.catalog.footprint import outline_contains
 from app.domain.catalog.models import Building, Floor, ServicePoint
 from app.domain.execution.answers import AnswerIn, build_answers
@@ -26,42 +26,20 @@ from app.domain.execution.models import (
     ExecutionReviewStatus,
     ExecutionSource,
     GeoValidation,
-    ManualCompletion,
     QrScan,
     QrScanKind,
 )
 from app.domain.execution.validation import (
     FLAG_QR_SUPERSEDED,
     Candidate,
-    ScheduleWindow,
     clock_skew_flag,
     resolve_room,
-    schedule_flag,
 )
 from app.domain.forms.models import FormVersion, FormVersionStatus
 from app.domain.qr.crypto import QrPayload, decode_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
-from app.domain.routing.models import (
-    Route,
-    RouteStatus,
-    RouteStop,
-    RouteStopStatus,
-    StopAssignment,
-    StopAssignmentOutcome,
-)
-from app.domain.routing.service import complete_route_if_finished
-
-
-class RouteAlreadyStarted(Exception):
-    pass
-
-
-class RouteNotStartable(Exception):
-    """The route is CANCELLED (or DONE) — a worker cannot start it (spec §3 Ruling 4)."""
-
-
-class RouteCancelled(Exception):
-    """The route was cancelled — it can no longer take check-ins or completions."""
+from app.domain.routing.models import ReleaseReason, Route, RouteStop, RouteStopStatus
+from app.domain.settings.service import get_settings_row
 
 
 class QrSignatureInvalid(Exception):
@@ -102,46 +80,29 @@ class RouteNotStarted(Exception):
     pass
 
 
-class StopAlreadyDone(Exception):
-    pass
-
-
-class StopAlreadyManuallyCompleted(Exception):
-    """A `manual_completions` row already exists for this stop (its unique constraint)."""
-
-
 class NoOpenCheckIn(Exception):
     """Check-out found no IN_PROGRESS stop with an open execution on the scanned floor."""
 
 
-class StopNotOnRoute(Exception):
-    """The `stop` passed to `complete_manually` does not belong to the given `route`."""
+class StopReleased(Exception):
+    """The stop went back to the pool before this check-in, check-out or evidence reached the
+    server — a late offline sync (spec 2026-10-20-alocacao-automatica §7.5). Nothing is written;
+    `appealable` tells the app whether to offer the worker an appeal."""
+
+    def __init__(self, stop: RouteStop, *, appealable: bool) -> None:
+        assert stop.release_reason is not None  # every RELEASED stop carries its reason
+        super().__init__(
+            f'Route stop "{stop.id}" was released back to the pool ({stop.release_reason}).'
+        )
+        self.route_stop_id = stop.id
+        self.release_reason: ReleaseReason = stop.release_reason
+        self.appealable = appealable
 
 
 class FormVersionMismatch(Exception):
     """The check-out's `form_version_id`/`answers` do not fit the stop (Ruling 7): missing one
     of the pair, a non-PUBLISHED version, the wrong service type's form, or a stop with no
     service type at all."""
-
-
-async def start_route(
-    db: AsyncSession, *, route: Route, latitude: float, longitude: float, started_at: datetime
-) -> Route:
-    if route.started_at is not None:
-        raise RouteAlreadyStarted(f'Route "{route.id}" was already started at {route.started_at}.')
-    if route.status != RouteStatus.PLANNED:
-        # PLANNED is the only startable state — CANCELLED/DONE routes never move to IN_PROGRESS
-        # (spec §3 Ruling 4). IN_PROGRESS is already ruled out by the started_at guard above.
-        raise RouteNotStartable(
-            f'Route "{route.id}" is {route.status.value} and cannot be started; expected PLANNED.'
-        )
-
-    route.started_at = started_at
-    route.start_latitude = latitude
-    route.start_longitude = longitude
-    route.status = RouteStatus.IN_PROGRESS
-    await db.commit()
-    return route
 
 
 async def check_in(
@@ -157,6 +118,7 @@ async def check_in(
     idempotency_key: uuid.UUID,
     chosen_route_stop_id: uuid.UUID | None,
     radius_m: int,
+    now: datetime,
     execution_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
 ) -> Execution:
@@ -164,7 +126,8 @@ async def check_in(
     IN_PROGRESS. Pass `chosen_route_stop_id` on the re-submit after an `AmbiguousRoom`;
     `latitude`/`longitude` are `None` when the device has no GPS fix. The offline app supplies
     `execution_id` so a retried check-in re-uses the same row, and reports its measured
-    `client_clock_offset_seconds` (server minus device clock) so implausible skew is flagged."""
+    `client_clock_offset_seconds` (server minus device clock) so implausible skew is flagged.
+    `now` is the server clock: `synced_at`, the scan's `received_at`, the appeal window."""
     existing = await db.scalar(
         select(Execution).where(Execution.idempotency_key == idempotency_key)
     )
@@ -177,6 +140,14 @@ async def check_in(
     candidates, stops = await _load_pending_candidates(
         db, route_id=route.id, floor_id=decoded.floor_id, latitude=latitude, longitude=longitude
     )
+    if not candidates or _chose_another_stop(chosen_route_stop_id, stops):
+        await _raise_if_released_on_floor(
+            db,
+            route=route,
+            floor_id=decoded.floor_id,
+            chosen_route_stop_id=chosen_route_stop_id,
+            now=now,
+        )
     if not candidates:
         raise FloorNotOnRoute(
             f'QR floor "{decoded.floor_id}" has no PENDING stop on route "{route.id}".'
@@ -192,9 +163,8 @@ async def check_in(
     resolved = resolution.resolved
     stop = stops[resolved.route_stop_id]
     skew_flags = clock_skew_flag(client_clock_offset_seconds)
-    flags = _merge_flags(resolution.flags, _schedule_flags(stop, scanned_at), qr_flags, skew_flags)
+    flags = _merge_flags(resolution.flags, qr_flags, skew_flags)
 
-    now = datetime.now(UTC)
     execution = Execution(
         # The offline app owns the id so a retry lands on the same row (spec Ruling 7).
         id=execution_id or uuid.uuid4(),
@@ -217,6 +187,7 @@ async def check_in(
             qr_code_id=qr_code.id,
             kind=QrScanKind.CHECK_IN,
             scanned_at=scanned_at,
+            received_at=now,
             resolved=resolved,
             geo_validation=resolution.geo_validation,
             latitude=latitude,
@@ -241,16 +212,17 @@ async def check_out(
     checkout_idempotency_key: uuid.UUID,
     chosen_route_stop_id: uuid.UUID | None,
     radius_m: int,
+    now: datetime,
     execution_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
     form_version_id: uuid.UUID | None = None,
     answers: list[AnswerIn] | None = None,
 ) -> Execution:
     """Close the open check-in on the scanned floor: sets `checked_out_at`, merges any new
-    flags into the execution, marks the stop DONE and its assignment EXECUTED. `execution_id`
+    flags into the execution and marks the stop DONE. `execution_id`
     is accepted for API symmetry with check-in but ignored here — check-out resolves the open
     execution by floor, it does not create one. `client_clock_offset_seconds` still flags
-    implausible skew."""
+    implausible skew. `now` is the server clock, as for the check-in."""
     _ = execution_id  # unused: check-out closes an existing execution, never creates one
     existing = await db.scalar(
         select(Execution).where(Execution.checkout_idempotency_key == checkout_idempotency_key)
@@ -264,6 +236,17 @@ async def check_out(
     open_rows = await _load_open_checkins(
         db, route_id=route.id, floor_id=decoded.floor_id, latitude=latitude, longitude=longitude
     )
+    open_stop_ids = {candidate.route_stop_id for candidate, _, _ in open_rows}
+    if not open_rows or _chose_another_stop(chosen_route_stop_id, open_stop_ids):
+        # The open check-in's stop was released — or, both scans offline, the stop was released
+        # before either synced: the same answer as the check-in got.
+        await _raise_if_released_on_floor(
+            db,
+            route=route,
+            floor_id=decoded.floor_id,
+            chosen_route_stop_id=chosen_route_stop_id,
+            now=now,
+        )
     if not open_rows:
         raise NoOpenCheckIn(
             f'Route "{route.id}" has no open check-in on floor "{decoded.floor_id}".'
@@ -286,9 +269,7 @@ async def check_out(
 
     previous_flags = set(execution.validation_flags)
     skew_flags = clock_skew_flag(client_clock_offset_seconds)
-    checkout_flags = _merge_flags(
-        resolution.flags, _schedule_flags(stop, scanned_at), qr_flags, skew_flags
-    )
+    checkout_flags = _merge_flags(resolution.flags, qr_flags, skew_flags)
     if skew_flags and execution.clock_skew_seconds is None:
         execution.clock_skew_seconds = client_clock_offset_seconds
     merged = previous_flags | set(checkout_flags)
@@ -308,6 +289,7 @@ async def check_out(
             qr_code_id=qr_code.id,
             kind=QrScanKind.CHECK_OUT,
             scanned_at=scanned_at,
+            received_at=now,
             resolved=resolved,
             geo_validation=resolution.geo_validation,
             latitude=latitude,
@@ -315,84 +297,77 @@ async def check_out(
         )
     )
     stop.status = RouteStopStatus.DONE
-    await _mark_assignment_executed(db, stop.id)
     await _persist_answers(
         db, execution=execution, stop=stop, form_version_id=form_version_id, answers=answers
     )
-    await complete_route_if_finished(db, route=route)
     await db.commit()
     return execution
 
 
-async def complete_manually(
-    db: AsyncSession,
-    *,
-    route: Route,
-    stop: RouteStop,
-    actor_id: uuid.UUID,
-    reason: str,
-    completed_at: datetime,
-) -> Execution:
-    """Manager closes a stop the worker could not (RF33) with an audited `manual_completions`
-    row. An IN_PROGRESS stop's open check-in `Execution` is closed in place (no orphan row);
-    a PENDING stop gets a synthetic MANAGER_MANUAL execution. No QR scan either way."""
-    if stop.route_id != route.id:
-        raise StopNotOnRoute(
-            f'Route stop "{stop.id}" belongs to route "{stop.route_id}", not "{route.id}".'
-        )
-    already_manual = await db.scalar(
-        select(ManualCompletion).where(ManualCompletion.route_stop_id == stop.id)
-    )
-    if already_manual is not None:
-        raise StopAlreadyManuallyCompleted(
-            f'Route stop "{stop.id}" was already completed manually.'
-        )
-    if stop.status is RouteStopStatus.DONE:
-        raise StopAlreadyDone(f'Route stop "{stop.id}" is already DONE.')
-    if route.status is RouteStatus.CANCELLED:
-        raise RouteCancelled(f'Route "{route.id}" was cancelled and cannot be completed.')
+async def released_stop_error(db: AsyncSession, *, stop: RouteStop, now: datetime) -> StopReleased:
+    """The `StopReleased` for a RELEASED `stop`, with whether its owner may still appeal it —
+    the same predicate `POST /appeals` applies (spec §7.5).
 
-    now = datetime.now(UTC)
-    open_checkin = await db.scalar(
-        select(Execution).where(
-            Execution.route_stop_id == stop.id, Execution.checked_out_at.is_(None)
-        )
+        raise await released_stop_error(db, stop=stop, now=now)
+    """
+    appealable = is_appealable(
+        stop,
+        now=now,
+        window_hours=(await get_settings_row(db)).appeal_window_hours,
+        has_appeal=await stop_has_appeal(db, stop.id),
     )
-    if open_checkin is not None:
-        open_checkin.checked_out_at = completed_at
-        execution = open_checkin
-    else:
-        execution = Execution(
-            route_stop_id=stop.id,
-            field_worker_id=route.field_worker_id,
-            checked_in_at=completed_at,
-            checked_out_at=completed_at,
-            synced_at=now,
-            source=ExecutionSource.MANAGER_MANUAL,
-            idempotency_key=uuid.uuid4(),
-            review_status=ExecutionReviewStatus.NONE,
-            validation_flags=[],
-        )
-        db.add(execution)
-        await db.flush()
+    return StopReleased(stop, appealable=appealable)
 
-    db.add(
-        ManualCompletion(
-            route_stop_id=stop.id,
-            execution_id=execution.id,
-            completed_by=actor_id,
-            reason=reason,
-            completed_at=completed_at,
-        )
-    )
-    stop.status = RouteStopStatus.DONE
-    await _mark_assignment_executed(db, stop.id)
-    await complete_route_if_finished(db, route=route)
-    await db.commit()
-    return execution
+
+async def ensure_stop_not_released(
+    db: AsyncSession, *, execution: Execution, now: datetime
+) -> None:
+    """Raise `StopReleased` when `execution`'s stop went back to the pool — evidence synced
+    after the release is refused like the late check-out it belongs to.
+
+        await ensure_stop_not_released(db, execution=execution, now=now)
+    """
+    stop = await db.get(RouteStop, execution.route_stop_id)
+    if stop is not None and stop.status is RouteStopStatus.RELEASED:
+        raise await released_stop_error(db, stop=stop, now=now)
 
 
 # --- internal helpers -----------------------------------------------------------------------
+
+
+async def _raise_if_released_on_floor(
+    db: AsyncSession,
+    *,
+    route: Route,
+    floor_id: uuid.UUID,
+    chosen_route_stop_id: uuid.UUID | None,
+    now: datetime,
+) -> None:
+    """Raise `StopReleased` when a stop of `route` on the scanned floor was released: the
+    worker's chosen stop if they chose one, else the latest released there."""
+    released = list(
+        await db.scalars(
+            select(RouteStop)
+            .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
+            .where(
+                RouteStop.route_id == route.id,
+                RouteStop.status == RouteStopStatus.RELEASED,
+                ServicePoint.floor_id == floor_id,
+            )
+            .order_by(RouteStop.released_at.desc())
+        )
+    )
+    if chosen_route_stop_id is not None:
+        released = [stop for stop in released if stop.id == chosen_route_stop_id]
+    if released:
+        raise await released_stop_error(db, stop=released[0], now=now)
+
+
+def _chose_another_stop(
+    chosen_route_stop_id: uuid.UUID | None, live_stop_ids: Collection[uuid.UUID]
+) -> bool:
+    """The worker's re-submit names a stop that is not among the live ones on the floor."""
+    return chosen_route_stop_id is not None and chosen_route_stop_id not in live_stop_ids
 
 
 async def _persist_answers(
@@ -436,8 +411,6 @@ async def _persist_answers(
 
 
 def _guard_route(route: Route, worker_id: uuid.UUID, *, require_started: bool) -> None:
-    if route.status is RouteStatus.CANCELLED:
-        raise RouteCancelled(f'Route "{route.id}" was cancelled and cannot take check-ins.')
     if route.field_worker_id != worker_id:
         raise StopNotAssignedToWorker(f'Route "{route.id}" is not on worker "{worker_id}"\'s list.')
     if require_started and route.started_at is None:
@@ -521,6 +494,10 @@ async def _load_pending_candidates(
             RouteStop.status == RouteStopStatus.PENDING,
             ServicePoint.floor_id == floor_id,
         )
+        # IMPORTANT: lock the stops until the commit. The release (`release_stops`) updates only
+        # rows still live, so it either waits for this check-in and spares the stop, or commits
+        # first and this read no longer sees it — never a RELEASED stop flipped back.
+        .with_for_update(of=RouteStop)
     )
     candidates: list[Candidate] = []
     stops: dict[uuid.UUID, RouteStop] = {}
@@ -550,18 +527,14 @@ async def _load_open_checkins(
             Execution.checked_out_at.is_(None),
             ServicePoint.floor_id == floor_id,
         )
+        # IMPORTANT: same lock as `_load_pending_candidates` — a check-out racing a release
+        # either finishes the stop first or finds it released, never overwrites RELEASED.
+        .with_for_update(of=RouteStop)
     )
     return [
         (_candidate(stop, point, footprint, latitude, longitude), execution, stop)
         for execution, stop, point, footprint in rows.all()
     ]
-
-
-def _schedule_flags(stop: RouteStop, scanned_at: datetime) -> list[str]:
-    window = ScheduleWindow(
-        arrival_from=stop.expected_arrival_from, arrival_to=stop.expected_arrival_to
-    )
-    return schedule_flag(window, scanned_at)
 
 
 def _merge_flags(*groups: Sequence[str]) -> list[str]:
@@ -577,6 +550,7 @@ def _build_scan(
     qr_code_id: uuid.UUID,
     kind: QrScanKind,
     scanned_at: datetime,
+    received_at: datetime,
     resolved: Candidate,
     geo_validation: GeoValidation,
     latitude: float | None,
@@ -587,21 +561,10 @@ def _build_scan(
         qr_code_id=qr_code_id,
         kind=kind,
         scanned_at=scanned_at,
-        received_at=datetime.now(UTC),  # server clock; `scanned_at` is the device's
+        received_at=received_at,  # server clock; `scanned_at` is the device's
         geo_validation=geo_validation,
         distance_m=resolved.distance_m,
         service_point_id=resolved.service_point_id,
         latitude=latitude,
         longitude=longitude,
     )
-
-
-async def _mark_assignment_executed(db: AsyncSession, route_stop_id: uuid.UUID) -> None:
-    assignment = await db.scalar(
-        select(StopAssignment)
-        .where(StopAssignment.route_stop_id == route_stop_id)
-        .order_by(StopAssignment.sequence.desc())
-        .limit(1)
-    )
-    if assignment is not None:
-        assignment.outcome = StopAssignmentOutcome.EXECUTED

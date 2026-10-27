@@ -19,7 +19,14 @@ from app.core.campus_clock import campus_today
 from app.core.config import Settings
 from app.core.mail import RecordingMailer
 from app.core.security import hash_password
-from app.domain.catalog.models import Building, ContractorCompany, FieldWorker, Floor, ServicePoint
+from app.domain.catalog.models import (
+    Building,
+    ContractorCompany,
+    FieldWorker,
+    FieldWorkerStatus,
+    Floor,
+    ServicePoint,
+)
 from app.domain.identity.models import User, UserRole
 from app.domain.monitoring.models import (
     Alert,
@@ -28,12 +35,12 @@ from app.domain.monitoring.models import (
     AlertStatus,
     WorkerPosition,
 )
-from app.domain.routing.models import Route, RouteStatus, RouteType
-from app.domain.routing.service import StopInput, create_route
+from app.domain.routing.models import Route
 from app.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from tests.support.factories import make_route
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -89,7 +96,10 @@ async def _seed_actors(db: AsyncSession) -> _Seed:
     db.add_all([manager, worker_user, company])
     await db.flush()
     worker = FieldWorker(
-        full_name="Joao da Silva", contractor_company_id=company.id, user_id=worker_user.id
+        full_name="Joao da Silva",
+        contractor_company_id=company.id,
+        user_id=worker_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     db.add(worker)
     await db.flush()
@@ -108,21 +118,11 @@ async def _make_route(db: AsyncSession, seed: _Seed) -> Route:
     )
     db.add(point)
     await db.flush()
-    route = await create_route(
-        db,
-        field_worker_id=seed.worker.id,
-        # The board's "today" is the campus calendar day: from 21:00 in Campina Grande the UTC
-        # date is already tomorrow, and a UTC-dated route fell off the board (test failed at night).
-        route_date=campus_today(datetime.now(UTC)),
-        route_type=RouteType.REGULAR,
-        scheduled_start_at=None,
-        stops=[StopInput(service_point_id=point.id)],
-        actor_id=seed.manager.id,
-        osrm=FakeOsrmClient(),
+    # The board's "today" is the campus calendar day: from 21:00 in Campina Grande the UTC
+    # date is already tomorrow, and a UTC-dated route fell off the board (test failed at night).
+    return await make_route(
+        db, worker=seed.worker, day=campus_today(datetime.now(UTC)), points=[point]
     )
-    route.status = RouteStatus.IN_PROGRESS
-    await db.flush()
-    return route
 
 
 class _Connection:
@@ -180,10 +180,10 @@ async def test_stream_re_emits_when_an_alert_appears(
 
     db_session.add(
         Alert(
-            kind=AlertKind.LATE_STOP,
-            severity=AlertSeverity.WARNING,
-            dedup_key=f"LATE_STOP:{route.stops[0].id}",
-            description="Ponto atrasado",
+            kind=AlertKind.NO_EVIDENCE,
+            severity=AlertSeverity.INFO,
+            dedup_key=f"NO_EVIDENCE:{route.stops[0].id}",
+            description="Execução sem evidência",
             route_id=route.id,
             route_stop_id=route.stops[0].id,
             field_worker_id=seed.worker.id,
@@ -198,10 +198,10 @@ async def test_stream_re_emits_when_an_alert_appears(
     open_alerts = second["open_alerts"]
     assert isinstance(open_alerts, list)
     assert len(open_alerts) == 1
-    assert open_alerts[0]["kind"] == "LATE_STOP"
+    assert open_alerts[0]["kind"] == "NO_EVIDENCE"
     routes = second["routes"]
     assert isinstance(routes, list)
-    assert routes[0]["is_delayed"] is True
+    assert routes[0]["open_alert_count"] == 1
 
 
 async def test_idle_stream_emits_keep_alive_not_a_fresh_board(

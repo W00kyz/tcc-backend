@@ -70,3 +70,19 @@ uv run python -m app.scripts.export_openapi
 Isto escreve `../docs/api/openapi.json`, no repositório principal — commitar lá (não aqui),
 depois rodar `npm run generate:api` no `tcc-dashboard` (ver `dashboard/CONTRIBUTING.md`) para
 atualizar o cliente TypeScript gerado.
+
+## Migração destrutiva da alocação automática
+
+A revisão `f3b9d1a7c2e5` (`automatic_allocation_reset`) apaga todo o dado operacional — rotas,
+paradas, execuções, evidências, alertas, impedimentos, notificações, posições — e não tem
+`downgrade` (voltar exige restaurar backup). Faça backup antes de aplicá-la num banco com dados.
+
+O Alembic não alcança o MinIO: as fotos das evidências apagadas ficam no bucket. Depois do
+`alembic upgrade`, remova-as com:
+
+```bash
+uv run python -m app.scripts.purge_orphan_evidence
+```
+
+O script só apaga objetos que nenhuma linha de `evidence_items` referencia, então rodar de novo
+é seguro.

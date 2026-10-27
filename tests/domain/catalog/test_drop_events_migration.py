@@ -2,47 +2,25 @@
 and the point_type/event_id columns, keeps every service point (occasional ones included),
 and round-trips cleanly.
 
-Plain (sync) test on purpose: alembic's env.py calls `asyncio.run()`, which would blow up
-inside an already-running event loop (Etapa 9 pattern, tests/domain/monitoring/test_models.py)."""
-
-import asyncio
+Runs on a scratch database (tests/support/migrations.py): the shared one is past the
+irreversible allocation reset. Plain (sync) test on purpose: alembic's env.py calls
+`asyncio.run()`, which would blow up inside an already-running event loop (Etapa 9 pattern,
+tests/domain/monitoring/test_models.py)."""
 
 from alembic import command
-from alembic.config import Config
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+
+from tests.support.migrations import LAST_REVERSIBLE_REVISION, alembic_config, run_sql
 
 _BEFORE_REMOVAL = "b7c4e2f9a1d3"
 
 
-def _alembic_config(url: str) -> Config:
-    cfg = Config(
-        str(__file__).replace("tests/domain/catalog/test_drop_events_migration.py", "alembic.ini")
-    )
-    cfg.attributes["sqlalchemy_url"] = url
-    return cfg
-
-
-async def _run(url: str, statement: str) -> list[str]:
-    engine = create_async_engine(url)
-    try:
-        async with engine.begin() as conn:
-            result = await conn.execute(text(statement))
-            return [str(row[0]) for row in result] if result.returns_rows else []
-    finally:
-        await engine.dispose()
-
-
 def _schema(url: str) -> tuple[bool, list[str]]:
-    has_events = asyncio.run(_run(url, "SELECT to_regclass('events')")) != ["None"]
-    point_columns = asyncio.run(
-        _run(
-            url,
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'service_points'",
-        )
+    has_events = run_sql(url, "SELECT to_regclass('events')") != [(None,)]
+    point_columns = run_sql(
+        url,
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'service_points'",
     )
-    return has_events, point_columns
+    return has_events, [str(row[0]) for row in point_columns]
 
 
 # One statement per call: asyncpg refuses several commands in one prepared statement.
@@ -61,25 +39,19 @@ _SEED_OCCASIONAL_POINT = (
 )
 
 
-def test_migration_drops_events_but_keeps_occasional_points(postgres_url: str) -> None:
-    cfg = _alembic_config(postgres_url)
+def test_migration_drops_events_but_keeps_occasional_points(pre_reset_database_url: str) -> None:
+    url = pre_reset_database_url
+    cfg = alembic_config(url)
 
-    # The try/finally makes sure a mid-test failure never leaves the shared session
-    # container downgraded or holding the seeded rows (they bypass the per-test truncate).
-    try:
-        command.downgrade(cfg, _BEFORE_REMOVAL)
-        has_events, point_columns = _schema(postgres_url)
-        assert has_events
-        assert {"point_type", "event_id"} <= set(point_columns)
-        for statement in _SEED_OCCASIONAL_POINT:
-            asyncio.run(_run(postgres_url, statement))
+    command.downgrade(cfg, _BEFORE_REMOVAL)
+    has_events, point_columns = _schema(url)
+    assert has_events
+    assert {"point_type", "event_id"} <= set(point_columns)
+    for statement in _SEED_OCCASIONAL_POINT:
+        run_sql(url, statement)
 
-        command.upgrade(cfg, "head")
-        has_events, point_columns = _schema(postgres_url)
-        assert not has_events
-        assert not {"point_type", "event_id"} & set(point_columns)
-        names = asyncio.run(_run(postgres_url, "SELECT name FROM service_points"))
-        assert names == ["Tenda"]
-    finally:
-        command.upgrade(cfg, "head")
-        asyncio.run(_run(postgres_url, "TRUNCATE service_points, floors, buildings CASCADE"))
+    command.upgrade(cfg, LAST_REVERSIBLE_REVISION)
+    has_events, point_columns = _schema(url)
+    assert not has_events
+    assert not {"point_type", "event_id"} & set(point_columns)
+    assert run_sql(url, "SELECT name FROM service_points") == [("Tenda",)]

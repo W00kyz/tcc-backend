@@ -36,6 +36,12 @@ async def test_login_with_correct_credentials_returns_tokens(
     assert "access_token" in body
     assert "refresh_token" in body
     assert body["token_type"] == "bearer"
+    # Worker-only fields stay empty for everyone else.
+    assert (body["worker_status"], body["rejection_reason"], body["worker_active"]) == (
+        None,
+        None,
+        None,
+    )
 
 
 async def test_login_with_wrong_password_returns_401_and_logs_the_attempt(
@@ -72,7 +78,13 @@ async def test_refresh_issues_a_new_access_token(
     response = client.post("/auth/refresh", json={"refresh_token": login.json()["refresh_token"]})
 
     assert response.status_code == 200
-    assert "access_token" in response.json()
+    body = response.json()
+    assert "access_token" in body
+    assert (body["worker_status"], body["rejection_reason"], body["worker_active"]) == (
+        None,
+        None,
+        None,
+    )
 
 
 async def test_refresh_rejects_an_access_token(client: TestClient, test_settings: Settings) -> None:

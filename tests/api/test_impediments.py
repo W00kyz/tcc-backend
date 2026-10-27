@@ -1,6 +1,7 @@
-"""Etapa 8 — the impediment API: a field worker reports, a manager lists the queue, ranks
-candidates, reassigns or dismisses. Domain mechanics are covered under
-tests/domain/impediments/; here we pin the HTTP surface (auth, ownership, status mapping)."""
+"""The impediment API (spec 2026-10-20-alocacao-automatica §7.1, §8.4): a field worker reports
+an impediment and the point(s) go straight back to the pool, the managers get an alert and a
+notification, and a manager lists every impediment and acknowledges it ("ciente"). Manual
+reassignment and dismissal went with manual planning."""
 
 import uuid
 from collections.abc import Iterator
@@ -15,26 +16,33 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     FieldWorker,
+    FieldWorkerStatus,
     Floor,
     ServicePoint,
 )
 from app.domain.identity.models import User, UserRole
-from app.domain.impediments import service as impediments_service
 from app.domain.impediments.models import (
     Impediment,
     ImpedimentReason,
     ImpedimentScope,
     ImpedimentStatus,
 )
-from app.domain.monitoring.models import Notification
-from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus, RouteType
-from app.domain.routing.service import StopInput, create_route
+from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity, Notification
+from app.domain.routing.models import (
+    ReleaseReason,
+    Route,
+    RouteStatus,
+    RouteStop,
+    RouteStopStatus,
+)
 from app.main import create_app
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from httpx2 import Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
+from tests.support.factories import make_route
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -44,7 +52,7 @@ _ROUTE_DATE = today_on_campus()
 
 @pytest.fixture
 def client(test_settings: Settings, recording_mailer: RecordingMailer) -> Iterator[TestClient]:
-    # Local override so every reassignment goes through the in-memory OSRM fake (spec §8).
+    # Local override so nothing reaches a real OSRM (spec §8).
     app = create_app(
         settings=test_settings,
         mailer=recording_mailer,
@@ -72,20 +80,16 @@ class _Fixture:
         worker_a_user: User,
         worker_b_user: User,
         worker_a: FieldWorker,
-        worker_b: FieldWorker,
         source: Route,
-        target: Route,
     ) -> None:
         self.manager = manager
         self.worker_a_user = worker_a_user
         self.worker_b_user = worker_b_user
         self.worker_a = worker_a
-        self.worker_b = worker_b
         self.source = source
-        self.target = target
 
 
-async def _seed(db: AsyncSession, *, source_points: int = 2, target_points: int = 1) -> _Fixture:
+async def _seed(db: AsyncSession, *, source_points: int = 2) -> _Fixture:
     manager = User(
         name="Larissa",
         email="larissa@pu.ufcg.edu.br",
@@ -113,7 +117,6 @@ async def _seed(db: AsyncSession, *, source_points: int = 2, target_points: int 
     db.add(floor)
     await db.flush()
 
-    n_points = source_points + target_points
     points = [
         ServicePoint(
             floor_id=floor.id,
@@ -122,47 +125,31 @@ async def _seed(db: AsyncSession, *, source_points: int = 2, target_points: int 
             latitude=-7.20 - i * 0.01,
             longitude=-35.90 - i * 0.01,
         )
-        for i in range(n_points)
+        for i in range(source_points)
     ]
     worker_a = FieldWorker(
-        full_name="Joao da Silva", contractor_company_id=company.id, user_id=worker_a_user.id
+        full_name="Joao da Silva",
+        contractor_company_id=company.id,
+        user_id=worker_a_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     worker_b = FieldWorker(
-        full_name="Maria Souza", contractor_company_id=company.id, user_id=worker_b_user.id
+        full_name="Maria Souza",
+        contractor_company_id=company.id,
+        user_id=worker_b_user.id,
+        status=FieldWorkerStatus.APPROVED,
     )
     db.add_all([*points, worker_a, worker_b])
     await db.flush()
 
-    source = await create_route(
-        db,
-        field_worker_id=worker_a.id,
-        route_date=_ROUTE_DATE,
-        route_type=RouteType.REGULAR,
-        scheduled_start_at=None,
-        stops=[StopInput(service_point_id=p.id) for p in points[:source_points]],
-        actor_id=manager.id,
-        osrm=FakeOsrmClient(),
-    )
-    source.status = RouteStatus.IN_PROGRESS
-    target = await create_route(
-        db,
-        field_worker_id=worker_b.id,
-        route_date=_ROUTE_DATE,
-        route_type=RouteType.REGULAR,
-        scheduled_start_at=None,
-        stops=[StopInput(service_point_id=p.id) for p in points[source_points:]],
-        actor_id=manager.id,
-        osrm=FakeOsrmClient(),
-    )
+    source = await make_route(db, worker=worker_a, day=_ROUTE_DATE, points=points)
     await db.commit()
     return _Fixture(
         manager=manager,
         worker_a_user=worker_a_user,
         worker_b_user=worker_b_user,
         worker_a=worker_a,
-        worker_b=worker_b,
         source=source,
-        target=target,
     )
 
 
@@ -179,15 +166,35 @@ def _report_body(*, route_stop_id: str | None, scope: str = "STOP") -> dict[str,
 # --- POST /routes/{route_id}/impediments (field worker) --------------------------------
 
 
-async def test_report_stop_impediment_created(client: TestClient, db_session: AsyncSession) -> None:
-    fx = await _seed(db_session)
-    token = _login(client, fx.worker_a_user.email)
-
-    response = client.post(
+def _report(
+    client: TestClient, fx: _Fixture, *, route_stop_id: object, scope: str = "STOP"
+) -> Response:
+    return client.post(
         f"/routes/{fx.source.id}/impediments",
-        json=_report_body(route_stop_id=str(fx.source.stops[0].id)),
-        headers=_auth(token),
+        json=_report_body(
+            route_stop_id=str(route_stop_id) if route_stop_id is not None else None, scope=scope
+        ),
+        headers=_auth(_login(client, fx.worker_a_user.email)),
     )
+
+
+async def _stops(db: AsyncSession, route: Route) -> list[RouteStop]:
+    return list(
+        await db.scalars(
+            select(RouteStop)
+            .where(RouteStop.route_id == route.id)
+            .order_by(RouteStop.order_index)
+            .execution_options(populate_existing=True)
+        )
+    )
+
+
+async def test_stop_impediment_releases_only_that_stop(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed(db_session)
+
+    response = _report(client, fx, route_stop_id=fx.source.stops[0].id)
 
     assert response.status_code == 201, response.text
     body = response.json()
@@ -195,52 +202,109 @@ async def test_report_stop_impediment_created(client: TestClient, db_session: As
     assert body["route_stop_id"] == str(fx.source.stops[0].id)
     assert body["status"] == "PENDING"
     assert body["received_at"] is not None
+    impeded, kept = await _stops(db_session, fx.source)
+    assert impeded.status is RouteStopStatus.RELEASED
+    assert impeded.release_reason is ReleaseReason.IMPEDIMENT
+    # The worker keeps the rest of the batch and goes on.
+    assert kept.status is RouteStopStatus.PENDING
+    await db_session.refresh(fx.source)
+    assert fx.source.status is RouteStatus.IN_PROGRESS
 
 
-async def test_report_notifies_every_manager_with_the_pending_point(
+async def test_route_remainder_releases_the_live_stops_and_pauses(
     client: TestClient, db_session: AsyncSession
 ) -> None:
-    # RF17: reporting the impediment notifies the managers, naming the point to reassign.
-    fx = await _seed(db_session)
-    token = _login(client, fx.worker_a_user.email)
-    stop = fx.source.stops[0]
+    fx = await _seed(db_session, source_points=3)
+    done = await db_session.get(RouteStop, fx.source.stops[0].id)
+    assert done is not None
+    done.status = RouteStopStatus.DONE
+    await db_session.commit()
 
-    response = client.post(
-        f"/routes/{fx.source.id}/impediments",
-        json=_report_body(route_stop_id=str(stop.id)),
-        headers=_auth(token),
-    )
+    response = _report(client, fx, route_stop_id=None, scope="ROUTE_REMAINDER")
 
     assert response.status_code == 201, response.text
-    rows = (
-        await db_session.scalars(
-            select(Notification).where(Notification.kind == "IMPEDIMENT_REPORTED")
-        )
-    ).all()
-    assert [row.user_id for row in rows] == [fx.manager.id]
+    stops = await _stops(db_session, fx.source)
+    assert [stop.status for stop in stops] == [
+        RouteStopStatus.DONE,
+        RouteStopStatus.RELEASED,
+        RouteStopStatus.RELEASED,
+    ]
+    assert {stop.release_reason for stop in stops[1:]} == {ReleaseReason.ROUTE_REMAINDER}
+    await db_session.refresh(fx.source)
+    assert fx.source.status is RouteStatus.PAUSED
+
+
+@pytest.mark.parametrize(("scope", "released"), [("STOP", 1), ("ROUTE_REMAINDER", 2)])
+async def test_report_audits_each_released_stop_as_the_worker(
+    client: TestClient, db_session: AsyncSession, scope: str, released: int
+) -> None:
+    fx = await _seed(db_session)
+    stop_id = fx.source.stops[0].id if scope == "STOP" else None
+
+    response = _report(client, fx, route_stop_id=stop_id, scope=scope)
+
+    assert response.status_code == 201, response.text
+    audits = list(
+        await db_session.scalars(select(AuditTrail).where(AuditTrail.action == "release"))
+    )
+    assert len(audits) == released
+    assert {(a.actor_id, a.entity_type) for a in audits} == {(fx.worker_a_user.id, "route_stop")}
+    reason = "IMPEDIMENT" if scope == "STOP" else "ROUTE_REMAINDER"
+    assert {a.after_data["release_reason"] for a in audits if a.after_data} == {reason}
+
+
+async def test_report_raises_a_point_impeded_alert(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed(db_session)
+    stop = fx.source.stops[0]
+
+    response = _report(client, fx, route_stop_id=stop.id)
+
+    assert response.status_code == 201, response.text
+    alert = await db_session.scalar(select(Alert))
+    assert alert is not None
+    assert alert.kind is AlertKind.POINT_IMPEDED
+    assert alert.severity is AlertSeverity.WARNING
+    assert alert.dedup_key == f"POINT_IMPEDED:{response.json()['id']}"
+    assert (alert.route_id, alert.route_stop_id, alert.field_worker_id) == (
+        fx.source.id,
+        stop.id,
+        fx.worker_a.id,
+    )
+    assert alert.description == "Joao da Silva não pode executar o ponto Ponto 0: outro motivo."
+
+
+async def test_report_notifies_every_manager_with_the_released_point(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    # RF17: reporting the impediment notifies the managers, naming the affected point — once,
+    # as an impediment; the POINT_IMPEDED alert is not fanned out a second time.
+    fx = await _seed(db_session)
+
+    response = _report(client, fx, route_stop_id=fx.source.stops[0].id)
+
+    assert response.status_code == 201, response.text
+    rows = (await db_session.scalars(select(Notification))).all()
+    assert [(row.user_id, row.kind) for row in rows] == [(fx.manager.id, "IMPEDIMENT_REPORTED")]
     assert "Joao da Silva" in rows[0].body
     assert "Ponto 0" in rows[0].body
     assert rows[0].data["impediment_id"] == response.json()["id"]
 
 
-async def test_report_remainder_notification_counts_the_open_stops(
+async def test_report_remainder_notification_counts_the_released_stops(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     fx = await _seed(db_session, source_points=3)
-    token = _login(client, fx.worker_a_user.email)
 
-    response = client.post(
-        f"/routes/{fx.source.id}/impediments",
-        json=_report_body(route_stop_id=None, scope="ROUTE_REMAINDER"),
-        headers=_auth(token),
-    )
+    response = _report(client, fx, route_stop_id=None, scope="ROUTE_REMAINDER")
 
     assert response.status_code == 201, response.text
     row = await db_session.scalar(
         select(Notification).where(Notification.kind == "IMPEDIMENT_REPORTED")
     )
     assert row is not None
-    assert "restante da rota (3 ponto(s) pendente(s))" in row.body
+    assert "restante da rota (3 ponto(s) de volta ao pool)" in row.body
 
 
 async def test_report_on_route_not_owned_is_403(
@@ -277,34 +341,28 @@ async def test_report_when_route_not_in_progress_is_409(
     fx = await _seed(db_session)
     route = await db_session.get(Route, fx.source.id)
     assert route is not None
-    route.status = RouteStatus.PLANNED
+    route.status = RouteStatus.PAUSED
     await db_session.commit()
-    token = _login(client, fx.worker_a_user.email)
 
-    response = client.post(
-        f"/routes/{fx.source.id}/impediments",
-        json=_report_body(route_stop_id=str(fx.source.stops[0].id)),
-        headers=_auth(token),
-    )
+    response = _report(client, fx, route_stop_id=fx.source.stops[0].id)
 
     assert response.status_code == 409
 
 
-async def test_report_stop_done_is_409(client: TestClient, db_session: AsyncSession) -> None:
+@pytest.mark.parametrize("stop_status", [RouteStopStatus.DONE, RouteStopStatus.RELEASED])
+async def test_report_stop_no_longer_live_is_409(
+    client: TestClient, db_session: AsyncSession, stop_status: RouteStopStatus
+) -> None:
     fx = await _seed(db_session)
     stop = await db_session.get(RouteStop, fx.source.stops[0].id)
     assert stop is not None
-    stop.status = RouteStopStatus.DONE
+    stop.status = stop_status
     await db_session.commit()
-    token = _login(client, fx.worker_a_user.email)
 
-    response = client.post(
-        f"/routes/{fx.source.id}/impediments",
-        json=_report_body(route_stop_id=str(fx.source.stops[0].id)),
-        headers=_auth(token),
-    )
+    response = _report(client, fx, route_stop_id=fx.source.stops[0].id)
 
     assert response.status_code == 409
+    assert await db_session.scalar(select(Alert.id)) is None
 
 
 async def test_report_stop_in_progress_is_201(client: TestClient, db_session: AsyncSession) -> None:
@@ -315,16 +373,13 @@ async def test_report_stop_in_progress_is_201(client: TestClient, db_session: As
     assert stop is not None
     stop.status = RouteStopStatus.IN_PROGRESS
     await db_session.commit()
-    token = _login(client, fx.worker_a_user.email)
 
-    response = client.post(
-        f"/routes/{fx.source.id}/impediments",
-        json=_report_body(route_stop_id=str(fx.source.stops[0].id)),
-        headers=_auth(token),
-    )
+    response = _report(client, fx, route_stop_id=fx.source.stops[0].id)
 
     assert response.status_code == 201, response.text
     assert response.json()["status"] == "PENDING"
+    impeded, _ = await _stops(db_session, fx.source)
+    assert impeded.status is RouteStopStatus.RELEASED
 
 
 async def test_report_forbidden_for_manager(client: TestClient, db_session: AsyncSession) -> None:
@@ -365,20 +420,14 @@ async def test_report_remainder_forces_route_stop_id_null(
     # F3 fix (spec §3): `route_stop_id` is meaningless for a ROUTE_REMAINDER report; a stray
     # non-null id in the body is dropped, not persisted.
     fx = await _seed(db_session)
-    token = _login(client, fx.worker_a_user.email)
-    body = _report_body(route_stop_id=str(fx.source.stops[0].id), scope="ROUTE_REMAINDER")
 
-    response = client.post(
-        f"/routes/{fx.source.id}/impediments",
-        json=body,
-        headers=_auth(token),
-    )
+    response = _report(client, fx, route_stop_id=fx.source.stops[0].id, scope="ROUTE_REMAINDER")
 
     assert response.status_code == 201, response.text
     assert response.json()["route_stop_id"] is None
 
 
-# --- GET /impediments (manager) -------------------------------------------------------
+# --- GET /impediments, POST /impediments/{id}/acknowledge (manager) ---------------------
 
 
 async def _make_impediment(
@@ -387,33 +436,74 @@ async def _make_impediment(
     *,
     stop_id: uuid.UUID | None,
     scope: ImpedimentScope = ImpedimentScope.STOP,
+    status: ImpedimentStatus = ImpedimentStatus.PENDING,
+    reported_at: datetime | None = None,
 ) -> Impediment:
     imp = Impediment(
         route_id=fx.source.id,
         route_stop_id=stop_id,
         scope=scope,
-        reason=ImpedimentReason.OTHER,
-        note=None,
+        reason=ImpedimentReason.ACCESS_BLOCKED,
+        note="Porta trancada",
         reported_by=fx.worker_a.id,
-        reported_at=datetime.now(UTC),
+        reported_at=reported_at or datetime.now(UTC),
+        status=status,
     )
     db.add(imp)
     await db.commit()
     return imp
 
 
-async def test_list_pending_returns_queue(client: TestClient, db_session: AsyncSession) -> None:
+async def test_list_returns_every_impediment_with_worker_point_and_building(
+    client: TestClient, db_session: AsyncSession
+) -> None:
     fx = await _seed(db_session)
-    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
+    resolved = await _make_impediment(
+        db_session,
+        fx,
+        stop_id=None,
+        scope=ImpedimentScope.ROUTE_REMAINDER,
+        status=ImpedimentStatus.RESOLVED,
+    )
+    pending = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
     token = _login(client, fx.manager.email)
 
-    response = client.get("/impediments?status=PENDING", headers=_auth(token))
+    response = client.get("/impediments", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    # Pending first — what the manager still has to see — then the acknowledged ones.
+    assert [row["id"] for row in rows] == [str(pending.id), str(resolved.id)]
+    assert rows[0]["field_worker_name"] == "Joao da Silva"
+    assert rows[0]["service_point_name"] == "Ponto 0"
+    assert rows[0]["building_name"] == "Bloco CI"
+    assert rows[0]["reason"] == "ACCESS_BLOCKED"
+    assert rows[0]["note"] == "Porta trancada"
+    assert rows[0]["status"] == "PENDING"
+    assert rows[0]["reported_at"] is not None
+    # A rest-of-route impediment names no point.
+    assert (rows[1]["service_point_name"], rows[1]["building_name"]) == (None, None)
+    assert rows[1]["status"] == "RESOLVED"
+
+
+@pytest.mark.parametrize("wanted", [ImpedimentStatus.PENDING, ImpedimentStatus.RESOLVED])
+async def test_list_filters_by_status(
+    client: TestClient, db_session: AsyncSession, wanted: ImpedimentStatus
+) -> None:
+    fx = await _seed(db_session)
+    by_status = {
+        status: await _make_impediment(db_session, fx, stop_id=None, status=status)
+        for status in ImpedimentStatus
+    }
+    token = _login(client, fx.manager.email)
+
+    response = client.get(f"/impediments?status={wanted.value}", headers=_auth(token))
 
     assert response.status_code == 200
-    assert [row["id"] for row in response.json()] == [str(imp.id)]
+    assert [row["id"] for row in response.json()] == [str(by_status[wanted].id)]
 
 
-async def test_list_pending_forbidden_for_field_worker(
+async def test_list_forbidden_for_field_worker(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     fx = await _seed(db_session)
@@ -431,238 +521,77 @@ async def test_list_invalid_status_is_422(client: TestClient, db_session: AsyncS
     response = client.get("/impediments?status=BOGUS", headers=_auth(token))
 
     assert response.status_code == 422
-    assert "BOGUS" in response.json()["detail"]
 
 
-# --- GET /impediments/{id}/candidates (manager) -------------------------------------
-
-
-async def test_candidates_ranked(client: TestClient, db_session: AsyncSession) -> None:
-    fx = await _seed(db_session)
-    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
-    token = _login(client, fx.manager.email)
-
-    response = client.get(f"/impediments/{imp.id}/candidates", headers=_auth(token))
-
-    assert response.status_code == 200
-    body = response.json()
-    assert [row["field_worker_id"] for row in body] == [str(fx.worker_b.id)]
-    assert body[0]["pending_stop_count"] == 1
-    assert body[0]["distance_m"] >= 0
-
-
-async def test_candidates_unknown_impediment_is_404(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed(db_session)
-    token = _login(client, fx.manager.email)
-
-    response = client.get(f"/impediments/{uuid.uuid4()}/candidates", headers=_auth(token))
-
-    assert response.status_code == 404
-
-
-# --- POST /impediments/{id}/reassign (manager) -------------------------------------
-
-
-async def test_reassign_moves_stop_and_resolves(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed(db_session)
-    moved_stop_id = fx.source.stops[0].id
-    target_id = fx.target.id
-    imp = await _make_impediment(db_session, fx, stop_id=moved_stop_id)
-    token = _login(client, fx.manager.email)
-
-    response = client.post(
-        f"/impediments/{imp.id}/reassign",
-        json={"field_worker_id": str(fx.worker_b.id), "reason": "afastamento medico"},
-        headers=_auth(token),
-    )
-
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "RESOLVED"
-    db_session.expire_all()  # drop the identity-map copies seeded before the request's commit
-    moved = await db_session.get(RouteStop, moved_stop_id)
-    assert moved is not None
-    assert moved.route_id == target_id
-    audit_count = await db_session.scalar(
-        select(func.count())
-        .select_from(AuditTrail)
-        .where(AuditTrail.entity_type == "impediment", AuditTrail.action == "reassign")
-    )
-    assert audit_count == 1
-
-
-async def test_reassign_notifies_the_target_route_worker(
+async def test_acknowledge_resolves_and_audits(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     fx = await _seed(db_session)
     imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
     token = _login(client, fx.manager.email)
 
-    response = client.post(
-        f"/impediments/{imp.id}/reassign",
-        json={"field_worker_id": str(fx.worker_b.id), "reason": "afastamento medico"},
-        headers=_auth(token),
-    )
+    first = client.post(f"/impediments/{imp.id}/acknowledge", headers=_auth(token))
+    again = client.post(f"/impediments/{imp.id}/acknowledge", headers=_auth(token))
 
-    assert response.status_code == 200, response.text
-    notes = (
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "RESOLVED"
+    assert first.json()["service_point_name"] == "Ponto 0"
+    # Idempotent: a second "ciente" changes nothing.
+    assert again.status_code == 200
+    await db_session.refresh(imp)
+    assert imp.status is ImpedimentStatus.RESOLVED
+    assert imp.resolved_by == fx.manager.id
+    assert imp.resolved_at is not None
+    audits = (
         await db_session.scalars(
-            select(Notification).where(Notification.user_id == fx.worker_b_user.id)
+            select(AuditTrail).where(
+                AuditTrail.entity_type == "impediment", AuditTrail.entity_id == imp.id
+            )
         )
     ).all()
-    assert len(notes) == 1
-    assert notes[0].kind == "STOP_REASSIGNED"
-    assert notes[0].data["route_id"] == str(fx.target.id)
+    assert [(a.action, a.before_data, a.after_data) for a in audits] == [
+        ("acknowledge", {"status": "PENDING"}, {"status": "RESOLVED"})
+    ]
 
 
-async def test_reassign_already_resolved_is_409(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed(db_session)
-    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
-    imp_row = await db_session.get(Impediment, imp.id)
-    assert imp_row is not None
-    imp_row.status = ImpedimentStatus.RESOLVED
-    await db_session.commit()
-    token = _login(client, fx.manager.email)
-
-    response = client.post(
-        f"/impediments/{imp.id}/reassign",
-        json={"field_worker_id": str(fx.worker_b.id), "reason": "x"},
-        headers=_auth(token),
-    )
-
-    assert response.status_code == 409
-
-
-async def test_reassign_worker_without_route_on_date_is_409(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed(db_session)
-    orphan = FieldWorker(
-        full_name="Sem Rota", contractor_company_id=fx.worker_a.contractor_company_id
-    )
-    db_session.add(orphan)
-    await db_session.commit()
-    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
-    token = _login(client, fx.manager.email)
-
-    response = client.post(
-        f"/impediments/{imp.id}/reassign",
-        json={"field_worker_id": str(orphan.id), "reason": "x"},
-        headers=_auth(token),
-    )
-
-    assert response.status_code == 409
-
-
-async def test_reassign_same_route_target_is_409(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed(db_session)
-    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
-    token = _login(client, fx.manager.email)
-
-    response = client.post(
-        f"/impediments/{imp.id}/reassign",
-        json={"field_worker_id": str(fx.worker_a.id), "reason": "x"},
-        headers=_auth(token),
-    )
-
-    assert response.status_code == 409
-
-
-async def test_reassign_stale_stop_propagates_409(
-    client: TestClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A stop that became DONE between the report and the reassign (finished by another
-    path) makes `reassign_stops` reject the batch — propagated as 409 via
-    StopNotReassignable."""
-    fx = await _seed(db_session, source_points=2, target_points=1)
-    stale = await db_session.get(RouteStop, fx.source.stops[1].id)
-    assert stale is not None
-    stale.status = RouteStopStatus.DONE
-    await db_session.commit()
-    imp = await _make_impediment(
-        db_session, fx, stop_id=None, scope=ImpedimentScope.ROUTE_REMAINDER
-    )
-
-    real_stops = [fx.source.stops[0], fx.source.stops[1]]
-
-    async def _stale_affected(db: AsyncSession, impediment: Impediment) -> list[RouteStop]:
-        return real_stops
-
-    monkeypatch.setattr(impediments_service, "_affected_stops", _stale_affected)
-    token = _login(client, fx.manager.email)
-
-    response = client.post(
-        f"/impediments/{imp.id}/reassign",
-        json={"field_worker_id": str(fx.worker_b.id), "reason": "x"},
-        headers=_auth(token),
-    )
-
-    assert response.status_code == 409
-
-
-async def test_reassign_forbidden_for_field_worker(
+async def test_acknowledge_forbidden_for_field_worker(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     fx = await _seed(db_session)
     imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
     token = _login(client, fx.worker_a_user.email)
 
-    response = client.post(
-        f"/impediments/{imp.id}/reassign",
-        json={"field_worker_id": str(fx.worker_b.id), "reason": "x"},
-        headers=_auth(token),
-    )
+    response = client.post(f"/impediments/{imp.id}/acknowledge", headers=_auth(token))
 
     assert response.status_code == 403
+    await db_session.refresh(imp)
+    assert imp.status is ImpedimentStatus.PENDING
 
 
-# --- POST /impediments/{id}/dismiss (manager) -------------------------------------
-
-
-async def test_dismiss_marks_resolved_and_audits(
-    client: TestClient, db_session: AsyncSession
-) -> None:
-    fx = await _seed(db_session)
-    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
-    token = _login(client, fx.manager.email)
-
-    response = client.post(f"/impediments/{imp.id}/dismiss", headers=_auth(token))
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "RESOLVED"
-    audit_count = await db_session.scalar(
-        select(func.count())
-        .select_from(AuditTrail)
-        .where(AuditTrail.entity_type == "impediment", AuditTrail.action == "dismiss")
-    )
-    assert audit_count == 1
-
-
-async def test_dismiss_twice_is_409(client: TestClient, db_session: AsyncSession) -> None:
-    fx = await _seed(db_session)
-    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
-    token = _login(client, fx.manager.email)
-
-    first = client.post(f"/impediments/{imp.id}/dismiss", headers=_auth(token))
-    second = client.post(f"/impediments/{imp.id}/dismiss", headers=_auth(token))
-
-    assert first.status_code == 200
-    assert second.status_code == 409
-
-
-async def test_dismiss_unknown_impediment_is_404(
+async def test_acknowledge_unknown_impediment_is_404(
     client: TestClient, db_session: AsyncSession
 ) -> None:
     fx = await _seed(db_session)
     token = _login(client, fx.manager.email)
 
-    response = client.post(f"/impediments/{uuid.uuid4()}/dismiss", headers=_auth(token))
+    response = client.post(f"/impediments/{uuid.uuid4()}/acknowledge", headers=_auth(token))
 
     assert response.status_code == 404
+
+
+# --- manual reassignment is gone -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method", "action"), [("GET", "candidates"), ("POST", "reassign"), ("POST", "dismiss")]
+)
+async def test_manual_reassignment_endpoints_are_gone(
+    client: TestClient, db_session: AsyncSession, method: str, action: str
+) -> None:
+    fx = await _seed(db_session)
+    imp = await _make_impediment(db_session, fx, stop_id=fx.source.stops[0].id)
+    token = _login(client, fx.manager.email)
+
+    response = client.request(method, f"/impediments/{imp.id}/{action}", headers=_auth(token))
+
+    assert response.status_code in (404, 405)

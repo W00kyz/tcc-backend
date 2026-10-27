@@ -1,5 +1,5 @@
-"""Etapa 11 (RNF10): the LGPD consent gate — `consent_required` on the login response
-and the `/auth/consent` + `/auth/consent-status` routes."""
+"""Etapa 11 (RNF10): the LGPD consent gate — `consent_required` on the login and refresh
+responses and the `/auth/consent` + `/auth/consent-status` routes."""
 
 from datetime import UTC, datetime
 
@@ -64,6 +64,25 @@ async def test_login_reports_consent_required_then_false_after_consent(
 
     r2 = client.post("/auth/login", json={"email": worker.email, "password": _PASSWORD})
     assert r2.json()["consent_required"] is False
+
+
+async def test_refresh_reports_consent_required_then_false_after_consent(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    """A worker already logged in when a new notice is published learns of it on the next
+    token refresh, not only on a fresh login."""
+    worker = await _seed(db_session)
+    login = client.post("/auth/login", json={"email": worker.email, "password": _PASSWORD})
+    refresh_token = login.json()["refresh_token"]
+
+    before = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+    auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    client.post("/auth/consent", headers=auth)
+    after = client.post("/auth/refresh", json={"refresh_token": refresh_token})
+
+    assert before.status_code == 200, before.text
+    assert before.json()["consent_required"] is True
+    assert after.json()["consent_required"] is False
 
 
 async def test_consent_status_requires_auth(client: TestClient) -> None:

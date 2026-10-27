@@ -1,11 +1,14 @@
-"""The monitoring board read model (RF41, spec §2 Ruling 9). `build_board` turns the current
-route / stop / alert / GPS state into one `BoardSnapshot` — the payload `GET /monitoring/board`
-returns and the SSE stream (Task 8) diffs and re-emits on change.
+"""The monitoring board read model (RF41, spec §2 Ruling 9; spec 2026-10-20-alocacao-automatica
+§8.2). `build_board` turns the current route / stop / alert / GPS state into one `BoardSnapshot`
+— the payload `GET /monitoring/board` returns and the SSE stream diffs and re-emits on change.
 
-`is_delayed` is derived here, never persisted (Ruling 9): the board shows the RAW delay signal
-(no tolerance) while the `Alert` carries the tolerance. `open_alerts` lists both `OPEN` and
-`ACKNOWLEDGED` rows so the dashboard can show "a manager is on it" distinctly; `open_alert_count`
-and the `is_delayed` alert signal count only `OPEN` (Ruling 9 says "um alerta OPEN").
+The board only follows the day, it plans nothing: per service type, how many of today's points
+are done, in somebody's batch, or still free; who is working (each route with its current
+batch) and who has not started yet; how many points went back to the pool today.
+
+`open_alerts` lists both `OPEN` and `ACKNOWLEDGED` rows so the dashboard can show "a manager is
+on it" distinctly; `open_alert_count` counts only `OPEN`. The derived `is_delayed` flag went with
+the planned start times and arrival windows (§8.7).
 
     snapshot = await build_board(db, now=datetime.now(UTC))
 """
@@ -13,36 +16,74 @@ and the `is_delayed` alert signal count only `OPEN` (Ruling 9 says "um alerta OP
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import Select, and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.campus_clock import campus_today, campus_wall_clock
-from app.domain.catalog.models import FieldWorker
+from app.core.campus_clock import CAMPUS_TIMEZONE, campus_today
+from app.domain.catalog.models import (
+    ContractorCompany,
+    FieldWorker,
+    FieldWorkerStatus,
+    ServicePoint,
+    ServiceType,
+)
 from app.domain.monitoring.models import Alert, AlertKind, AlertStatus, WorkerPosition
-from app.domain.routing.models import Route, RouteStatus, RouteStopStatus
+from app.domain.reports.point_days import served_on
+from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from app.domain.routing.release import LIVE_STOP_STATUSES
+from app.domain.settings.campus import is_service_day
+from app.domain.settings.service import get_settings_row
 
-# Same scope as the alert scan: a stale route still open shows on the board (spec §2 Ruling 1).
-_BOARD_STATUSES = (RouteStatus.PLANNED, RouteStatus.IN_PROGRESS)
-# Alert kinds that, while OPEN, mark their route delayed (Ruling 9).
-_DELAY_ALERT_KINDS = frozenset({AlertKind.LATE_START, AlertKind.WORKER_ABSENT, AlertKind.LATE_STOP})
+# Same scope as the alert scan: a stale route of an earlier day still open shows on the board
+# (spec §2 Ruling 1). Today's routes show whatever their status.
+_OPEN_ROUTE_STATUSES = (RouteStatus.IN_PROGRESS, RouteStatus.PAUSED)
 # Statuses the dashboard still treats as "open work" — RESOLVED drops off the board.
 _BOARD_ALERT_STATUSES = (AlertStatus.OPEN, AlertStatus.ACKNOWLEDGED)
+
+
+class BoardStop(BaseModel):
+    id: uuid.UUID
+    service_point_id: uuid.UUID
+    service_point_name: str
+    status: RouteStopStatus
 
 
 class BoardRoute(BaseModel):
     route_id: uuid.UUID
     field_worker_id: uuid.UUID
     field_worker_name: str
+    company_name: str
     route_date: date
     status: str
-    is_delayed: bool
     open_alert_count: int
-    stop_total: int
-    stop_done: int
+    # The route's highest batch number; 0 before any batch was handed out.
+    current_batch: int
+    # The current batch's stops still to do (PENDING / IN_PROGRESS), in route order.
+    stops: list[BoardStop]
+    done_today: int
+
+
+class PoolKpi(BaseModel):
+    """Today's typed points of one service type: `done` (served, also by appeal) + `in_progress`
+    (in somebody's batch) + `free` (in the pool) = `total`."""
+
+    service_type_id: uuid.UUID
+    service_type_name: str
+    company_name: str
+    total: int
+    done: int
+    in_progress: int
+    free: int
+
+
+class WorkerRef(BaseModel):
+    id: uuid.UUID
+    full_name: str
+    company_name: str
 
 
 class BoardAlert(BaseModel):
@@ -50,7 +91,7 @@ class BoardAlert(BaseModel):
     kind: AlertKind
     severity: str
     description: str
-    route_id: uuid.UUID
+    route_id: uuid.UUID | None
     route_stop_id: uuid.UUID | None
     field_worker_id: uuid.UUID | None
     status: AlertStatus
@@ -68,77 +109,169 @@ class BoardPosition(BaseModel):
 
 class BoardSnapshot(BaseModel):
     generated_at: datetime
+    # False on a day outside `service_weekdays`: no pool, nobody expected to start.
+    service_day: bool
     routes: list[BoardRoute]
+    pool: list[PoolKpi]
+    # Approved, active workers with no route today — informative only.
+    not_started: list[WorkerRef]
+    # Stops given back to the pool today, whatever the reason.
+    released_today: int
     open_alerts: list[BoardAlert]
     worker_positions: list[BoardPosition]
 
 
 async def build_board(db: AsyncSession, *, now: datetime) -> BoardSnapshot:
-    """Load routes+stops, board alerts and the latest GPS fix per worker — four queries, no
-    N+1 — and fold them into a `BoardSnapshot`."""
-    routes = await _load_routes(db, now)
-    alerts = await _load_board_alerts(db, [route.id for route in routes])
-    open_by_route: dict[uuid.UUID, int] = defaultdict(int)
-    delayed_route_ids: set[uuid.UUID] = set()
+    """Load today's routes, the pool, the board alerts and the latest GPS fix per worker — a
+    fixed number of queries, no N+1 — and fold them into a `BoardSnapshot`."""
+    today = campus_today(now)
+    service_day = is_service_day(await get_settings_row(db), today)
+    routes = await _load_routes(db, today)
+    alerts = await _load_board_alerts(db, [route.id for route in routes], today)
+    open_by_route: dict[uuid.UUID | None, int] = defaultdict(int)
     for alert in alerts:
-        if alert.status is not AlertStatus.OPEN:
-            continue
-        open_by_route[alert.route_id] += 1
-        if alert.kind in _DELAY_ALERT_KINDS:
-            delayed_route_ids.add(alert.route_id)
+        if alert.status is AlertStatus.OPEN:
+            open_by_route[alert.route_id] += 1
 
-    worker_ids = [route.field_worker_id for route in routes]
-    names = await _worker_names(db, worker_ids)
-    positions = await _latest_positions(db, worker_ids)
-
-    board_routes = [
-        _to_board_route(
-            route,
-            name=names.get(route.field_worker_id, ""),
-            open_alert_count=open_by_route[route.id],
-            is_delayed=_is_delayed(route, now, alert_delayed=route.id in delayed_route_ids),
-        )
-        for route in routes
-    ]
+    workers = await _worker_refs(db, [route.field_worker_id for route in routes])
+    positions = await _latest_positions(db, list(workers))
     return BoardSnapshot(
         generated_at=now,
-        routes=board_routes,
+        service_day=service_day,
+        routes=[
+            _to_board_route(route, workers[route.field_worker_id], open_by_route[route.id])
+            for route in routes
+        ],
+        pool=await _pool_kpis(db, today) if service_day else [],
+        not_started=await _not_started(db, today) if service_day else [],
+        released_today=await _released_count(db, today),
         open_alerts=[_to_board_alert(alert) for alert in alerts],
         worker_positions=[
-            _to_board_position(position, names.get(position.field_worker_id, ""), now)
+            _to_board_position(position, workers[position.field_worker_id].full_name, now)
             for position in positions
         ],
     )
 
 
-async def _load_routes(db: AsyncSession, now: datetime) -> Sequence[Route]:
+async def _load_routes(db: AsyncSession, today: date) -> Sequence[Route]:
+    stale_open = and_(Route.route_date < today, Route.status.in_(_OPEN_ROUTE_STATUSES))
     stmt = (
         select(Route)
-        .where(Route.route_date <= campus_today(now), Route.status.in_(_BOARD_STATUSES))
-        .options(selectinload(Route.stops))
+        .where(or_(Route.route_date == today, stale_open))
+        .options(selectinload(Route.stops).selectinload(RouteStop.service_point))
         .order_by(Route.route_date, Route.created_at)
     )
     return (await db.scalars(stmt)).all()
 
 
-async def _load_board_alerts(db: AsyncSession, route_ids: Sequence[uuid.UUID]) -> Sequence[Alert]:
-    if not route_ids:
-        return []
+async def _load_board_alerts(
+    db: AsyncSession, route_ids: Sequence[uuid.UUID], today: date
+) -> Sequence[Alert]:
+    """The open alerts of the board's routes plus today's route-less ones (a day-level alert
+    such as POINTS_UNSERVED has no route to hang from)."""
+    day_start = datetime.combine(today, time.min, tzinfo=CAMPUS_TIMEZONE)
+    route_less_today = and_(
+        Alert.route_id.is_(None),
+        Alert.created_at >= day_start,
+        Alert.created_at < day_start + timedelta(days=1),
+    )
     stmt = (
         select(Alert)
-        .where(Alert.route_id.in_(route_ids), Alert.status.in_(_BOARD_ALERT_STATUSES))
+        .where(
+            Alert.status.in_(_BOARD_ALERT_STATUSES),
+            or_(Alert.route_id.in_(route_ids), route_less_today),
+        )
         .order_by(Alert.created_at)
     )
     return (await db.scalars(stmt)).all()
 
 
-async def _worker_names(db: AsyncSession, worker_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
+def _worker_ref_query() -> Select[tuple[uuid.UUID, str, str]]:
+    return select(FieldWorker.id, FieldWorker.full_name, ContractorCompany.name).join(
+        ContractorCompany, FieldWorker.contractor_company_id == ContractorCompany.id
+    )
+
+
+async def _worker_refs(
+    db: AsyncSession, worker_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, WorkerRef]:
     if not worker_ids:
         return {}
-    rows = await db.execute(
-        select(FieldWorker.id, FieldWorker.full_name).where(FieldWorker.id.in_(worker_ids))
+    rows = await db.execute(_worker_ref_query().where(FieldWorker.id.in_(worker_ids)))
+    return {
+        worker_id: WorkerRef(id=worker_id, full_name=name, company_name=company)
+        for worker_id, name, company in rows.tuples()
+    }
+
+
+async def _not_started(db: AsyncSession, today: date) -> list[WorkerRef]:
+    has_route_today = exists().where(
+        Route.field_worker_id == FieldWorker.id, Route.route_date == today
     )
-    return {row.id: row.full_name for row in rows}
+    stmt = (
+        _worker_ref_query()
+        .where(
+            FieldWorker.status == FieldWorkerStatus.APPROVED,
+            FieldWorker.is_active.is_(True),
+            ~has_route_today,
+        )
+        .order_by(ContractorCompany.name, FieldWorker.full_name)
+    )
+    return [
+        WorkerRef(id=worker_id, full_name=name, company_name=company)
+        for worker_id, name, company in (await db.execute(stmt)).tuples()
+    ]
+
+
+async def _pool_kpis(db: AsyncSession, today: date) -> list[PoolKpi]:
+    """Today's typed points per service type. A served point counts as done even when it is
+    also back in somebody's batch; so done, in progress and free never overlap."""
+    in_a_batch = exists().where(
+        RouteStop.service_point_id == ServicePoint.id,
+        RouteStop.service_date == today,
+        RouteStop.status.in_(LIVE_STOP_STATUSES),
+    )
+    points = select(
+        ServicePoint.service_type_id,
+        served_on(today).label("served"),
+        in_a_batch.label("in_a_batch"),
+    ).subquery()
+    stmt = (
+        select(
+            ServiceType.id,
+            ServiceType.name,
+            ContractorCompany.name,
+            func.count(),
+            func.count().filter(points.c.served),
+            func.count().filter(~points.c.served, points.c.in_a_batch),
+        )
+        .select_from(points)
+        .join(ServiceType, points.c.service_type_id == ServiceType.id)
+        .join(ContractorCompany, ServiceType.contractor_company_id == ContractorCompany.id)
+        .group_by(ServiceType.id, ServiceType.name, ContractorCompany.name)
+        .order_by(ContractorCompany.name, ServiceType.name)
+    )
+    return [
+        PoolKpi(
+            service_type_id=type_id,
+            service_type_name=type_name,
+            company_name=company,
+            total=total,
+            done=done,
+            in_progress=in_progress,
+            free=total - done - in_progress,
+        )
+        for type_id, type_name, company, total, done, in_progress in (
+            await db.execute(stmt)
+        ).tuples()
+    ]
+
+
+async def _released_count(db: AsyncSession, today: date) -> int:
+    stmt = select(func.count(RouteStop.id)).where(
+        RouteStop.service_date == today, RouteStop.status == RouteStopStatus.RELEASED
+    )
+    return (await db.execute(stmt)).scalar_one()
 
 
 async def _latest_positions(
@@ -157,41 +290,28 @@ async def _latest_positions(
     return (await db.scalars(stmt)).all()
 
 
-def _is_delayed(route: Route, now: datetime, *, alert_delayed: bool) -> bool:
-    """Ruling 9 — ANY of: an OPEN LATE_*/WORKER_ABSENT alert, a PLANNED route past its
-    scheduled start, or a PENDING stop past its arrival window. No tolerance — the raw signal."""
-    if alert_delayed:
-        return True
-    if (
-        route.status is RouteStatus.PLANNED
-        and route.scheduled_start_at is not None
-        and route.scheduled_start_at < now
-    ):
-        return True
-    # Arrival windows are campus wall-clock tagged UTC (app/core/campus_clock.py); the route's
-    # scheduled start above is a real instant and keeps the real `now`.
-    wall_now = campus_wall_clock(now)
-    return any(
-        stop.status is RouteStopStatus.PENDING
-        and stop.expected_arrival_to is not None
-        and stop.expected_arrival_to < wall_now
-        for stop in route.stops
-    )
-
-
-def _to_board_route(
-    route: Route, *, name: str, open_alert_count: int, is_delayed: bool
-) -> BoardRoute:
+def _to_board_route(route: Route, worker: WorkerRef, open_alert_count: int) -> BoardRoute:
+    current_batch = max((stop.batch_number for stop in route.stops), default=0)
     return BoardRoute(
         route_id=route.id,
         field_worker_id=route.field_worker_id,
-        field_worker_name=name,
+        field_worker_name=worker.full_name,
+        company_name=worker.company_name,
         route_date=route.route_date,
         status=route.status.value,
-        is_delayed=is_delayed,
         open_alert_count=open_alert_count,
-        stop_total=len(route.stops),
-        stop_done=sum(1 for stop in route.stops if stop.status is RouteStopStatus.DONE),
+        current_batch=current_batch,
+        stops=[
+            BoardStop(
+                id=stop.id,
+                service_point_id=stop.service_point_id,
+                service_point_name=stop.service_point.name,
+                status=stop.status,
+            )
+            for stop in route.stops
+            if stop.batch_number == current_batch and stop.status in LIVE_STOP_STATUSES
+        ],
+        done_today=sum(1 for stop in route.stops if stop.status is RouteStopStatus.DONE),
     )
 
 
