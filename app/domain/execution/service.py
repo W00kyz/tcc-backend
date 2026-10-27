@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.appeals.service import is_appealable, stop_has_appeal
 from app.domain.catalog.footprint import outline_contains
 from app.domain.catalog.models import Building, Floor, ServicePoint
+from app.domain.execution.evidence_service import count_execution_photos
 from app.domain.execution.geo import haversine_meters
 from app.domain.execution.models import (
     Execution,
@@ -28,7 +29,9 @@ from app.domain.execution.models import (
     QrScanKind,
 )
 from app.domain.execution.validation import (
+    FLAG_INSUFFICIENT_EVIDENCE,
     FLAG_QR_SUPERSEDED,
+    MIN_EVIDENCE_PHOTOS,
     Candidate,
     clock_skew_flag,
     resolve_room,
@@ -206,12 +209,15 @@ async def check_out(
     now: datetime,
     execution_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
+    complaints_suggestions: str | None = None,
 ) -> Execution:
     """Close the open check-in on the scanned floor: sets `checked_out_at`, merges any new
     flags into the execution and marks the stop DONE. `execution_id`
     is accepted for API symmetry with check-in but ignored here — check-out resolves the open
     execution by floor, it does not create one. `client_clock_offset_seconds` still flags
-    implausible skew. `now` is the server clock, as for the check-in."""
+    implausible skew. `complaints_suggestions` is stored stripped, blank as NULL. A stop that
+    requires evidence with fewer than `MIN_EVIDENCE_PHOTOS` photos is flagged, never rejected.
+    `now` is the server clock, as for the check-in."""
     _ = execution_id  # unused: check-out closes an existing execution, never creates one
     existing = await db.scalar(
         select(Execution).where(Execution.checkout_idempotency_key == checkout_idempotency_key)
@@ -258,7 +264,13 @@ async def check_out(
 
     previous_flags = set(execution.validation_flags)
     skew_flags = clock_skew_flag(client_clock_offset_seconds)
-    checkout_flags = _merge_flags(resolution.flags, qr_flags, skew_flags)
+    evidence_flags = (
+        [FLAG_INSUFFICIENT_EVIDENCE]
+        if stop.requires_evidence
+        and await count_execution_photos(db, execution.id) < MIN_EVIDENCE_PHOTOS
+        else []
+    )
+    checkout_flags = _merge_flags(resolution.flags, qr_flags, skew_flags, evidence_flags)
     if skew_flags and execution.clock_skew_seconds is None:
         execution.clock_skew_seconds = client_clock_offset_seconds
     merged = previous_flags | set(checkout_flags)
@@ -270,6 +282,7 @@ async def check_out(
     elif merged and execution.review_status is ExecutionReviewStatus.NONE:
         execution.review_status = ExecutionReviewStatus.PENDING_REVIEW
     execution.checked_out_at = scanned_at
+    execution.complaints_suggestions = (complaints_suggestions or "").strip() or None
     execution.checkout_idempotency_key = checkout_idempotency_key
 
     db.add(

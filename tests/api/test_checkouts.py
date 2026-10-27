@@ -7,6 +7,7 @@ candidate list so the app can re-submit with the chosen `route_stop_id`."""
 import uuid
 from datetime import UTC, datetime
 
+import pytest
 from app.core.config import Settings
 from app.domain.execution.models import Execution
 from app.domain.identity.models import UserRole
@@ -29,6 +30,7 @@ from tests.api.test_checkins import (
     _seed_route,
     _stop_released,
 )
+from tests.api.test_evidence import _PHOTO_BYTES, _PHOTO_SHA, _upload_photo
 
 
 def _post_check_out(
@@ -45,6 +47,7 @@ def _post_check_out(
         "route_stop_id",
         "execution_id",
         "client_clock_offset_seconds",
+        "complaints_suggestions",
         "form_version_id",
         "answers",
     ):
@@ -297,3 +300,140 @@ async def test_impeded_stop_not_appealable(
     assert response.json()["detail"] == _stop_released(
         stop_id, ReleaseReason.IMPEDIMENT, appealable=False
     )
+
+
+# --- complaints_suggestions and the INSUFFICIENT_EVIDENCE flag (spec 2026-10-26 §6.2) ----------
+
+
+def _get_execution(client: TestClient, manager_token: str, execution_id: str) -> dict[str, object]:
+    response = client.get(
+        f"/executions/{execution_id}", headers={"Authorization": f"Bearer {manager_token}"}
+    )
+    assert response.status_code == 200, response.text
+    body: dict[str, object] = response.json()
+    return body
+
+
+async def _check_in_with_photos(
+    client: TestClient,
+    db_session: AsyncSession,
+    test_settings: Settings,
+    *,
+    requires_evidence: bool,
+    photos: int,
+) -> tuple[str, str, str]:
+    """A started route whose single stop may require evidence, checked in and given `photos`
+    photos; returns (worker token, QR payload, execution id). Not yet checked out."""
+    seeded = await _seed_route(db_session, test_settings)
+    seeded.stops[0].requires_evidence = requires_evidence
+    await db_session.commit()
+    token = _login(client)
+    checkin = _post(client, token, seeded.qr_code.public_code)
+    assert checkin.status_code == 201, checkin.text
+    execution_id = str(checkin.json()["execution_id"])
+    for _ in range(photos):
+        assert (
+            _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA).status_code == 201
+        )
+    return token, seeded.qr_code.public_code, execution_id
+
+
+async def test_check_out_stores_complaints_suggestions(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, code, execution_id = await _check_in_with_photos(
+        client, db_session, test_settings, requires_evidence=False, photos=0
+    )
+    await _add_user(db_session, "gerente@empresa.com", UserRole.MANAGER)
+
+    response = _post_check_out(client, token, code, complaints_suggestions="Falta sabão")
+
+    assert response.status_code == 201, response.text
+    detail = _get_execution(client, _login(client, email="gerente@empresa.com"), execution_id)
+    assert detail["complaints_suggestions"] == "Falta sabão"
+
+
+async def test_check_out_blank_complaints_suggestions_stored_as_null(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, code, execution_id = await _check_in_with_photos(
+        client, db_session, test_settings, requires_evidence=False, photos=0
+    )
+    await _add_user(db_session, "gerente@empresa.com", UserRole.MANAGER)
+
+    response = _post_check_out(client, token, code, complaints_suggestions="   ")
+
+    assert response.status_code == 201, response.text
+    detail = _get_execution(client, _login(client, email="gerente@empresa.com"), execution_id)
+    assert detail["complaints_suggestions"] is None
+
+
+async def test_check_out_rejects_complaints_suggestions_over_2000(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, code, _ = await _check_in_with_photos(
+        client, db_session, test_settings, requires_evidence=False, photos=0
+    )
+
+    response = _post_check_out(client, token, code, complaints_suggestions="x" * 2001)
+
+    assert response.status_code == 422, response.text
+    assert "2000" in response.text
+
+
+async def test_check_out_accepts_complaints_suggestions_of_exactly_2000(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, code, _ = await _check_in_with_photos(
+        client, db_session, test_settings, requires_evidence=False, photos=0
+    )
+
+    response = _post_check_out(client, token, code, complaints_suggestions="x" * 2000)
+
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.parametrize("photos", [0, 1])
+async def test_check_out_requires_evidence_with_too_few_photos_is_flagged(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings, photos: int
+) -> None:
+    token, code, _ = await _check_in_with_photos(
+        client, db_session, test_settings, requires_evidence=True, photos=photos
+    )
+
+    response = _post_check_out(client, token, code)
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert "INSUFFICIENT_EVIDENCE" in payload["validation_flags"]
+    assert payload["review_status"] == "PENDING_REVIEW"
+
+
+async def test_check_out_requires_evidence_with_two_photos_not_flagged(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, code, _ = await _check_in_with_photos(
+        client, db_session, test_settings, requires_evidence=True, photos=2
+    )
+
+    response = _post_check_out(client, token, code)
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert "INSUFFICIENT_EVIDENCE" not in payload["validation_flags"]
+    assert payload["review_status"] == "NONE"
+
+
+async def test_check_out_without_requires_evidence_and_no_photos_not_flagged(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, code, _ = await _check_in_with_photos(
+        client, db_session, test_settings, requires_evidence=False, photos=0
+    )
+
+    response = _post_check_out(client, token, code)
+
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["validation_flags"] == []
+    assert payload["review_status"] == "NONE"

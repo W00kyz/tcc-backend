@@ -92,6 +92,7 @@ class ExecutionEvidence(BaseModel):
 class ExecutionDetail(ExecutionListItem):
     scans: list[ExecutionScan]
     evidence: list[ExecutionEvidence]
+    complaints_suggestions: str | None
 
 
 class ResolveReviewRequest(BaseModel):
@@ -151,6 +152,7 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
             )
             for item_ in detail.evidence
         ],
+        complaints_suggestions=detail.complaints_suggestions,
     )
 
 

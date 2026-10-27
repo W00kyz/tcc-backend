@@ -161,6 +161,7 @@ async def test_get_execution_detail_includes_scans_and_evidence(
     assert body["evidence"][0]["kind"] == "PHOTO"
     assert not {"manual_completion", "reassigned", "assignment_history"} & set(body)
     assert not {"form_version_id", "answers"} & set(body)
+    assert body["complaints_suggestions"] is None
 
 
 async def test_get_execution_detail_missing_404(

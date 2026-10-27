@@ -41,6 +41,7 @@ from app.domain.execution.evidence_service import (
     add_photo,
     list_evidence,
     load_content,
+    reconcile_evidence_flag,
 )
 from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution
 from app.domain.execution.service import StopReleased, ensure_stop_not_released
@@ -191,6 +192,8 @@ async def upload_photo(
     except EvidenceOwnershipError as exc:  # pragma: no cover - endpoint checks ownership first
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
+    if created:
+        await reconcile_evidence_flag(db, execution)
     await db.commit()
     if not created:
         response.status_code = status.HTTP_200_OK

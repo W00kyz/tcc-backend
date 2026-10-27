@@ -14,7 +14,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api._execution_common import (
@@ -63,6 +63,8 @@ class CheckOutRequest(BaseModel):
     route_stop_id: UUID | None = None  # the worker's room choice on a re-submit
     execution_id: UUID | None = None  # accepted for symmetry with check-in; ignored by check-out
     client_clock_offset_seconds: float | None = None  # server minus device clock (spec Ruling 7)
+    # Free text typed at check-out; blank is stored as null, over 2000 characters is a 422.
+    complaints_suggestions: str | None = Field(default=None, max_length=2000)
 
 
 class CheckOutResponse(BaseModel):
@@ -132,6 +134,7 @@ async def create_check_out(
             now=now,
             execution_id=body.execution_id,
             client_clock_offset_seconds=body.client_clock_offset_seconds,
+            complaints_suggestions=body.complaints_suggestions,
         )
     except AmbiguousRoom as exc:
         raise _ambiguous_conflict(exc) from exc

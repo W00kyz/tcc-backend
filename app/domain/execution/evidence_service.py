@@ -10,11 +10,17 @@ import hashlib
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.object_store import ObjectStore
-from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution
+from app.domain.execution.models import (
+    EvidenceItem,
+    EvidenceKind,
+    Execution,
+    ExecutionReviewStatus,
+)
+from app.domain.execution.validation import FLAG_INSUFFICIENT_EVIDENCE, MIN_EVIDENCE_PHOTOS
 
 # The upload endpoint enforces the byte ceiling and the JPEG magic-byte check (so it can
 # answer 413/422 cleanly); this module only guards ownership and integrity.
@@ -134,6 +140,39 @@ async def list_evidence(db: AsyncSession, *, execution_id: UUID) -> list[Evidenc
         .order_by(EvidenceItem.created_at)
     )
     return list(rows)
+
+
+async def count_execution_photos(db: AsyncSession, execution_id: UUID) -> int:
+    """How many PHOTO evidence items the execution has (notes do not count)."""
+    count = await db.scalar(
+        select(func.count(EvidenceItem.id)).where(
+            EvidenceItem.execution_id == execution_id, EvidenceItem.kind == EvidenceKind.PHOTO
+        )
+    )
+    return int(count or 0)
+
+
+async def reconcile_evidence_flag(db: AsyncSession, execution: Execution) -> None:
+    """Drop `INSUFFICIENT_EVIDENCE` once a late photo brings the count to `MIN_EVIDENCE_PHOTOS`.
+
+    A no-op before check-out (the flag is raised there, not before) and while the flag is absent
+    or the count is still short. With no flag left, a PENDING_REVIEW execution goes back to NONE;
+    a RESOLVED one is never touched — a manager already closed that review. Flushes, never
+    commits: the evidence endpoint owns the commit."""
+    if execution.checked_out_at is None or FLAG_INSUFFICIENT_EVIDENCE not in (
+        execution.validation_flags
+    ):
+        return
+    if await count_execution_photos(db, execution.id) < MIN_EVIDENCE_PHOTOS:
+        return
+    execution.validation_flags = [
+        flag for flag in execution.validation_flags if flag != FLAG_INSUFFICIENT_EVIDENCE
+    ]
+    if not execution.validation_flags and (
+        execution.review_status is ExecutionReviewStatus.PENDING_REVIEW
+    ):
+        execution.review_status = ExecutionReviewStatus.NONE
+    await db.flush()
 
 
 async def load_content(

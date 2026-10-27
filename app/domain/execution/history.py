@@ -109,6 +109,7 @@ class ExecutionDetailRow:
     execution: ExecutionListRow
     scans: list[ExecutionScanRow]
     evidence: list[ExecutionEvidenceRow]
+    complaints_suggestions: str | None
 
 
 def _checkin_geo_subquery() -> ScalarSelect[Any]:
@@ -298,6 +299,7 @@ async def get_execution_detail(db: AsyncSession, execution_id: UUID) -> Executio
         execution=_to_list_row(*row),
         scans=[_to_scan_row(scan) for scan in scans],
         evidence=[_to_evidence_row(item) for item in evidence],
+        complaints_suggestions=row[0].complaints_suggestions,
     )
 
 

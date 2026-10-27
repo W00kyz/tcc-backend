@@ -77,6 +77,8 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Set when the app-reported device/server clock offset at sync exceeds the plausible
     # threshold (spec Ruling 7); drives the CLOCK_SKEW review flag. NULL until Etapa 6 sync.
     clock_skew_seconds: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    # The worker's free-text complaints/suggestions typed at check-out; NULL when left blank.
+    complaints_suggestions: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
 
 class GeoValidation(enum.StrEnum):
