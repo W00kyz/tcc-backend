@@ -1,5 +1,5 @@
 """RF43 / RF44 — the manager execution-history surface: a filterable paginated list, a detail
-view bundling the scans / evidence / form answers, and review resolution.
+view bundling the scans / evidence, and review resolution.
 
 Transaction discipline: `history` flushes and this router owns `db.commit()`. The list and
 detail endpoints are pure reads; only `resolve_review` writes (the status change plus one
@@ -7,7 +7,7 @@ detail endpoints are pure reads; only `resolve_review` writes (the status change
 """
 
 from datetime import date, datetime
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -85,23 +85,13 @@ class ExecutionEvidence(BaseModel):
     captured_at: datetime
     created_at: datetime
     content_url: str | None  # the authenticated proxy path for a PHOTO; None for a NOTE
-    # The app-generated key a MEDIA answer lists to point at this photo.
+    # The app-generated key, so a retried upload lands on the same row.
     idempotency_key: UUID | None
-
-
-class AnswerOut(BaseModel):
-    question_stable_key: str
-    prompt: str | None  # null when the key is no longer in the recorded form version (Ruling 15)
-    value: Any
-    # "MEDIA" lists photo idempotency keys; null alongside a null prompt.
-    question_type: str | None
 
 
 class ExecutionDetail(ExecutionListItem):
     scans: list[ExecutionScan]
     evidence: list[ExecutionEvidence]
-    form_version_id: UUID | None
-    answers: list[AnswerOut]
 
 
 class ResolveReviewRequest(BaseModel):
@@ -160,16 +150,6 @@ def _to_detail(detail: ExecutionDetailRow) -> ExecutionDetail:
                 idempotency_key=item_.idempotency_key,
             )
             for item_ in detail.evidence
-        ],
-        form_version_id=detail.form_version_id,
-        answers=[
-            AnswerOut(
-                question_stable_key=a.question_stable_key,
-                prompt=a.prompt,
-                value=a.value,
-                question_type=a.question_type,
-            )
-            for a in detail.answers
         ],
     )
 

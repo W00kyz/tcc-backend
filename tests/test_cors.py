@@ -57,10 +57,10 @@ def test_preflight_rejects_an_unrecognized_origin() -> None:
     assert "access-control-allow-origin" not in response.headers
 
 
-def test_preflight_allows_put_for_settings_and_form_reorder() -> None:
+def test_preflight_allows_put_for_settings() -> None:
     client = TestClient(create_app(object_store=FakeObjectStore()))
 
-    for path in ("/settings", "/forms/00000000-0000-0000-0000-000000000000/draft/order"):
+    for path in ("/settings",):
         response = client.options(
             path,
             headers={

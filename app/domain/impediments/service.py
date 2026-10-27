@@ -1,12 +1,12 @@
 # ruff: noqa: N818 — RouteNotInProgress / StopNotReassignable name the signal
-# condition the caller catches by name, same convention as app/domain/forms/service.py.
+# condition the caller catches by name, same convention as the other domain services.
 """Impediment reports service (RF16-RF17, spec 2026-10-20-alocacao-automatica §7.1): a field
 worker's impediment gives the point(s) straight back to the pool and tells the managers; the
 manager lists every impediment and acknowledges it ("ciente"). Ranking candidates and
 reassigning by hand went with manual planning (§2.1).
 
 Transaction discipline: these functions flush, never commit — the endpoint owns the
-transaction boundary, same convention as app/domain/forms/service.py."""
+transaction boundary, same convention as the other domain services."""
 
 import uuid
 from datetime import UTC, datetime

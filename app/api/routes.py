@@ -111,7 +111,7 @@ async def list_routes(
     if route_status is not None:
         stmt = stmt.where(Route.status == _parse_enum(RouteStatus, route_status, "status"))
     routes = (await db.scalars(stmt)).all()
-    return [await _to_route_out(db, route) for route in routes]
+    return [_to_route_out(route) for route in routes]
 
 
 @router.get("/me", response_model=MyDayOut)
@@ -126,7 +126,7 @@ async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday) -> MyDayOu
     )
     return MyDayOut(
         service_day=is_service_day(settings, today),
-        route=await _to_route_out(db, route) if route is not None else None,
+        route=_to_route_out(route) if route is not None else None,
         position_report_interval_seconds=settings.position_report_interval_seconds,
         location_silence_warning_minutes=settings.location_silence_warning_minutes,
         location_silence_release_minutes=settings.location_silence_release_minutes,
@@ -206,7 +206,7 @@ async def _allocation_out(db: AsyncSession, result: AllocationResult) -> Allocat
     await db.commit()
     route = await _load_route(db, result.route.id)
     assert route is not None  # just written in this session
-    return AllocationOut(route=await _to_route_out(db, route), pool_empty=result.pool_empty)
+    return AllocationOut(route=_to_route_out(route), pool_empty=result.pool_empty)
 
 
 @router.get("/{route_id}", response_model=RouteOut)
@@ -215,4 +215,4 @@ async def get_route(route_id: UUID, _actor: _Manager, db: _Db) -> RouteOut:
     route = await _load_route(db, route_id)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-    return await _to_route_out(db, route)
+    return _to_route_out(route)

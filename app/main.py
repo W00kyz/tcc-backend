@@ -15,7 +15,6 @@ from app.api.evidence import router as evidence_router
 from app.api.executions import router as executions_router
 from app.api.field_workers import router as field_workers_router
 from app.api.floors import router as floors_router
-from app.api.forms import router as forms_router
 from app.api.health import router as health_router
 from app.api.impediments import router as impediments_router
 from app.api.me import router as me_router
@@ -58,7 +57,7 @@ def _add_cors_middleware(app: FastAPI, settings: Settings) -> None:
         CORSMiddleware,
         allow_origins=[settings.dashboard_base_url],
         allow_credentials=True,
-        # PUT is used by /settings and /forms/{id}/draft/order — leaving it out made the
+        # PUT is used by /settings — leaving it out made the
         # browser's preflight fail (400) before the request was ever sent.
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
@@ -169,7 +168,6 @@ def create_app(
     app.include_router(service_points_router)
     app.include_router(qr_codes_router)
     app.include_router(settings_router)
-    app.include_router(forms_router)
     app.include_router(impediments_router)
     app.include_router(appeals_router)
     app.include_router(me_router)

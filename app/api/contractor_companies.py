@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
-from app.domain.catalog.deletion import delete_form_of_type, service_type_has_history
+from app.domain.catalog.deletion import service_type_has_history
 from app.domain.catalog.models import ContractorCompany, ServicePoint, ServiceType
 from app.domain.identity.models import User, UserRole
 
@@ -120,7 +120,6 @@ async def _reconcile_service_types(
                 f'Service type "{service_type.name}" has routes or executions on record.',
                 service_type_id=str(service_type_id),
             )
-        await delete_form_of_type(db, service_type_id)
         company.service_types.remove(service_type)
         await db.delete(service_type)
     await db.flush()

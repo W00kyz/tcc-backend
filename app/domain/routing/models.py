@@ -118,8 +118,7 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     batch_number: Mapped[int] = mapped_column(Integer)
     # A copy of `route.route_date`, so the exclusivity index above needs no join.
     service_date: Mapped[date] = mapped_column(Date)
-    # Etapa 7: which service type is executed at this stop — drives the dynamic check-out
-    # form. Nullable: a stop with no type has no form.
+    # Which service type is executed at this stop. Nullable: a stop may have no type.
     service_type_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("service_types.id"), nullable=True
     )
@@ -137,6 +136,6 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     route: Mapped["Route"] = relationship(back_populates="stops")
     service_point: Mapped["ServicePoint"] = relationship()
-    # Etapa 7: read-only lookup for RouteStopOut.service_type_name and the embedded form.
-    # Nullable — a stop with no service_type_id has no type and no form. One-directional.
+    # Read-only lookup for RouteStopOut.service_type_name. Nullable — a stop with no
+    # service_type_id has no type. One-directional.
     service_type: Mapped["ServiceType | None"] = relationship()

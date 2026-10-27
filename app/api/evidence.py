@@ -73,7 +73,7 @@ class EvidenceItemOut(BaseModel):
     created_at: datetime
     # The authenticated proxy path for a PHOTO; None for a NOTE. `object_key` is never exposed.
     content_url: str | None
-    # The app-generated key a MEDIA answer lists to point at this photo.
+    # The app-generated key, so a retried upload lands on the same row.
     idempotency_key: UUID | None
 
 

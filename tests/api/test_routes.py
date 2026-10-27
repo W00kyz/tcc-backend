@@ -17,8 +17,6 @@ from app.domain.catalog.models import (
     ServicePoint,
     ServiceType,
 )
-from app.domain.forms.models import QuestionType
-from app.domain.forms.service import add_question, get_or_create_form, publish_form
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import ReleaseReason, RouteStatus, RouteStopStatus
 from fastapi import FastAPI
@@ -160,39 +158,13 @@ async def test_route_stop_out_carries_batch_and_release_reason(
     assert not {"expected_arrival_from", "reassigned", "assignment_history"} & set(stops[0])
 
 
-async def test_routes_me_embeds_the_active_form_per_stop(
-    client: TestClient, db_session: AsyncSession
-) -> None:
+async def test_routes_me_stop_has_no_form_key(client: TestClient, db_session: AsyncSession) -> None:
     _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
-    published_type = ServiceType(name="Limpeza", average_duration_minutes=30)
-    draft_only_type = ServiceType(name="Jardinagem", average_duration_minutes=45)
-    db_session.add_all([published_type, draft_only_type])
+    service_type = ServiceType(name="Limpeza", average_duration_minutes=30)
+    db_session.add(service_type)
     await db_session.flush()
-
-    published_form = await get_or_create_form(db_session, service_type_id=published_type.id)
-    await add_question(
-        db_session,
-        form_id=published_form.id,
-        prompt="Piso lavado?",
-        question_type=QuestionType.TEXT,
-        required=True,
-        options=[],
-    )
-    published_version = await publish_form(db_session, form_id=published_form.id)
-
-    draft_form = await get_or_create_form(db_session, service_type_id=draft_only_type.id)
-    await add_question(
-        db_session,
-        form_id=draft_form.id,
-        prompt="Grama aparada?",
-        question_type=QuestionType.TEXT,
-        required=False,
-        options=[],
-    )
-
     route = await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points)
-    route.stops[0].service_type_id = published_type.id
-    route.stops[2].service_type_id = draft_only_type.id
+    route.stops[0].service_type_id = service_type.id
     await db_session.commit()
     token = _login(client, worker_user.email)
 
@@ -200,18 +172,9 @@ async def test_routes_me_embeds_the_active_form_per_stop(
 
     assert response.status_code == 200
     stops = response.json()["route"]["stops"]
-
     assert stops[0]["service_type_name"] == "Limpeza"
-    assert stops[0]["service_type_id"] == str(published_type.id)
-    assert stops[0]["form"]["form_version_id"] == str(published_version.id)
-    assert len(stops[0]["form"]["questions"][0]["content_hash"]) == 64
-
-    assert stops[1]["service_type_id"] is None
-    assert stops[1]["service_type_name"] is None
-    assert stops[1]["form"] is None
-
-    assert stops[2]["service_type_name"] == "Jardinagem"
-    assert stops[2]["form"] is None  # only a draft version exists
+    assert stops[0]["service_type_id"] == str(service_type.id)
+    assert all("form" not in stop for stop in stops)
 
 
 async def test_routes_me_follows_the_campus_day_not_the_server_date(
