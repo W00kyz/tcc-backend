@@ -1,8 +1,8 @@
 """Routes: the manager list and detail (RF41), the field worker's day (`GET /routes/me` — RF27)
-and the automatic allocation that creates them (`POST /routes/start`, `POST
-/routes/{id}/next-batch` — spec 2026-10-20-alocacao-automatica §6.2); nobody builds a route by
-hand. The `RouteOut` read model lives in `app.api.route_view` so a route looks the same on mobile
-and the dashboard."""
+and its live first leg (`GET /routes/me/approach`), and the automatic allocation that creates
+them (`POST /routes/start`, `POST /routes/{id}/next-batch` — spec 2026-10-20-alocacao-automatica
+§6.2); nobody builds a route by hand. The `RouteOut` read model lives in `app.api.route_view` so
+a route looks the same on mobile and the dashboard."""
 
 from collections.abc import Coroutine
 from datetime import date, datetime
@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,7 +36,9 @@ from app.domain.routing.allocation import (
     next_batch,
     start_or_resume,
 )
+from app.domain.routing.approach import next_stop_approach
 from app.domain.routing.models import Route, RouteStatus
+from app.domain.routing.osrm import OsrmLeg, OsrmUnavailable
 from app.domain.settings.campus import is_service_day
 from app.domain.settings.service import get_settings_row
 
@@ -81,6 +83,17 @@ class MyDayOut(BaseModel):
     location_silence_release_minutes: int
 
 
+class ApproachOut(BaseModel):
+    """The live first leg: the street path from the worker's position to the next stop. Never
+    stored; the app asks again as the worker moves."""
+
+    route_stop_id: UUID
+    # [[lng, lat], ...] — GeoJSON order, the same convention as `RouteStopOut.leg_geometry`.
+    geometry: list[list[float]]
+    distance_m: float
+    duration_s: float
+
+
 def _parse_enum[FilterEnum: Enum](enum_cls: type[FilterEnum], value: str, param: str) -> FilterEnum:
     """Turn a raw `?status=` string into its enum member, or answer 422 naming
     the offending value and the allowed set — an unknown filter is a client error, not an
@@ -111,7 +124,7 @@ async def list_routes(
     if route_status is not None:
         stmt = stmt.where(Route.status == _parse_enum(RouteStatus, route_status, "status"))
     routes = (await db.scalars(stmt)).all()
-    return [await _to_route_out(db, route) for route in routes]
+    return [_to_route_out(route) for route in routes]
 
 
 @router.get("/me", response_model=MyDayOut)
@@ -126,10 +139,57 @@ async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday) -> MyDayOu
     )
     return MyDayOut(
         service_day=is_service_day(settings, today),
-        route=await _to_route_out(db, route) if route is not None else None,
+        route=_to_route_out(route) if route is not None else None,
         position_report_interval_seconds=settings.position_report_interval_seconds,
         location_silence_warning_minutes=settings.location_silence_warning_minutes,
         location_silence_release_minutes=settings.location_silence_release_minutes,
+    )
+
+
+@router.get(
+    "/me/approach",
+    response_model=ApproachOut,
+    responses={
+        204: {"description": "No route today, or no PENDING stop in its current batch."},
+        503: {"description": "OSRM is unavailable or cannot route the leg; draw a straight line."},
+    },
+)
+async def my_approach(
+    worker: ApprovedWorker,
+    db: _Db,
+    today: CampusToday,
+    request: Request,
+    lat: Annotated[float, Query(ge=-90, le=90)],
+    lng: Annotated[float, Query(ge=-180, le=180)],
+) -> ApproachOut | Response:
+    """The street leg from `(lat, lng)` to the worker's next stop: the first PENDING stop of
+    today's current batch, in route order. 204 when there is none; 503 with `OSRM_UNAVAILABLE`
+    when OSRM cannot answer — the server never falls back to a straight line itself."""
+    await ensure_location_consent(db, worker)
+    try:
+        approach = await next_stop_approach(
+            db,
+            field_worker_id=worker.id,
+            today=today,
+            origin=(lat, lng),
+            osrm=request.app.state.osrm_client,
+        )
+    except OsrmUnavailable as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "OSRM_UNAVAILABLE", "detail": str(exc)},
+        ) from exc
+    if approach is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return _approach_out(approach.route_stop_id, approach.leg)
+
+
+def _approach_out(route_stop_id: UUID, leg: OsrmLeg) -> ApproachOut:
+    return ApproachOut(
+        route_stop_id=route_stop_id,
+        geometry=leg.geometry,
+        distance_m=leg.distance_m,
+        duration_s=leg.duration_s,
     )
 
 
@@ -206,7 +266,7 @@ async def _allocation_out(db: AsyncSession, result: AllocationResult) -> Allocat
     await db.commit()
     route = await _load_route(db, result.route.id)
     assert route is not None  # just written in this session
-    return AllocationOut(route=await _to_route_out(db, route), pool_empty=result.pool_empty)
+    return AllocationOut(route=_to_route_out(route), pool_empty=result.pool_empty)
 
 
 @router.get("/{route_id}", response_model=RouteOut)
@@ -215,4 +275,4 @@ async def get_route(route_id: UUID, _actor: _Manager, db: _Db) -> RouteOut:
     route = await _load_route(db, route_id)
     if route is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Route "{route_id}" not found.')
-    return await _to_route_out(db, route)
+    return _to_route_out(route)

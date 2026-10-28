@@ -2,7 +2,6 @@
 the field-worker feed (`app.api.routes`). Mobile and the dashboard consume the same `RouteOut`
 shape so a route looks identical on both (Task 7)."""
 
-import uuid
 from datetime import date, datetime
 from uuid import UUID
 
@@ -12,15 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.domain.catalog.models import Floor, ServicePoint
-from app.domain.forms.models import QuestionType
-from app.domain.forms.reads import FormVersionOut, to_form_version_out
-from app.domain.forms.service import active_form_version
 from app.domain.routing.models import ReleaseReason, Route, RouteStop
 from app.domain.routing.service import routing_degraded
 
 # One eager-load recipe shared by every read: RouteOut needs the stop's service point down to
-# its building, the route's field worker, and — Etapa 7 — the stop's service type so
-# `service_type_name` and the embedded form resolve without a lazy load under async.
+# its building, the route's field worker, and the stop's service type so `service_type_name`
+# resolves without a lazy load under async.
 _ROUTE_LOADERS = (
     selectinload(Route.stops)
     .selectinload(RouteStop.service_point)
@@ -28,29 +24,9 @@ _ROUTE_LOADERS = (
     .selectinload(Floor.building),
     selectinload(Route.field_worker),
     selectinload(Route.stops).selectinload(RouteStop.service_type),
+    # One extra IN query for the whole route, so `done_at` costs no per-stop lazy load.
+    selectinload(Route.stops).selectinload(RouteStop.executions),
 )
-
-
-class FormQuestionField(BaseModel):
-    """One question of the embedded form, mirroring `FormQuestionOut`. `content_hash` is the
-    per-question fingerprint the app pins each answer to while offline (spec §5.2)."""
-
-    id: UUID
-    stable_key: UUID
-    order_index: int
-    prompt: str
-    question_type: QuestionType
-    required: bool
-    options: list[str]
-    content_hash: str | None
-
-
-class EmbeddedForm(BaseModel):
-    """The stop's active PUBLISHED execution form, shipped inside `GET /routes/me` so the app
-    has the schema (with hashes) before it goes offline (spec §5.2, Etapa 7)."""
-
-    form_version_id: UUID
-    questions: list[FormQuestionField]
 
 
 class RouteStopOut(BaseModel):
@@ -65,16 +41,24 @@ class RouteStopOut(BaseModel):
     service_point_name: str
     floor_label: str
     building_name: str
+    # Lets the app group a batch's stops by building.
+    building_id: UUID
     latitude: float
     longitude: float
     distance_from_prev_m: float | None
     duration_from_prev_s: float | None
     leg_geometry: list[list[float]] | None
-    # Etapa 7: the service type executed here and its active form. All three are null for a
-    # stop with no `service_type_id`; `form` is also null when the type has no published version.
+    # The service type executed here; both are null for a stop with no `service_type_id`.
     service_type_id: UUID | None
     service_type_name: str | None
-    form: EmbeddedForm | None
+    # Whether finishing this stop needs evidence; fixed when the stop was allocated.
+    requires_evidence: bool
+    # When the stop's execution was checked out; null while the stop has none finished.
+    done_at: datetime | None
+
+
+def _done_at(stop: RouteStop) -> datetime | None:
+    return max((e.checked_out_at for e in stop.executions if e.checked_out_at), default=None)
 
 
 class RouteOut(BaseModel):
@@ -91,43 +75,8 @@ class RouteOut(BaseModel):
     stops: list[RouteStopOut]
 
 
-def _to_embedded_form(form: FormVersionOut) -> EmbeddedForm:
-    return EmbeddedForm(
-        form_version_id=form.form_version_id,
-        questions=[
-            FormQuestionField(
-                id=q.id,
-                stable_key=q.stable_key,
-                order_index=q.order_index,
-                prompt=q.prompt,
-                question_type=q.question_type,
-                required=q.required,
-                options=list(q.options),
-                content_hash=q.content_hash,
-            )
-            for q in form.questions
-        ],
-    )
-
-
-async def _resolve_forms(db: AsyncSession, route: Route) -> dict[uuid.UUID, FormVersionOut]:
-    """Map each distinct stop `service_type_id` on the route to its active PUBLISHED form.
-
-    One query per distinct service type — not N+1 in practice: a route visits a handful of
-    types, and the map is reused across every stop that shares one. Types with no form or no
-    published version are simply absent from the map."""
-    service_type_ids = {s.service_type_id for s in route.stops if s.service_type_id is not None}
-    form_map: dict[uuid.UUID, FormVersionOut] = {}
-    for service_type_id in service_type_ids:
-        version = await active_form_version(db, service_type_id=service_type_id)
-        if version is not None:
-            form_map[service_type_id] = to_form_version_out(version)
-    return form_map
-
-
-def _to_stop_out(stop: RouteStop, form_map: dict[uuid.UUID, FormVersionOut]) -> RouteStopOut:
+def _to_stop_out(stop: RouteStop) -> RouteStopOut:
     point = stop.service_point
-    form = form_map.get(stop.service_type_id) if stop.service_type_id is not None else None
     return RouteStopOut(
         id=stop.id,
         order_index=stop.order_index,
@@ -138,6 +87,7 @@ def _to_stop_out(stop: RouteStop, form_map: dict[uuid.UUID, FormVersionOut]) -> 
         service_point_name=point.name,
         floor_label=point.floor.label,
         building_name=point.floor.building.name,
+        building_id=point.floor.building.id,
         latitude=point.latitude,
         longitude=point.longitude,
         distance_from_prev_m=stop.distance_from_prev_m,
@@ -145,12 +95,12 @@ def _to_stop_out(stop: RouteStop, form_map: dict[uuid.UUID, FormVersionOut]) -> 
         leg_geometry=stop.leg_geometry,
         service_type_id=stop.service_type_id,
         service_type_name=stop.service_type.name if stop.service_type is not None else None,
-        form=_to_embedded_form(form) if form is not None else None,
+        requires_evidence=stop.requires_evidence,
+        done_at=_done_at(stop),
     )
 
 
-async def _to_route_out(db: AsyncSession, route: Route) -> RouteOut:
-    form_map = await _resolve_forms(db, route)
+def _to_route_out(route: Route) -> RouteOut:
     return RouteOut(
         id=route.id,
         field_worker_id=route.field_worker_id,
@@ -162,7 +112,7 @@ async def _to_route_out(db: AsyncSession, route: Route) -> RouteOut:
         current_batch=max((stop.batch_number for stop in route.stops), default=0),
         # Route.stops is order_by="RouteStop.order_index" and every service function reloads it
         # in that order — no re-sort needed here.
-        stops=[_to_stop_out(stop, form_map) for stop in route.stops],
+        stops=[_to_stop_out(stop) for stop in route.stops],
     )
 
 

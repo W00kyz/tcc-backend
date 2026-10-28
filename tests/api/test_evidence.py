@@ -8,7 +8,13 @@ from typing import cast
 
 from app.core.config import Settings
 from app.domain.catalog.models import Building, FieldWorker, Floor, ServicePoint
-from app.domain.execution.models import EvidenceItem, EvidenceKind, Execution, ExecutionSource
+from app.domain.execution.models import (
+    EvidenceItem,
+    EvidenceKind,
+    Execution,
+    ExecutionReviewStatus,
+    ExecutionSource,
+)
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import ReleaseReason
 from fastapi.testclient import TestClient
@@ -17,6 +23,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.api.test_checkins import (
+    _POINT_LAT,
+    _POINT_LNG,
     _add_field_worker,
     _add_user,
     _login,
@@ -499,3 +507,121 @@ async def test_upload_for_a_released_stop_is_409(
         assert response.json()["detail"]["code"] == "STOP_RELEASED"
         assert response.json()["detail"]["appealable"] is True
     assert await db_session.scalar(select(EvidenceItem.id)) is None
+
+
+# --- a late photo reconciles INSUFFICIENT_EVIDENCE (spec 2026-10-26 §6.2) -----------------------
+
+
+def _check_out(client: TestClient, token: str, qr_payload: str, **extra: object) -> Response:
+    body: dict[str, object] = {
+        "qr_payload": qr_payload,
+        "latitude": _POINT_LAT,
+        "longitude": _POINT_LNG,
+        "scanned_at": datetime.now(UTC).isoformat(),
+        "checkout_idempotency_key": str(uuid.uuid4()),
+        **extra,
+    }
+    return client.post("/check-outs", json=body, headers={"Authorization": f"Bearer {token}"})
+
+
+async def _checked_out_short_of_photos(
+    client: TestClient,
+    db_session: AsyncSession,
+    test_settings: Settings,
+    **check_out_overrides: object,
+) -> tuple[str, str]:
+    """A stop that requires evidence, checked in, given one photo and checked out: flagged
+    INSUFFICIENT_EVIDENCE. Returns (worker token, execution id)."""
+    seeded = await _seed_route(db_session, test_settings)
+    seeded.stops[0].requires_evidence = True
+    await db_session.commit()
+    token = _login(client)
+    checkin = _post(client, token, seeded.qr_code.public_code)
+    execution_id = str(checkin.json()["execution_id"])
+    assert _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA).status_code == 201
+    checkout = _check_out(client, token, seeded.qr_code.public_code, **check_out_overrides)
+    assert checkout.status_code == 201, checkout.text
+    assert "INSUFFICIENT_EVIDENCE" in checkout.json()["validation_flags"]
+    return token, execution_id
+
+
+async def _reload(db_session: AsyncSession, execution_id: str) -> Execution:
+    execution = await db_session.get(Execution, uuid.UUID(execution_id))
+    assert execution is not None
+    await db_session.refresh(execution)
+    return execution
+
+
+async def test_late_photo_completing_two_clears_flag_and_review(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, execution_id = await _checked_out_short_of_photos(client, db_session, test_settings)
+
+    response = _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA)
+
+    assert response.status_code == 201, response.text
+    execution = await _reload(db_session, execution_id)
+    assert "INSUFFICIENT_EVIDENCE" not in execution.validation_flags
+    assert execution.review_status.value == "NONE"
+
+
+async def test_late_photo_keeps_other_flags_pending(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, execution_id = await _checked_out_short_of_photos(
+        client, db_session, test_settings, latitude=None, longitude=None
+    )
+
+    response = _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA)
+
+    assert response.status_code == 201, response.text
+    execution = await _reload(db_session, execution_id)
+    assert execution.validation_flags == ["GPS_UNAVAILABLE"]
+    assert execution.review_status.value == "PENDING_REVIEW"
+
+
+async def test_late_photo_after_manager_resolved_keeps_resolved(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, execution_id = await _checked_out_short_of_photos(client, db_session, test_settings)
+    execution = await _reload(db_session, execution_id)
+    execution.review_status = ExecutionReviewStatus.RESOLVED
+    await db_session.commit()
+
+    response = _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA)
+
+    assert response.status_code == 201, response.text
+    execution = await _reload(db_session, execution_id)
+    assert "INSUFFICIENT_EVIDENCE" not in execution.validation_flags
+    assert execution.review_status is ExecutionReviewStatus.RESOLVED
+
+
+async def test_late_photo_still_short_keeps_flag(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    """A note is not a photo: it never completes the count."""
+    token, execution_id = await _checked_out_short_of_photos(client, db_session, test_settings)
+
+    assert _upload_note(client, token, execution_id, "uma nota").status_code == 201
+
+    execution = await _reload(db_session, execution_id)
+    assert "INSUFFICIENT_EVIDENCE" in execution.validation_flags
+    assert execution.review_status.value == "PENDING_REVIEW"
+
+
+async def test_photo_before_check_out_does_not_touch_flags(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    token, execution_id = await _seed_execution(client, db_session, test_settings)
+    execution = await _reload(db_session, execution_id)
+    execution.validation_flags = ["INSUFFICIENT_EVIDENCE"]
+    await db_session.commit()
+
+    for _ in range(2):
+        assert (
+            _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA).status_code == 201
+        )
+
+    execution = await _reload(db_session, execution_id)
+    assert execution.checked_out_at is None
+    assert execution.validation_flags == ["INSUFFICIENT_EVIDENCE"]

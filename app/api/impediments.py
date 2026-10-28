@@ -4,8 +4,8 @@ the pool at once — and a manager lists the impediments and acknowledges them (
 Reassigning or dismissing by hand went with manual planning (§2.1).
 
 Every endpoint owns its transaction boundary — call the flush-only service, then
-`db.commit()` — the same discipline as `app/api/forms.py`. The impediment services flush,
-never commit."""
+`db.commit()` — the same discipline as the other routers. The impediment services flush, never
+commit."""
 
 from datetime import datetime
 from typing import Annotated, NoReturn

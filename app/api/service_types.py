@@ -22,6 +22,7 @@ class ServiceTypeOut(BaseModel):
     id: UUID
     name: str
     average_duration_minutes: int
+    requires_evidence: bool
     contractor_company_id: UUID | None
     contractor_company_name: str | None
 
@@ -32,6 +33,7 @@ def _to_out(service_type: ServiceType) -> ServiceTypeOut:
         id=service_type.id,
         name=service_type.name,
         average_duration_minutes=service_type.average_duration_minutes,
+        requires_evidence=service_type.requires_evidence,
         contractor_company_id=service_type.contractor_company_id,
         contractor_company_name=company.name if company else None,
     )

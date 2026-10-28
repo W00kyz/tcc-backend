@@ -2,7 +2,7 @@
 
 `list_executions` builds one denormalised row per execution (worker, service point, building,
 floor, the check-in GPS verdict and the evidence count) with the RF44 filters applied
-conditionally; `get_execution_detail` adds the scans, evidence items and the form answers;
+conditionally; `get_execution_detail` adds the scans and evidence items;
 `resolve_review` closes a review flag.
 
 Transaction discipline: this module flushes, never commits — the endpoint owns the commit
@@ -16,7 +16,6 @@ from uuid import UUID
 
 from sqlalchemy import ColumnElement, ScalarSelect, Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.domain.appeals.models import Appeal
 from app.domain.catalog.models import (
@@ -26,7 +25,6 @@ from app.domain.catalog.models import (
     ServicePoint,
 )
 from app.domain.execution.models import (
-    Answer,
     EvidenceItem,
     Execution,
     ExecutionReviewStatus,
@@ -35,7 +33,6 @@ from app.domain.execution.models import (
     QrScan,
     QrScanKind,
 )
-from app.domain.forms.models import FormQuestion, FormVersion
 from app.domain.routing.models import RouteStop, RouteStopStatus
 
 
@@ -103,17 +100,8 @@ class ExecutionEvidenceRow:
     byte_size: int | None
     captured_at: datetime
     created_at: datetime
-    # The key the app generated offline; a MEDIA answer points at its photos by it.
+    # The key the app generated offline, so a retried upload lands on the same row.
     idempotency_key: UUID | None
-
-
-@dataclass(frozen=True)
-class AnswerDetailRow:
-    question_stable_key: str
-    prompt: str | None  # None when the key is no longer in the recorded form version (Ruling 15)
-    value: Any
-    # Same lifetime as `prompt`: None for a key no longer in the recorded version.
-    question_type: str | None
 
 
 @dataclass(frozen=True)
@@ -121,8 +109,7 @@ class ExecutionDetailRow:
     execution: ExecutionListRow
     scans: list[ExecutionScanRow]
     evidence: list[ExecutionEvidenceRow]
-    form_version_id: UUID | None
-    answers: list[AnswerDetailRow]
+    complaints_suggestions: str | None
 
 
 def _checkin_geo_subquery() -> ScalarSelect[Any]:
@@ -296,9 +283,6 @@ async def get_execution_detail(db: AsyncSession, execution_id: UUID) -> Executio
     if row is None:
         return None
 
-    form_version_id: UUID | None = row[0].form_version_id
-    answers = await _load_answers(db, execution_id, form_version_id)
-
     scans = (
         await db.scalars(
             select(QrScan).where(QrScan.execution_id == execution_id).order_by(QrScan.scanned_at)
@@ -315,39 +299,8 @@ async def get_execution_detail(db: AsyncSession, execution_id: UUID) -> Executio
         execution=_to_list_row(*row),
         scans=[_to_scan_row(scan) for scan in scans],
         evidence=[_to_evidence_row(item) for item in evidence],
-        form_version_id=form_version_id,
-        answers=answers,
+        complaints_suggestions=row[0].complaints_suggestions,
     )
-
-
-async def _load_answers(
-    db: AsyncSession, execution_id: UUID, form_version_id: UUID | None
-) -> list[AnswerDetailRow]:
-    """Ruling 15 — the execution's form answers, each joined to its question prompt from the
-    version the execution recorded. No form version means no answers to surface."""
-    if form_version_id is None:
-        return []
-
-    version = await db.scalar(
-        select(FormVersion)
-        .where(FormVersion.id == form_version_id)
-        .options(selectinload(FormVersion.questions))
-    )
-    questions = {str(q.stable_key): q for q in version.questions} if version is not None else {}
-    answers = (
-        await db.scalars(
-            select(Answer).where(Answer.execution_id == execution_id).order_by(Answer.created_at)
-        )
-    ).all()
-    return [
-        AnswerDetailRow(
-            question_stable_key=a.question_stable_key,
-            prompt=_question_prompt(questions, a.question_stable_key),
-            value=a.value_json,
-            question_type=_question_type(questions, a.question_stable_key),
-        )
-        for a in answers
-    ]
 
 
 async def resolve_review(db: AsyncSession, *, execution_id: UUID) -> Execution:
@@ -362,13 +315,3 @@ async def resolve_review(db: AsyncSession, *, execution_id: UUID) -> Execution:
     execution.review_status = ExecutionReviewStatus.RESOLVED
     await db.flush()
     return execution
-
-
-def _question_prompt(questions: dict[str, FormQuestion], stable_key: str) -> str | None:
-    question = questions.get(stable_key)
-    return None if question is None else question.prompt
-
-
-def _question_type(questions: dict[str, FormQuestion], stable_key: str) -> str | None:
-    question = questions.get(stable_key)
-    return None if question is None else question.question_type.value

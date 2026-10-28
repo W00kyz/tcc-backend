@@ -26,6 +26,7 @@ from app.domain.execution.service import (
 from app.domain.execution.validation import (
     FLAG_CLOCK_SKEW,
     FLAG_GPS_UNAVAILABLE,
+    FLAG_INSUFFICIENT_EVIDENCE,
     FLAG_OUT_OF_RADIUS,
     FLAG_QR_SUPERSEDED,
 )
@@ -157,6 +158,7 @@ async def _do_check_out(
     checkout_idempotency_key: uuid.UUID | None = None,
     chosen_route_stop_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
+    complaints_suggestions: str | None = None,
 ) -> Execution:
     return await check_out(
         db,
@@ -172,6 +174,7 @@ async def _do_check_out(
         radius_m=_RADIUS_M,
         now=datetime.now(UTC),
         client_clock_offset_seconds=client_clock_offset_seconds,
+        complaints_suggestions=complaints_suggestions,
     )
 
 
@@ -493,3 +496,40 @@ async def test_check_out_of_last_stop_leaves_the_route_open_for_the_next_batch(
 
     await db_session.refresh(seed.route)
     assert seed.route.status is RouteStatus.IN_PROGRESS
+
+
+async def test_check_out_strips_and_stores_complaints_suggestions(
+    db_session: AsyncSession,
+) -> None:
+    seed = await _seed(db_session)
+    await _do_check_in(db_session, seed)
+
+    execution = await _do_check_out(db_session, seed, complaints_suggestions="  Falta sabão \n")
+
+    assert execution.complaints_suggestions == "Falta sabão"
+
+
+@pytest.mark.parametrize("text", [None, "", "   \n\t"])
+async def test_check_out_stores_blank_complaints_suggestions_as_null(
+    db_session: AsyncSession, text: str | None
+) -> None:
+    seed = await _seed(db_session)
+    await _do_check_in(db_session, seed)
+
+    execution = await _do_check_out(db_session, seed, complaints_suggestions=text)
+
+    assert execution.complaints_suggestions is None
+
+
+async def test_check_out_flags_insufficient_evidence_when_the_stop_requires_it(
+    db_session: AsyncSession,
+) -> None:
+    seed = await _seed(db_session)
+    seed.stops[0].requires_evidence = True
+    await db_session.commit()
+    await _do_check_in(db_session, seed)
+
+    execution = await _do_check_out(db_session, seed)
+
+    assert execution.validation_flags == [FLAG_INSUFFICIENT_EVIDENCE]
+    assert execution.review_status is ExecutionReviewStatus.PENDING_REVIEW

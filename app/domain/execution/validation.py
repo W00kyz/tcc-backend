@@ -17,6 +17,12 @@ FLAG_GPS_UNAVAILABLE = "GPS_UNAVAILABLE"
 # executions carry it and the dashboard still labels it.
 FLAG_ROOM_CHOSEN_MANUALLY = "ROOM_CHOSEN_MANUALLY"
 FLAG_CLOCK_SKEW = "CLOCK_SKEW"
+# Raised at check-out when the stop requires evidence and fewer than MIN_EVIDENCE_PHOTOS photos
+# were synced; a late photo completing the count clears it
+# (evidence_service.reconcile_evidence_flag).
+# The server never rejects a check-out for missing photos — it flags it for review (Ruling 6).
+FLAG_INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+MIN_EVIDENCE_PHOTOS = 2
 
 # The app reports its measured clock offset (server minus device) on check-in/check-out; an offset
 # past this bound is implausible and routes the execution to review (spec §3.7, §4.2).

@@ -14,12 +14,11 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.domain.appeals.service import is_appealable, stop_has_appeal
 from app.domain.catalog.footprint import outline_contains
 from app.domain.catalog.models import Building, Floor, ServicePoint
-from app.domain.execution.answers import AnswerIn, build_answers
+from app.domain.execution.evidence_service import count_execution_photos
 from app.domain.execution.geo import haversine_meters
 from app.domain.execution.models import (
     Execution,
@@ -30,12 +29,13 @@ from app.domain.execution.models import (
     QrScanKind,
 )
 from app.domain.execution.validation import (
+    FLAG_INSUFFICIENT_EVIDENCE,
     FLAG_QR_SUPERSEDED,
+    MIN_EVIDENCE_PHOTOS,
     Candidate,
     clock_skew_flag,
     resolve_room,
 )
-from app.domain.forms.models import FormVersion, FormVersionStatus
 from app.domain.qr.crypto import QrPayload, decode_qr_payload
 from app.domain.qr.models import QrCode, QrCodeStatus
 from app.domain.routing.models import ReleaseReason, Route, RouteStop, RouteStopStatus
@@ -97,12 +97,6 @@ class StopReleased(Exception):
         self.route_stop_id = stop.id
         self.release_reason: ReleaseReason = stop.release_reason
         self.appealable = appealable
-
-
-class FormVersionMismatch(Exception):
-    """The check-out's `form_version_id`/`answers` do not fit the stop (Ruling 7): missing one
-    of the pair, a non-PUBLISHED version, the wrong service type's form, or a stop with no
-    service type at all."""
 
 
 async def check_in(
@@ -215,14 +209,15 @@ async def check_out(
     now: datetime,
     execution_id: uuid.UUID | None = None,
     client_clock_offset_seconds: float | None = None,
-    form_version_id: uuid.UUID | None = None,
-    answers: list[AnswerIn] | None = None,
+    complaints_suggestions: str | None = None,
 ) -> Execution:
     """Close the open check-in on the scanned floor: sets `checked_out_at`, merges any new
     flags into the execution and marks the stop DONE. `execution_id`
     is accepted for API symmetry with check-in but ignored here — check-out resolves the open
     execution by floor, it does not create one. `client_clock_offset_seconds` still flags
-    implausible skew. `now` is the server clock, as for the check-in."""
+    implausible skew. `complaints_suggestions` is stored stripped, blank as NULL. A stop that
+    requires evidence with fewer than `MIN_EVIDENCE_PHOTOS` photos is flagged, never rejected.
+    `now` is the server clock, as for the check-in."""
     _ = execution_id  # unused: check-out closes an existing execution, never creates one
     existing = await db.scalar(
         select(Execution).where(Execution.checkout_idempotency_key == checkout_idempotency_key)
@@ -269,7 +264,13 @@ async def check_out(
 
     previous_flags = set(execution.validation_flags)
     skew_flags = clock_skew_flag(client_clock_offset_seconds)
-    checkout_flags = _merge_flags(resolution.flags, qr_flags, skew_flags)
+    evidence_flags = (
+        [FLAG_INSUFFICIENT_EVIDENCE]
+        if stop.requires_evidence
+        and await count_execution_photos(db, execution.id) < MIN_EVIDENCE_PHOTOS
+        else []
+    )
+    checkout_flags = _merge_flags(resolution.flags, qr_flags, skew_flags, evidence_flags)
     if skew_flags and execution.clock_skew_seconds is None:
         execution.clock_skew_seconds = client_clock_offset_seconds
     merged = previous_flags | set(checkout_flags)
@@ -281,6 +282,7 @@ async def check_out(
     elif merged and execution.review_status is ExecutionReviewStatus.NONE:
         execution.review_status = ExecutionReviewStatus.PENDING_REVIEW
     execution.checked_out_at = scanned_at
+    execution.complaints_suggestions = (complaints_suggestions or "").strip() or None
     execution.checkout_idempotency_key = checkout_idempotency_key
 
     db.add(
@@ -297,9 +299,6 @@ async def check_out(
         )
     )
     stop.status = RouteStopStatus.DONE
-    await _persist_answers(
-        db, execution=execution, stop=stop, form_version_id=form_version_id, answers=answers
-    )
     await db.commit()
     return execution
 
@@ -368,46 +367,6 @@ def _chose_another_stop(
 ) -> bool:
     """The worker's re-submit names a stop that is not among the live ones on the floor."""
     return chosen_route_stop_id is not None and chosen_route_stop_id not in live_stop_ids
-
-
-async def _persist_answers(
-    db: AsyncSession,
-    *,
-    execution: Execution,
-    stop: RouteStop,
-    form_version_id: uuid.UUID | None,
-    answers: list[AnswerIn] | None,
-) -> None:
-    """RF37/RF38 (Ruling 6): persist the check-out form answers exactly as sent, inside the
-    check-out transaction. `form_version_id` and `answers` come as a pair — one without the
-    other, or a stop with no service type, is a `FormVersionMismatch` (Ruling 7)."""
-    if form_version_id is None and answers is None:
-        return
-    if form_version_id is None or answers is None:
-        raise FormVersionMismatch(
-            "check-out needs both form_version_id and answers, or neither; "
-            f"got form_version_id={form_version_id!r}, answers={'set' if answers else None}."
-        )
-    if stop.service_type_id is None:
-        raise FormVersionMismatch(
-            f'Route stop "{stop.id}" has no service_type_id; it cannot carry form answers.'
-        )
-    version = await db.scalar(
-        select(FormVersion)
-        .where(FormVersion.id == form_version_id)
-        .options(selectinload(FormVersion.questions), selectinload(FormVersion.form))
-    )
-    if (
-        version is None
-        or version.status != FormVersionStatus.PUBLISHED
-        or version.form.service_type_id != stop.service_type_id
-    ):
-        raise FormVersionMismatch(
-            f'Form version "{form_version_id}" is not a PUBLISHED version of the form for '
-            f'service type "{stop.service_type_id}".'
-        )
-    execution.form_version_id = form_version_id
-    db.add_all(build_answers(execution_id=execution.id, form_version=version, answers=answers))
 
 
 def _guard_route(route: Route, worker_id: uuid.UUID, *, require_started: bool) -> None:

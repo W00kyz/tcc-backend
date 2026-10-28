@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     # Avoids a real circular import at runtime — catalog does not import routing, but
     # mypy strict still wants the annotation resolvable without executing the import eagerly.
     from app.domain.catalog.models import FieldWorker, ServicePoint, ServiceType
+    from app.domain.execution.models import Execution
 
 
 class RouteStatus(enum.StrEnum):
@@ -118,11 +119,13 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     batch_number: Mapped[int] = mapped_column(Integer)
     # A copy of `route.route_date`, so the exclusivity index above needs no join.
     service_date: Mapped[date] = mapped_column(Date)
-    # Etapa 7: which service type is executed at this stop — drives the dynamic check-out
-    # form. Nullable: a stop with no type has no form.
+    # Which service type is executed at this stop. Nullable: a stop may have no type.
     service_type_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("service_types.id"), nullable=True
     )
+    # Copy of the service type's flag taken at allocation, so a later change to the type does not
+    # alter stops already handed out.
+    requires_evidence: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     status: Mapped[RouteStopStatus] = mapped_column(
         ROUTE_STOP_STATUS_ENUM, default=RouteStopStatus.PENDING
     )
@@ -137,6 +140,8 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     route: Mapped["Route"] = relationship(back_populates="stops")
     service_point: Mapped["ServicePoint"] = relationship()
-    # Etapa 7: read-only lookup for RouteStopOut.service_type_name and the embedded form.
-    # Nullable — a stop with no service_type_id has no type and no form. One-directional.
+    # Read-only lookup for RouteStopOut.service_type_name. Nullable — a stop with no
+    # service_type_id has no type. One-directional.
     service_type: Mapped["ServiceType | None"] = relationship()
+    # Read-only lookup for RouteStopOut.done_at (the execution's check-out time). One-directional.
+    executions: Mapped[list["Execution"]] = relationship(viewonly=True)

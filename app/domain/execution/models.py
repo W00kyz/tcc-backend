@@ -5,7 +5,6 @@ offline mode (Etapa 6) must not lie about when the work actually happened."""
 import enum
 import uuid
 from datetime import datetime
-from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -16,8 +15,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
-    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -56,8 +53,6 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     field_worker_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("field_workers.id"), index=True
     )
-    # form_version_id arrives in Etapa 7; nullable until then — there is no form this stage.
-    form_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     # timezone=True (not the plan's bare mapped_column): the caller always passes a
     # timezone-aware datetime (datetime.now(UTC)) — asyncpg rejects binding that into a
     # bare TIMESTAMP WITHOUT TIME ZONE column, so this matches TimestampMixin's own choice.
@@ -82,6 +77,8 @@ class Execution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Set when the app-reported device/server clock offset at sync exceeds the plausible
     # threshold (spec Ruling 7); drives the CLOCK_SKEW review flag. NULL until Etapa 6 sync.
     clock_skew_seconds: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    # The worker's free-text complaints/suggestions typed at check-out; NULL when left blank.
+    complaints_suggestions: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
 
 class GeoValidation(enum.StrEnum):
@@ -140,25 +137,3 @@ class EvidenceItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     idempotency_key: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), unique=True, nullable=True
     )
-
-
-class Answer(UUIDPrimaryKeyMixin, Base):
-    """One persisted response to a dynamic-form question (Etapa 7, spec §3.1).
-
-    No FK to `form_questions`: `question_stable_key` is the logical link, and RF38 keeps
-    answers whose key may no longer exist in the active version. ON DELETE CASCADE — an
-    answer has no meaning without its execution."""
-
-    __tablename__ = "answers"
-    __table_args__ = (
-        UniqueConstraint(
-            "execution_id", "question_stable_key", name="uq_answers_execution_stable_key"
-        ),
-    )
-
-    execution_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("executions.id", ondelete="CASCADE")
-    )
-    question_stable_key: Mapped[str] = mapped_column(String(64))
-    value_json: Mapped[Any] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
