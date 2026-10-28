@@ -38,6 +38,8 @@ class RouteStopOut(BaseModel):
     # Why a RELEASED stop went back to the pool; null for every other status.
     release_reason: ReleaseReason | None
     service_point_id: UUID
+    # Lets the app match a scanned floor QR to its tasks.
+    floor_id: UUID
     service_point_name: str
     floor_label: str
     building_name: str
@@ -84,6 +86,7 @@ def _to_stop_out(stop: RouteStop) -> RouteStopOut:
         status=stop.status.value,
         release_reason=stop.release_reason,
         service_point_id=point.id,
+        floor_id=point.floor_id,
         service_point_name=point.name,
         floor_label=point.floor.label,
         building_name=point.floor.building.name,
