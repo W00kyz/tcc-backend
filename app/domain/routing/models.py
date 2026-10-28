@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     # Avoids a real circular import at runtime — catalog does not import routing, but
     # mypy strict still wants the annotation resolvable without executing the import eagerly.
     from app.domain.catalog.models import FieldWorker, ServicePoint, ServiceType
+    from app.domain.execution.models import Execution
 
 
 class RouteStatus(enum.StrEnum):
@@ -142,3 +143,5 @@ class RouteStop(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Read-only lookup for RouteStopOut.service_type_name. Nullable — a stop with no
     # service_type_id has no type. One-directional.
     service_type: Mapped["ServiceType | None"] = relationship()
+    # Read-only lookup for RouteStopOut.done_at (the execution's check-out time). One-directional.
+    executions: Mapped[list["Execution"]] = relationship(viewonly=True)

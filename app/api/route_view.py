@@ -24,6 +24,8 @@ _ROUTE_LOADERS = (
     .selectinload(Floor.building),
     selectinload(Route.field_worker),
     selectinload(Route.stops).selectinload(RouteStop.service_type),
+    # One extra IN query for the whole route, so `done_at` costs no per-stop lazy load.
+    selectinload(Route.stops).selectinload(RouteStop.executions),
 )
 
 
@@ -39,6 +41,8 @@ class RouteStopOut(BaseModel):
     service_point_name: str
     floor_label: str
     building_name: str
+    # Lets the app group a batch's stops by building.
+    building_id: UUID
     latitude: float
     longitude: float
     distance_from_prev_m: float | None
@@ -49,6 +53,12 @@ class RouteStopOut(BaseModel):
     service_type_name: str | None
     # Whether finishing this stop needs evidence; fixed when the stop was allocated.
     requires_evidence: bool
+    # When the stop's execution was checked out; null while the stop has none finished.
+    done_at: datetime | None
+
+
+def _done_at(stop: RouteStop) -> datetime | None:
+    return max((e.checked_out_at for e in stop.executions if e.checked_out_at), default=None)
 
 
 class RouteOut(BaseModel):
@@ -77,6 +87,7 @@ def _to_stop_out(stop: RouteStop) -> RouteStopOut:
         service_point_name=point.name,
         floor_label=point.floor.label,
         building_name=point.floor.building.name,
+        building_id=point.floor.building.id,
         latitude=point.latitude,
         longitude=point.longitude,
         distance_from_prev_m=stop.distance_from_prev_m,
@@ -85,6 +96,7 @@ def _to_stop_out(stop: RouteStop) -> RouteStopOut:
         service_type_id=stop.service_type_id,
         service_type_name=stop.service_type.name if stop.service_type is not None else None,
         requires_evidence=stop.requires_evidence,
+        done_at=_done_at(stop),
     )
 
 

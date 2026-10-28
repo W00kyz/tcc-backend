@@ -1,7 +1,7 @@
 """Route reads: the manager list/detail and the worker's "rota do dia". Routes are created by the
 automatic allocation; these tests seed them with `make_route`, the shape that allocation leaves."""
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import uuid4
 
@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
-from tests.support.factories import make_route, make_worker
+from tests.support.factories import make_check_in, make_route, make_worker
 
 _PASSWORD = "senha-forte-o-suficiente"
 
@@ -191,6 +191,57 @@ async def test_routes_me_stop_carries_requires_evidence(
     assert response.status_code == 200
     stops = response.json()["route"]["stops"]
     assert [stop["requires_evidence"] for stop in stops] == [True, False, False]
+
+
+async def test_route_stop_carries_building_id(client: TestClient, db_session: AsyncSession) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points)
+    await db_session.commit()
+    floor = await db_session.get(Floor, points[0].floor_id)
+    assert floor is not None
+    token = _login(client, worker_user.email)
+
+    stops = client.get("/routes/me", headers=_auth(token)).json()["route"]["stops"]
+
+    assert {stop["building_id"] for stop in stops} == {str(floor.building_id)}
+
+
+async def test_route_stop_done_at_is_checkout_time(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    route = await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points)
+    checked_in = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
+    checked_out = datetime(2026, 10, 27, 12, 30, tzinfo=UTC)
+    execution = await make_check_in(
+        db_session, stop=route.stops[0], worker=workers[0], scanned_at=checked_in
+    )
+    execution.checked_out_at = checked_out
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    stops = client.get("/routes/me", headers=_auth(token)).json()["route"]["stops"]
+
+    assert datetime.fromisoformat(stops[0]["done_at"]) == checked_out
+
+
+async def test_route_stop_done_at_null_when_pending(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    route = await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points)
+    await make_check_in(  # open execution: checked in, not out
+        db_session,
+        stop=route.stops[1],
+        worker=workers[0],
+        scanned_at=datetime(2026, 10, 27, 12, 0, tzinfo=UTC),
+    )
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    stops = client.get("/routes/me", headers=_auth(token)).json()["route"]["stops"]
+
+    assert [stop["done_at"] for stop in stops] == [None, None, None]
 
 
 async def test_routes_me_follows_the_campus_day_not_the_server_date(
