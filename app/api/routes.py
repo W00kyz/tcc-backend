@@ -1,8 +1,8 @@
 """Routes: the manager list and detail (RF41), the field worker's day (`GET /routes/me` — RF27)
-and the automatic allocation that creates them (`POST /routes/start`, `POST
-/routes/{id}/next-batch` — spec 2026-10-20-alocacao-automatica §6.2); nobody builds a route by
-hand. The `RouteOut` read model lives in `app.api.route_view` so a route looks the same on mobile
-and the dashboard."""
+and its live first leg (`GET /routes/me/approach`), and the automatic allocation that creates
+them (`POST /routes/start`, `POST /routes/{id}/next-batch` — spec 2026-10-20-alocacao-automatica
+§6.2); nobody builds a route by hand. The `RouteOut` read model lives in `app.api.route_view` so
+a route looks the same on mobile and the dashboard."""
 
 from collections.abc import Coroutine
 from datetime import date, datetime
@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,7 +36,9 @@ from app.domain.routing.allocation import (
     next_batch,
     start_or_resume,
 )
+from app.domain.routing.approach import next_stop_approach
 from app.domain.routing.models import Route, RouteStatus
+from app.domain.routing.osrm import OsrmLeg, OsrmUnavailable
 from app.domain.settings.campus import is_service_day
 from app.domain.settings.service import get_settings_row
 
@@ -79,6 +81,17 @@ class MyDayOut(BaseModel):
     position_report_interval_seconds: int
     location_silence_warning_minutes: int
     location_silence_release_minutes: int
+
+
+class ApproachOut(BaseModel):
+    """The live first leg: the street path from the worker's position to the next stop. Never
+    stored; the app asks again as the worker moves."""
+
+    route_stop_id: UUID
+    # [[lng, lat], ...] — GeoJSON order, the same convention as `RouteStopOut.leg_geometry`.
+    geometry: list[list[float]]
+    distance_m: float
+    duration_s: float
 
 
 def _parse_enum[FilterEnum: Enum](enum_cls: type[FilterEnum], value: str, param: str) -> FilterEnum:
@@ -130,6 +143,53 @@ async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday) -> MyDayOu
         position_report_interval_seconds=settings.position_report_interval_seconds,
         location_silence_warning_minutes=settings.location_silence_warning_minutes,
         location_silence_release_minutes=settings.location_silence_release_minutes,
+    )
+
+
+@router.get(
+    "/me/approach",
+    response_model=ApproachOut,
+    responses={
+        204: {"description": "No route today, or no PENDING stop in its current batch."},
+        503: {"description": "OSRM is unavailable or cannot route the leg; draw a straight line."},
+    },
+)
+async def my_approach(
+    worker: ApprovedWorker,
+    db: _Db,
+    today: CampusToday,
+    request: Request,
+    lat: Annotated[float, Query(ge=-90, le=90)],
+    lng: Annotated[float, Query(ge=-180, le=180)],
+) -> ApproachOut | Response:
+    """The street leg from `(lat, lng)` to the worker's next stop: the first PENDING stop of
+    today's current batch, in route order. 204 when there is none; 503 with `OSRM_UNAVAILABLE`
+    when OSRM cannot answer — the server never falls back to a straight line itself."""
+    await ensure_location_consent(db, worker)
+    try:
+        approach = await next_stop_approach(
+            db,
+            field_worker_id=worker.id,
+            today=today,
+            origin=(lat, lng),
+            osrm=request.app.state.osrm_client,
+        )
+    except OsrmUnavailable as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "OSRM_UNAVAILABLE", "detail": str(exc)},
+        ) from exc
+    if approach is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return _approach_out(approach.route_stop_id, approach.leg)
+
+
+def _approach_out(route_stop_id: UUID, leg: OsrmLeg) -> ApproachOut:
+    return ApproachOut(
+        route_stop_id=route_stop_id,
+        geometry=leg.geometry,
+        distance_m=leg.distance_m,
+        duration_s=leg.duration_s,
     )
 
 
