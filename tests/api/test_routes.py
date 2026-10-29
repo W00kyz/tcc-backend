@@ -206,6 +206,17 @@ async def test_route_stop_carries_building_id(client: TestClient, db_session: As
     assert {stop["building_id"] for stop in stops} == {str(floor.building_id)}
 
 
+async def test_route_stop_carries_floor_id(client: TestClient, db_session: AsyncSession) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points)
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    stops = client.get("/routes/me", headers=_auth(token)).json()["route"]["stops"]
+
+    assert {stop["floor_id"] for stop in stops} == {str(points[0].floor_id)}
+
+
 async def test_route_stop_done_at_is_checkout_time(
     client: TestClient, db_session: AsyncSession
 ) -> None:
