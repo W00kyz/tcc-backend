@@ -21,6 +21,15 @@ def point_location(building: Building) -> tuple[float, float] | None:
     return latitude, longitude
 
 
+async def floor_location(db: AsyncSession, floor: Floor) -> tuple[float, float] | None:
+    """(latitude, longitude) a point of `floor` takes: its building's, None without an outline.
+
+    Example: ``location = await floor_location(db, floor)``
+    """
+    building = await db.get(Building, floor.building_id)
+    return None if building is None else point_location(building)
+
+
 async def place_points_of_building(db: AsyncSession, building: Building) -> None:
     """Moves every point of `building` to its outline's centre (after a redraw).
 

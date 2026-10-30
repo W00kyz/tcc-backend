@@ -23,6 +23,7 @@ from app.api.notifications import router as notifications_router
 from app.api.public import router as public_router
 from app.api.qr_codes import router as qr_codes_router
 from app.api.reports import reports_router
+from app.api.rooms import router as rooms_router
 from app.api.routes import router as routes_router
 from app.api.service_points import router as service_points_router
 from app.api.service_types import router as service_types_router
@@ -165,6 +166,7 @@ def create_app(
     app.include_router(field_workers_router)
     app.include_router(buildings_router)
     app.include_router(floors_router)
+    app.include_router(rooms_router)
     app.include_router(service_points_router)
     app.include_router(qr_codes_router)
     app.include_router(settings_router)
