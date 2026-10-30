@@ -250,6 +250,40 @@ async def test_renaming_a_room_renames_its_points(
     assert [entry.entity_type for entry in entries] == ["room"]
 
 
+async def test_renaming_a_room_renames_all_of_its_points(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    setup = await _setup(client, db_session)
+    room = _create(client, setup, setup.ground)
+    garden = await _second_type(db_session)
+    await db_session.commit()
+    client.post(
+        f"/rooms/{room['id']}/services",
+        json={"service_type_id": str(garden.id)},
+        headers=setup.headers,
+    )
+
+    client.patch(f"/rooms/{room['id']}", json={"name": "Sala de aula"}, headers=setup.headers)
+
+    db_session.expire_all()
+    assert [point.name for point in await _points(db_session)] == ["Sala de aula"] * 2
+
+
+async def test_a_room_name_longer_than_200_characters_is_a_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    setup = await _setup(client, db_session)
+
+    too_long = client.post(
+        "/rooms",
+        json={"floor_id": str(setup.ground.id), "name": "a" * 201},
+        headers=setup.headers,
+    )
+
+    assert too_long.status_code == 422
+    assert _create(client, setup, setup.ground, name="a" * 200)["name"] == "a" * 200
+
+
 async def test_renaming_to_a_name_in_use_is_a_409(
     client: TestClient, db_session: AsyncSession
 ) -> None:

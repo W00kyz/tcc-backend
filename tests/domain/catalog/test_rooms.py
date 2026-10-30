@@ -31,3 +31,9 @@ def test_the_hundredth_numbered_room_needs_a_name() -> None:
 
     with pytest.raises(RoomLimitReached):
         next_room_name(0, full)
+
+
+def test_the_ninety_ninth_numbered_room_is_still_allowed() -> None:
+    used = [str(100 + number) for number in range(1, 99)]
+
+    assert next_room_name(0, used) == "199"

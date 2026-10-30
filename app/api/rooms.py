@@ -35,7 +35,7 @@ class RoomOut(BaseModel):
 class RoomCreateRequest(BaseModel):
     floor_id: UUID
     # Omitted or blank, the server numbers the room by its floor ("101", "102", ...).
-    name: str | None = None
+    name: Annotated[str, StringConstraints(max_length=200)] | None = None
     with_cleaning: bool = True
 
 
