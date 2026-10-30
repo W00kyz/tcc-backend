@@ -189,7 +189,7 @@ async def test_a_point_can_be_switched_off_and_on_again(
 
     off = client.patch(
         f"/service-points/{point_id}",
-        json={"name": "Sala 101", "description": "Aula", "active": False},
+        json={"active": False},
         headers=headers,
     )
     assert off.status_code == 200, off.text
@@ -204,10 +204,11 @@ async def test_a_point_can_be_switched_off_and_on_again(
 
     on = client.patch(
         f"/service-points/{point_id}",
-        json={"name": "Sala 102", "description": "Aula", "active": True},
+        json={"active": True},
         headers=headers,
     )
     assert on.json()["active"] is True
+    assert (on.json()["name"], on.json()["description"]) == ("Sala 102", "Aula")
 
     trails = list(
         await db_session.scalars(
@@ -225,6 +226,28 @@ async def test_a_point_can_be_switched_off_and_on_again(
         (False, False),
         (False, True),
     ]
+
+
+async def test_switching_a_point_leaves_name_and_description_untouched(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor, service_type = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+    headers = {"Authorization": f"Bearer {token}"}
+    point_id = _create_point(client, token, floor.id, service_type.id).json()["id"]
+
+    off = client.patch(f"/service-points/{point_id}", json={"active": False}, headers=headers)
+
+    assert off.status_code == 200, off.text
+    assert (off.json()["name"], off.json()["description"]) == ("Sala 101", "Aula")
+    assert off.json()["active"] is False
+    trail = await db_session.scalar(
+        select(AuditTrail).where(
+            AuditTrail.entity_id == uuid.UUID(point_id), AuditTrail.action == "update"
+        )
+    )
+    assert trail is not None
+    assert trail.before_data == {**(trail.after_data or {}), "active": True}
 
 
 async def test_the_events_endpoints_are_gone(client: TestClient, db_session: AsyncSession) -> None:

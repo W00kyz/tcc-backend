@@ -269,6 +269,27 @@ async def test_renaming_a_room_renames_all_of_its_points(
     assert [point.name for point in await _points(db_session)] == ["Sala de aula"] * 2
 
 
+async def test_a_stale_name_sent_to_a_room_point_does_not_overwrite_the_room_name(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    setup = await _setup(client, db_session)
+    room = _create(client, setup, setup.ground, name="Sala nova")
+    point = (await _points(db_session))[0]
+
+    response = client.patch(
+        f"/service-points/{point.id}",
+        json={"name": "Nome antigo", "description": "Observação", "active": False},
+        headers=setup.headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == room["name"] == "Sala nova"
+    assert response.json()["description"] == "Observação"
+    assert response.json()["active"] is False
+    db_session.expire_all()
+    assert [p.name for p in await _points(db_session)] == ["Sala nova"]
+
+
 async def test_a_room_name_longer_than_200_characters_is_a_422(
     client: TestClient, db_session: AsyncSession
 ) -> None:

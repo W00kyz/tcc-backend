@@ -53,8 +53,10 @@ class ServicePointCreateRequest(BaseModel):
 class ServicePointUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str
-    description: str
+    # None leaves them as they are, so a switch-off need not resend a possibly stale copy. A room's
+    # point ignores `name`: it always follows its room (renamed through PATCH /rooms/{id}).
+    name: str | None = None
+    description: str | None = None
     # Optional so a rename does not have to resend it; a point can only change type, never lose it.
     service_type_id: UUID | None = None
     # None leaves it as is; False takes the point out of new allocations and the expected set.
@@ -148,8 +150,10 @@ async def update_service_point(
         point.service_type = await require_service_type(db, body.service_type_id)
     else:
         await db.refresh(point, ["service_type"])
-    point.name = body.name
-    point.description = body.description
+    if body.name is not None and point.room_id is None:
+        point.name = body.name
+    if body.description is not None:
+        point.description = body.description
     if body.active is not None:
         point.active = body.active
     await record_audit_trail(
