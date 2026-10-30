@@ -5,11 +5,11 @@
 exception), so this router neither opens one nor records an audit trail. It only maps the
 domain's refusals to HTTP; `_refusal` is the one place they pass through."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,7 @@ from app.api._execution_common import (
 )
 from app.api.deps import ApprovedWorker, CampusToday, Now
 from app.db.session import get_db
+from app.domain.catalog.models import FieldWorker
 from app.domain.execution.location_completion import (
     LocationRequired,
     NotALocationStop,
@@ -28,7 +29,9 @@ from app.domain.execution.location_completion import (
     StopAlreadyDone,
     complete_by_location,
 )
+from app.domain.execution.refusal_alert import record_completion_refusal
 from app.domain.execution.service import RouteNotStarted, StopNotAssignedToWorker, StopReleased
+from app.domain.routing.models import RouteStop
 from app.domain.settings.service import get_settings_row
 
 router = APIRouter(prefix="/location-completions", tags=["execution"])
@@ -82,9 +85,38 @@ def _unprocessable(code: str, detail: str, **extra: float) -> HTTPException:
     )
 
 
+async def _alert_and_commit(
+    db: AsyncSession,
+    exc: LocationRequired | OutOfRadius,
+    *,
+    stop_id: UUID,
+    worker: FieldWorker,
+    radius_m: int,
+    today: date,
+    request: Request,
+) -> None:
+    """Warn the managers of a refused completion and commit *before* the 422 goes out: the
+    refusal rolls nothing back, so the alert (and the stop's row lock) is settled here. The stop
+    stays PENDING with no execution."""
+    stop = await db.get(RouteStop, stop_id)
+    assert stop is not None  # the domain just loaded it
+    await record_completion_refusal(
+        db,
+        stop=stop,
+        worker=worker,
+        reason="OUT_OF_RADIUS" if isinstance(exc, OutOfRadius) else "LOCATION_REQUIRED",
+        distance_m=exc.distance_m if isinstance(exc, OutOfRadius) else None,
+        radius_m=radius_m,
+        campus_day=today,
+        push=request.app.state.push_sender,
+    )
+    await db.commit()
+
+
 @router.post("", response_model=LocationCompletionResponse, status_code=status.HTTP_201_CREATED)
 async def create_location_completion(
     body: LocationCompletionRequest,
+    request: Request,
     worker: ApprovedWorker,
     db: Annotated[AsyncSession, Depends(get_db)],
     today: CampusToday,
@@ -130,6 +162,16 @@ async def create_location_completion(
         # Every refusal passes here: the one place to record an alert before answering.
         refusal = _refusal(exc)
         assert refusal is not None
+        if isinstance(exc, LocationRequired | OutOfRadius):
+            await _alert_and_commit(
+                db,
+                exc,
+                stop_id=body.route_stop_id,
+                worker=worker,
+                radius_m=radius_m,
+                today=today,
+                request=request,
+            )
         raise refusal from exc
 
     assert execution.checked_out_at is not None

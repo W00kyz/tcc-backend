@@ -2,8 +2,8 @@
 of `point_day_rows` so the report's filters narrow them too.
 
 - An **execution** belongs to the point-day of its stop (point, `service_date`).
-- An **alert on a stop** (NO_EVIDENCE, POINT_IMPEDED of one stop, APPEAL_FILED) belongs to the
-  point-day of that stop.
+- An **alert on a stop** (NO_EVIDENCE, POINT_IMPEDED of one stop, APPEAL_FILED,
+  COMPLETION_REFUSED) belongs to the point-day of that stop.
   The caller counts both only for the point-days its filters kept. Narrowed to a worker, only
   that worker's executions and the alerts on their own stops count.
 - An **alert on a route without a stop** (BATCH_RELEASED, a rest-of-route POINT_IMPEDED) has no

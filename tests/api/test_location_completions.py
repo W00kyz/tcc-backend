@@ -9,7 +9,8 @@ from datetime import UTC, datetime
 
 from app.domain.catalog.models import ServicePoint
 from app.domain.execution.models import Execution, ExecutionReviewStatus, QrScan
-from app.domain.identity.models import UserRole
+from app.domain.identity.models import User, UserRole
+from app.domain.monitoring.models import Alert, AlertKind, AlertRule, AlertStatus, Notification
 from app.domain.routing.models import ReleaseReason, Route, RouteStop, RouteStopStatus
 from app.domain.settings.service import get_settings_row
 from fastapi.testclient import TestClient
@@ -318,3 +319,101 @@ async def test_photos_uploaded_afterwards_clear_the_evidence_flag(
     second = _upload_photo(client, token, execution_id, _PHOTO_BYTES, _PHOTO_SHA)
     assert second.status_code == 201, second.text
     assert await flags_and_review() == ([], ExecutionReviewStatus.NONE)
+
+
+async def test_a_refused_far_completion_alerts_the_managers_and_survives_the_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seed = await _seed(db_session)
+    await _add_user(db_session, "gestor@ufcg.edu.br", UserRole.MANAGER)
+    manager = await db_session.scalar(select(User).where(User.email == "gestor@ufcg.edu.br"))
+    assert manager is not None
+    token = _login(client, _WORKER_EMAIL)
+
+    response = _post(client, token, _body(seed.stop, latitude=_LAT + 120 * _DEGREES_PER_METRE))
+
+    assert response.status_code == 422, response.text
+    alert = await db_session.scalar(select(Alert))
+    assert alert is not None
+    assert alert.kind is AlertKind.COMPLETION_REFUSED
+    assert alert.status is AlertStatus.OPEN
+    assert alert.route_stop_id == seed.stop.id
+    assert alert.route_id == seed.route.id
+    assert alert.field_worker_id == seed.route.field_worker_id
+    assert "a 120 m do local (limite 50 m)" in alert.description
+    notification = await db_session.scalar(select(Notification))
+    assert notification is not None
+    assert notification.user_id == manager.id
+    assert notification.body == alert.description
+    await db_session.refresh(seed.stop)
+    assert seed.stop.status is RouteStopStatus.PENDING
+    assert await _count(db_session, Execution) == 0
+
+
+async def test_a_second_refusal_the_same_day_keeps_one_alert(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seed = await _seed(db_session)
+    await _add_user(db_session, "gestor@ufcg.edu.br", UserRole.MANAGER)
+    token = _login(client, _WORKER_EMAIL)
+    far = _LAT + 120 * _DEGREES_PER_METRE
+
+    first = _post(client, token, _body(seed.stop, latitude=far))
+    second = _post(client, token, _body(seed.stop, latitude=far + 30 * _DEGREES_PER_METRE))
+
+    assert first.status_code == second.status_code == 422
+    assert await _count(db_session, Alert) == 1
+    assert await _count(db_session, Notification) == 1
+
+
+async def test_a_refusal_without_a_position_uses_the_location_required_wording(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seed = await _seed(db_session)
+    token = _login(client, _WORKER_EMAIL)
+
+    response = _post(client, token, _body(seed.stop, latitude=None, longitude=None))
+
+    assert response.status_code == 422, response.text
+    alert = await db_session.scalar(select(Alert))
+    assert alert is not None
+    assert alert.description.endswith("sem localização ativa.")
+
+
+async def test_with_the_rule_off_the_refusal_is_still_422_but_raises_no_alert(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seed = await _seed(db_session)
+    await _add_user(db_session, "gestor@ufcg.edu.br", UserRole.MANAGER)
+    await db_session.merge(AlertRule(rule_kind=AlertKind.COMPLETION_REFUSED, enabled=False))
+    await db_session.commit()
+    token = _login(client, _WORKER_EMAIL)
+
+    response = _post(client, token, _body(seed.stop, latitude=_LAT + 120 * _DEGREES_PER_METRE))
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "OUT_OF_RADIUS"
+    assert await _count(db_session, Alert) == 0
+    assert await _count(db_session, Notification) == 0
+
+
+async def test_an_accepted_completion_raises_no_alert(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seed = await _seed(db_session)
+    token = _login(client, _WORKER_EMAIL)
+
+    response = _post(client, token, _body(seed.stop))
+
+    assert response.status_code == 201, response.text
+    assert await _count(db_session, Alert) == 0
+
+
+async def test_other_refusals_raise_no_alert(client: TestClient, db_session: AsyncSession) -> None:
+    seed = await _seed(db_session, building_stop=True)
+    token = _login(client, _WORKER_EMAIL)
+
+    response = _post(client, token, _body(seed.stop))
+
+    assert response.status_code == 422, response.text
+    assert await _count(db_session, Alert) == 0

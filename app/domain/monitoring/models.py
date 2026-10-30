@@ -37,11 +37,14 @@ class AlertKind(enum.StrEnum):
     # BATCH_RELEASED: a worker's batch was released (left campus / location silence).
     # POINTS_UNSERVED: the workday ended with points not served (one per day, no route).
     # APPEAL_FILED: a worker contested a released stop.
+    # COMPLETION_REFUSED: a completion by location was refused (no fix, or out of radius).
+    # IMPORTANT: new kinds go LAST — `_RULE_AUDIT_IDS` numbers the rules by member order.
     NO_EVIDENCE = "NO_EVIDENCE"
     POINT_IMPEDED = "POINT_IMPEDED"
     BATCH_RELEASED = "BATCH_RELEASED"
     POINTS_UNSERVED = "POINTS_UNSERVED"
     APPEAL_FILED = "APPEAL_FILED"
+    COMPLETION_REFUSED = "COMPLETION_REFUSED"
 
 
 class AlertSeverity(enum.StrEnum):

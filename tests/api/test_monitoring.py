@@ -418,6 +418,7 @@ async def test_get_alert_rules_returns_one_row_per_kind(
         "BATCH_RELEASED",
         "POINTS_UNSERVED",
         "APPEAL_FILED",
+        "COMPLETION_REFUSED",
     }
     assert all(row["enabled"] for row in response.json())
 
@@ -495,3 +496,19 @@ async def test_patch_alert_rule_rejects_a_negative_threshold(
     )
 
     assert response.status_code == 422
+
+
+async def test_the_completion_refused_rule_can_be_switched_off(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed_actors(db_session)
+    await db_session.commit()
+    token = _login(client, fx.manager.email)
+
+    off = client.patch(
+        "/alert-rules/COMPLETION_REFUSED", json={"enabled": False}, headers=_auth(token)
+    )
+
+    assert off.status_code == 200, off.text
+    assert off.json()["rule_kind"] == "COMPLETION_REFUSED"
+    assert off.json()["enabled"] is False

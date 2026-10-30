@@ -28,6 +28,7 @@ _ALERT_TITLE_PT_BR: dict[AlertKind, str] = {
     AlertKind.BATCH_RELEASED: "Pontos liberados",
     AlertKind.POINTS_UNSERVED: "Pontos não atendidos",
     AlertKind.APPEAL_FILED: "Novo recurso",
+    AlertKind.COMPLETION_REFUSED: "Conclusão recusada",
 }
 
 
@@ -153,6 +154,27 @@ async def notify_appeal_filed(
         title=_ALERT_TITLE_PT_BR[AlertKind.APPEAL_FILED],
         body=description,
         data={"appeal_id": str(appeal_id)},
+        push=push,
+    )
+
+
+async def notify_completion_refused(
+    db: AsyncSession, *, alert: Alert, push: PushSender
+) -> list[Notification]:
+    """Tell every active manager that a completion by location was refused, whether or not
+    the stop already had its alert resolved — the caller only asks for a freshly created one.
+    Same audience and reasoning as `notify_appeal_filed`; the payload is an alert's, so the
+    dashboard opens it like any other. Flush, never commit.
+
+        await notify_completion_refused(db, alert=alert, push=push)
+    """
+    return await notify_users(
+        db,
+        user_ids=await _manager_ids(db),
+        kind="ALERT",
+        title=_ALERT_TITLE_PT_BR[AlertKind.COMPLETION_REFUSED],
+        body=alert.description,
+        data=_alert_data(alert),
         push=push,
     )
 
