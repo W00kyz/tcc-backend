@@ -112,9 +112,24 @@ class Floor(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     building_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("buildings.id"))
     label: Mapped[str] = mapped_column(String(100))
+    # Vertical position of the floor in the building (0 = Térreo, negative = below ground),
+    # used to order floors. Deliberately not unique: the label is what identifies a floor.
+    level: Mapped[int] = mapped_column(default=0, server_default=text("0"))
     # Task 8: lets the QR sheet PDF endpoint read floor.building.name via selectinload,
     # without a second query.
     building: Mapped["Building"] = relationship()
+
+
+class Room(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A room of a floor (spec 2026-10-29-andares-salas §4). The service points of the room
+    hang off it; the name is unique within the floor."""
+
+    __tablename__ = "rooms"
+    __table_args__ = (UniqueConstraint("floor_id", "name"),)
+
+    floor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("floors.id"))
+    name: Mapped[str] = mapped_column(String(200))
+    floor: Mapped["Floor"] = relationship()
 
 
 class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -137,3 +152,11 @@ class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("service_types.id"), nullable=True
     )
     service_type: Mapped["ServiceType | None"] = relationship()
+    # Nullable in the database only for rows written before rooms existed; the migration
+    # backfills one room per existing point.
+    room_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rooms.id"), nullable=True
+    )
+    room: Mapped["Room | None"] = relationship()
+    # A deactivated point leaves every worker's pool but keeps its execution history.
+    active: Mapped[bool] = mapped_column(default=True, server_default=text("true"))

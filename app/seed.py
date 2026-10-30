@@ -20,6 +20,7 @@ from app.domain.catalog.models import (
     FieldWorker,
     FieldWorkerStatus,
     Floor,
+    Room,
     ServicePoint,
     ServiceType,
 )
@@ -85,7 +86,7 @@ async def seed() -> None:
         building = Building(
             name="Bloco CI",
             campus_area="Centro de Ciências e Tecnologia",
-            # Every building is registered with its outline (a rectangle around Sala 101).
+            # Every building is registered with its outline (a rectangle around room 101).
             footprint=_BLOCO_CI_OUTLINE,
             footprint_source="drawn",
         )
@@ -101,13 +102,18 @@ async def seed() -> None:
         db.add(service_type)
         await db.flush()
 
-        floor = Floor(building_id=building.id, label="Térreo")
+        floor = Floor(building_id=building.id, label="Térreo", level=0)
         db.add(floor)
+        await db.flush()
+
+        room = Room(floor_id=floor.id, name="101")
+        db.add(room)
         await db.flush()
 
         point = ServicePoint(
             floor_id=floor.id,
-            name="Sala 101",
+            room_id=room.id,
+            name="101",
             description="Sala de aula",
             latitude=-7.2195,
             longitude=-35.9105,
