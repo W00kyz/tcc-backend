@@ -2,6 +2,7 @@ import uuid
 
 import pytest
 from app.core.security import hash_password
+from app.domain.audit.models import AuditTrail
 from app.domain.catalog.models import (
     Building,
     ContractorCompany,
@@ -12,6 +13,7 @@ from app.domain.catalog.models import (
 from app.domain.identity.models import User, UserRole
 from fastapi.testclient import TestClient
 from httpx2 import Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -174,6 +176,55 @@ async def test_editing_a_point_changes_only_its_name_and_description(
     assert response.status_code == 200, response.text
     assert response.json()["name"] == "Sala 102"
     assert response.json()["latitude"] == pytest.approx(-7.2145)
+
+
+async def test_a_point_can_be_switched_off_and_on_again(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, floor, service_type = await _seed_floor(db_session)
+    token = _login(client, manager.email)
+    headers = {"Authorization": f"Bearer {token}"}
+    point_id = _create_point(client, token, floor.id, service_type.id).json()["id"]
+    assert client.get(f"/service-points?floor_id={floor.id}", headers=headers).json()[0]["active"]
+
+    off = client.patch(
+        f"/service-points/{point_id}",
+        json={"name": "Sala 101", "description": "Aula", "active": False},
+        headers=headers,
+    )
+    assert off.status_code == 200, off.text
+    assert off.json()["active"] is False
+
+    renamed = client.patch(
+        f"/service-points/{point_id}",
+        json={"name": "Sala 102", "description": "Aula"},
+        headers=headers,
+    )
+    assert renamed.json()["active"] is False  # omitting `active` leaves it alone
+
+    on = client.patch(
+        f"/service-points/{point_id}",
+        json={"name": "Sala 102", "description": "Aula", "active": True},
+        headers=headers,
+    )
+    assert on.json()["active"] is True
+
+    trails = list(
+        await db_session.scalars(
+            select(AuditTrail)
+            .where(AuditTrail.entity_id == uuid.UUID(point_id), AuditTrail.action == "update")
+            .order_by(AuditTrail.created_at)
+        )
+    )
+    assert [
+        (t.before_data["active"], t.after_data["active"])
+        for t in trails
+        if t.before_data and t.after_data
+    ] == [
+        (True, False),
+        (False, False),
+        (False, True),
+    ]
 
 
 async def test_the_events_endpoints_are_gone(client: TestClient, db_session: AsyncSession) -> None:

@@ -123,8 +123,8 @@ async def free_points(
     db: AsyncSession, *, company_id: uuid.UUID, day: date, exclude_point_ids: set[uuid.UUID]
 ) -> list[ServicePoint]:
     """The pool (spec §6.1): points whose service type belongs to `company_id` and that no stop
-    of `day` holds. A point without a type, or whose type has no company, is never in it. Comes
-    back with floor and building loaded, for the batch ordering.
+    of `day` holds. An inactive point, a point without a type and one whose type has no company
+    are never in it. Comes back with floor and building loaded, for the batch ordering.
 
         pool = await free_points(db, company_id=company.id, day=today, exclude_point_ids=set())
     """
@@ -136,7 +136,11 @@ async def free_points(
     stmt = (
         select(ServicePoint)
         .join(ServiceType, ServicePoint.service_type_id == ServiceType.id)
-        .where(ServiceType.contractor_company_id == company_id, ~taken)
+        .where(
+            ServiceType.contractor_company_id == company_id,
+            ServicePoint.active.is_(True),
+            ~taken,
+        )
         .options(
             contains_eager(ServicePoint.service_type),
             selectinload(ServicePoint.floor).selectinload(Floor.building),

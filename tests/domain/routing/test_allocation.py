@@ -28,6 +28,7 @@ from app.domain.routing.allocation import (
     NotAServiceDay,
     OutsideCampus,
     WorkdayOver,
+    free_points,
     next_batch,
     start_or_resume,
 )
@@ -254,6 +255,37 @@ async def test_only_points_of_the_worker_company_types(db_session: AsyncSession)
     result = await _start(db_session, worker, settings)
 
     assert _names(result.route.stops) == ["Sala"]
+
+
+async def test_an_inactive_point_is_not_in_the_pool_until_reactivated(
+    db_session: AsyncSession,
+) -> None:
+    own = await _company(db_session, "Limpa Tudo")
+    other = await _company(db_session, "Jardins SA")
+    mine, theirs = await _building(
+        db_session,
+        "Bloco A",
+        (-7.2150, -35.9095),
+        [("Térreo", "Sala 1"), ("Térreo", "Sala 2")],
+        None,
+    )
+    mine.service_type_id = own.service_type.id
+    theirs.service_type_id = other.service_type.id
+    mine.active = False
+    theirs.active = False
+    await db_session.flush()
+
+    async def pool(company: _Company) -> set[UUID]:
+        points = await free_points(
+            db_session, company_id=company.company.id, day=_TODAY, exclude_point_ids=set()
+        )
+        return {point.id for point in points}
+
+    assert await pool(own) == set()
+    mine.active = True
+    await db_session.flush()
+    assert await pool(own) == {mine.id}
+    assert await pool(other) == set()  # another company's inactive point stays out
 
 
 async def test_untyped_points_and_orphan_types_never_allocated(db_session: AsyncSession) -> None:

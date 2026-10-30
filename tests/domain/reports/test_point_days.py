@@ -10,7 +10,8 @@ import pytest
 from app.domain.appeals.models import Appeal, AppealReason, AppealStatus
 from app.domain.catalog.models import FieldWorker, Floor, ServicePoint, ServiceType
 from app.domain.reports.point_days import PointDay, point_day_rows
-from app.domain.routing.models import ReleaseReason, RouteStopStatus
+from app.domain.routing.models import ReleaseReason, RouteStop, RouteStopStatus
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.factories import make_points, make_route, make_service_type, make_worker
@@ -182,3 +183,23 @@ async def test_filters_narrow_the_rows(db_session: AsyncSession) -> None:
     assert await ids(building_id=floor.building_id) == {jardim.id}
     # A worker's rows are the point-days they held a stop for.
     assert await ids(field_worker_id=ana.id) == {sala_2.id}
+
+
+async def test_inactive_point_leaves_the_expected_set_but_keeps_its_history(
+    db_session: AsyncSession,
+) -> None:
+    service_type, (kept, switched_off) = await _typed_points(db_session, ["Sala 1", "Sala 2"])
+    ana = await _worker(db_session, service_type, "Ana")
+    route = await make_route(db_session, worker=ana, day=_TUE, points=[switched_off])
+    route.stops[0].status = RouteStopStatus.DONE
+    switched_off.active = False
+
+    rows = await _rows(db_session, _MON, _FRI)
+
+    assert {row.service_point_id for row in rows} == {kept.id}
+    stops = list(
+        await db_session.scalars(
+            select(RouteStop).where(RouteStop.service_point_id == switched_off.id)
+        )
+    )
+    assert [(stop.service_date, stop.status) for stop in stops] == [(_TUE, RouteStopStatus.DONE)]

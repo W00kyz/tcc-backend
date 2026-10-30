@@ -197,7 +197,7 @@ async def point_day_rows(
     building_id: uuid.UUID | None = None,
     field_worker_id: uuid.UUID | None = None,
 ) -> list[PointDay]:
-    """Every typed point on every service day of `date_from..date_to` it existed, ordered by
+    """Every active typed point on every service day of `date_from..date_to` it existed, ordered by
     day. The filters narrow by the point's company, type and building; `field_worker_id` keeps
     the point-days that worker held a stop for — each row still describes the whole point-day;
     `outcome_for` / `release_reasons_by` narrow it to the worker.
@@ -230,7 +230,7 @@ async def point_day_rows(
             facts,
             and_(facts.c.service_point_id == ServicePoint.id, facts.c.service_date == days.c.day),
         )
-        .where(campus_day_of(ServicePoint.created_at) <= days.c.day)
+        .where(ServicePoint.active.is_(True), campus_day_of(ServicePoint.created_at) <= days.c.day)
         .order_by(days.c.day, ServicePoint.id)
     )
     if company_id is not None:

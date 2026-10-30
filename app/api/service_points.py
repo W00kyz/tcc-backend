@@ -56,6 +56,8 @@ class ServicePointUpdateRequest(BaseModel):
     description: str
     # Optional so a rename does not have to resend it; a point can only change type, never lose it.
     service_type_id: UUID | None = None
+    # None leaves it as is; False takes the point out of new allocations and the expected set.
+    active: bool | None = None
 
 
 class DeletionImpactOut(BaseModel):
@@ -150,6 +152,7 @@ async def update_service_point(
         "name": point.name,
         "description": point.description,
         "service_type_id": str(point.service_type_id) if point.service_type_id else None,
+        "active": point.active,
     }
     if body.service_type_id is not None:
         point.service_type = await require_service_type(db, body.service_type_id)
@@ -157,6 +160,8 @@ async def update_service_point(
         await db.refresh(point, ["service_type"])
     point.name = body.name
     point.description = body.description
+    if body.active is not None:
+        point.active = body.active
     await record_audit_trail(
         db,
         actor_id=actor.id,
@@ -168,6 +173,7 @@ async def update_service_point(
             "name": point.name,
             "description": point.description,
             "service_type_id": str(point.service_type_id) if point.service_type_id else None,
+            "active": point.active,
         },
     )
     await db.commit()
