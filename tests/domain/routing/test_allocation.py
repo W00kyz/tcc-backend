@@ -45,7 +45,7 @@ from app.domain.settings.service import get_settings_row
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from tests.support.factories import make_worker
+from tests.support.factories import make_place_point, make_worker
 from tests.support.osrm import FakeOsrmClient
 
 # Tuesday 10:00 on campus (UTC-3).
@@ -326,6 +326,36 @@ async def test_batch_buildings_follow_the_osrm_trip_order(db_session: AsyncSessi
         "optimize_order",
         [(-35.9100, -7.2150), (-35.9095, -7.2150), (-35.9050, -7.2150)],
     )
+
+
+async def test_a_place_stop_is_its_own_group_among_the_buildings(
+    db_session: AsyncSession,
+) -> None:
+    own = await _company(db_session)
+    await _building(
+        db_session,
+        "Bloco A",
+        (-7.2150, -35.9095),
+        [("Térreo", "A1"), ("1º andar", "A2")],
+        own.service_type,
+    )
+    await make_place_point(
+        db_session, service_type=own.service_type, name="Jardim", at=(-7.2150, -35.9080)
+    )
+    await _building(
+        db_session, "Bloco B", (-7.2150, -35.9050), [("Térreo", "B1")], own.service_type
+    )
+    worker = await make_worker(db_session, company=own.company)
+    settings = await _settings(db_session)
+    # Groups reach OSRM in distance order: Bloco A (1), the place (2), Bloco B (3). It says walk
+    # Bloco B, then the place, then Bloco A.
+    osrm = FakeOsrmClient(order=[0, 3, 2, 1])
+
+    result = await _start(db_session, worker, settings, osrm=osrm)
+
+    # Inside Bloco A the floors sort by label ("1º andar" before "Térreo").
+    assert _names(result.route.stops) == ["B1", "Jardim", "A2", "A1"]
+    assert [stop.order_index for stop in result.route.stops] == [1, 2, 3, 4]
 
 
 async def test_osrm_down_falls_back_to_distance_order(db_session: AsyncSession) -> None:

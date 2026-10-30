@@ -33,9 +33,10 @@ from app.domain.execution.models import (
 )
 from app.domain.qr.models import QrCode
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_worker
+from tests.support.factories import make_place_point, make_worker
 
 # Anchored to a fixed noon so every relative offset below (-1h, -25h) lands on its
 # intended UTC calendar day no matter the wall-clock time the suite runs at — a bare
@@ -263,6 +264,62 @@ async def test_filter_by_building(db_session: AsyncSession) -> None:
 
     assert total == 2
     assert {r.execution_id for r in rows} == {world.exec_today_a, world.exec_appeal_a}
+
+
+async def _execution_at_a_place(db: AsyncSession, world: _World) -> uuid.UUID:
+    point = await make_place_point(db, service_type=None, name="Jardim", place_name="Praça central")
+    route_id = await db.scalar(select(Route.id).where(Route.field_worker_id == world.worker_a))
+    assert route_id is not None
+    execution_id, _ = await _execution(
+        db,
+        worker_id=world.worker_a,
+        route_id=route_id,
+        point_id=point.id,
+        checked_in_at=_NOW - timedelta(minutes=30),
+        source=ExecutionSource.APP,
+        review_status=ExecutionReviewStatus.NONE,
+    )
+    return execution_id
+
+
+async def test_an_execution_at_a_place_is_listed_with_the_place_and_no_building(
+    db_session: AsyncSession,
+) -> None:
+    world = await _seed_world(db_session)
+    at_place = await _execution_at_a_place(db_session, world)
+
+    rows, total = await list_executions(db_session, ExecutionFilters(), page=1, page_size=50)
+
+    assert total == 4
+    row = next(r for r in rows if r.execution_id == at_place)
+    assert (row.building_id, row.building_name, row.floor_label) == (None, "Praça central", None)
+    assert row.service_point_name == "Jardim"
+
+
+async def test_an_execution_at_a_place_has_a_detail(db_session: AsyncSession) -> None:
+    world = await _seed_world(db_session)
+    at_place = await _execution_at_a_place(db_session, world)
+
+    detail = await get_execution_detail(db_session, at_place)
+
+    assert detail is not None
+    assert detail.execution.building_id is None
+    assert detail.execution.building_name == "Praça central"
+    assert detail.execution.floor_label is None
+
+
+async def test_a_building_filter_leaves_out_the_executions_at_places(
+    db_session: AsyncSession,
+) -> None:
+    world = await _seed_world(db_session)
+    at_place = await _execution_at_a_place(db_session, world)
+
+    rows, total = await list_executions(
+        db_session, ExecutionFilters(building_id=world.building_a), page=1, page_size=50
+    )
+
+    assert total == 2
+    assert at_place not in {r.execution_id for r in rows}
 
 
 async def test_filter_by_service_point(db_session: AsyncSession) -> None:

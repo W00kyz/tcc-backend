@@ -44,9 +44,11 @@ class ExecutionListItem(BaseModel):
     field_worker_name: str
     service_point_id: UUID
     service_point_name: str
-    building_id: UUID
+    # Null building id and floor label for an execution at an outdoor place, whose name stands
+    # in `building_name`.
+    building_id: UUID | None
     building_name: str
-    floor_label: str
+    floor_label: str | None
     checked_in_at: datetime
     checked_out_at: datetime | None
     geo_validation: str | None

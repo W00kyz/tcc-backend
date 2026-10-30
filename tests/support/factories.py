@@ -14,6 +14,7 @@ from app.domain.catalog.models import (
     FieldWorker,
     FieldWorkerStatus,
     Floor,
+    Place,
     ServicePoint,
     ServiceType,
 )
@@ -214,6 +215,35 @@ async def make_points(
     db.add_all(points)
     await db.flush()
     return points
+
+
+async def make_place_point(
+    db: AsyncSession,
+    *,
+    service_type: ServiceType | None,
+    name: str,
+    place_name: str = "Praça central",
+    at: tuple[float, float] = ON_CAMPUS,
+) -> ServicePoint:
+    """An outdoor place at `at` holding one point (no floor, no room) of `service_type`. Flushes,
+    never commits; `point.place` comes back loaded.
+
+        point = await make_place_point(db, service_type=service_type, name="Jardim")
+    """
+    place = Place(name=place_name, latitude=at[0], longitude=at[1])
+    db.add(place)
+    await db.flush()
+    point = ServicePoint(
+        place=place,
+        name=name,
+        description="Área externa",
+        latitude=at[0],
+        longitude=at[1],
+        service_type_id=service_type.id if service_type is not None else None,
+    )
+    db.add(point)
+    await db.flush()
+    return point
 
 
 async def make_check_in(

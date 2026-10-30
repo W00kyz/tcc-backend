@@ -66,7 +66,8 @@ class PointDay:
     service_point_id: uuid.UUID
     service_type_id: uuid.UUID
     company_id: uuid.UUID
-    building_id: uuid.UUID
+    # Null for a point at an outdoor place: it counts everywhere except under a building filter.
+    building_id: uuid.UUID | None
     outcome: PointDayOutcome
     # The worker of the DONE stop, else the one whose appeal was accepted; None when unserved.
     done_by: uuid.UUID | None
@@ -225,7 +226,7 @@ async def point_day_rows(
         .join(ServicePoint, true())
         .join(ServiceType, ServicePoint.service_type_id == ServiceType.id)
         .join(ContractorCompany, ServiceType.contractor_company_id == ContractorCompany.id)
-        .join(Floor, ServicePoint.floor_id == Floor.id)
+        .outerjoin(Floor, ServicePoint.floor_id == Floor.id)
         .outerjoin(
             facts,
             and_(facts.c.service_point_id == ServicePoint.id, facts.c.service_date == days.c.day),
@@ -250,7 +251,7 @@ def _to_point_day(
         uuid.UUID,
         uuid.UUID,
         uuid.UUID,
-        uuid.UUID,
+        uuid.UUID | None,
         list[uuid.UUID] | None,
         list[uuid.UUID] | None,
         list[str] | None,

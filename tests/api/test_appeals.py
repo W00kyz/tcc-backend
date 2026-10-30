@@ -24,7 +24,13 @@ from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_points, make_route, make_service_type, make_worker
+from tests.support.factories import (
+    make_place_point,
+    make_points,
+    make_route,
+    make_service_type,
+    make_worker,
+)
 
 _PASSWORD = "senha-forte-o-suficiente"
 # Tuesday 10:00 on campus (UTC-3).
@@ -240,6 +246,54 @@ async def test_manager_lists_pending_first_and_filters(
     # Nobody has decided a pending appeal yet.
     assert pending.json()[0]["reviewed_by_name"] is None
     assert rejected.json() == []
+
+
+async def _release_a_place_stop(db: AsyncSession, seeded: _Seeded) -> RouteStop:
+    """A stop of an outdoor place on a second route of the worker, released like the others."""
+    point = await make_place_point(db, service_type=None, name="Jardim", place_name="Praça central")
+    route = await make_route(
+        db, worker=seeded.worker, day=campus_today(_NOW) - timedelta(days=1), points=[point]
+    )
+    route.status = RouteStatus.PAUSED
+    _release(route.stops[0], ReleaseReason.LEFT_CAMPUS)
+    await db.commit()
+    return route.stops[0]
+
+
+async def test_a_released_place_stop_is_eligible_under_the_place_name(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seeded = await _seed(db_session)
+    stop = await _release_a_place_stop(db_session, seeded)
+    _freeze(client)
+
+    response = client.get("/appeals/eligible", headers=_auth(client, _WORKER_EMAIL))
+
+    assert response.status_code == 200, response.text
+    [row] = [row for row in response.json() if row["route_stop_id"] == str(stop.id)]
+    assert (row["service_point_name"], row["building_name"]) == ("Jardim", "Praça central")
+    assert row["floor_label"] is None
+
+
+async def test_an_appeal_on_a_place_stop_names_the_place(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seeded = await _seed(db_session)
+    stop = await _release_a_place_stop(db_session, seeded)
+    _freeze(client)
+    filed = _file(client, stop.id)
+    assert filed.status_code == 201, filed.text
+
+    manager = _auth(client, _MANAGER_EMAIL)
+    mine = client.get("/appeals/mine", headers=_auth(client, _WORKER_EMAIL))
+    listed = client.get("/appeals", headers=manager)
+    accepted = client.post(f"/appeals/{filed.json()['id']}/accept", json={}, headers=manager)
+
+    assert filed.json()["building_name"] == "Praça central"
+    assert [a["building_name"] for a in mine.json()] == ["Praça central"]
+    assert [a["building_name"] for a in listed.json()] == ["Praça central"]
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["building_name"] == "Praça central"
 
 
 async def test_workers_cannot_review(client: TestClient, db_session: AsyncSession) -> None:

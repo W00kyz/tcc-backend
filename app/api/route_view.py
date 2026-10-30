@@ -3,6 +3,7 @@ the field-worker feed (`app.api.routes`). Mobile and the dashboard consume the s
 shape so a route looks identical on both (Task 7)."""
 
 from datetime import date, datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -11,17 +12,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.domain.catalog.models import Floor, ServicePoint
+from app.domain.catalog.sites import site_of
 from app.domain.routing.models import ReleaseReason, Route, RouteStop
 from app.domain.routing.service import routing_degraded
 
 # One eager-load recipe shared by every read: RouteOut needs the stop's service point down to
-# its building, the route's field worker, and the stop's service type so `service_type_name`
-# resolves without a lazy load under async.
+# its building or place, the route's field worker, and the stop's service type so
+# `service_type_name` resolves without a lazy load under async.
 _ROUTE_LOADERS = (
     selectinload(Route.stops)
     .selectinload(RouteStop.service_point)
     .selectinload(ServicePoint.floor)
     .selectinload(Floor.building),
+    selectinload(Route.stops)
+    .selectinload(RouteStop.service_point)
+    .selectinload(ServicePoint.place),
     selectinload(Route.field_worker),
     selectinload(Route.stops).selectinload(RouteStop.service_type),
     # One extra IN query for the whole route, so `done_at` costs no per-stop lazy load.
@@ -38,13 +43,17 @@ class RouteStopOut(BaseModel):
     # Why a RELEASED stop went back to the pool; null for every other status.
     release_reason: ReleaseReason | None
     service_point_id: UUID
-    # Lets the app match a scanned floor QR to its tasks.
-    floor_id: UUID
+    # Lets the app match a scanned floor QR to its tasks; null for a stop in an outdoor place.
+    floor_id: UUID | None
     service_point_name: str
-    floor_label: str
+    floor_label: str | None
+    # The building's name, or the place's for a stop outdoors: the one name the app displays.
     building_name: str
-    # Lets the app group a batch's stops by building.
-    building_id: UUID
+    # Lets the app group a batch's stops by building; null for a stop in an outdoor place.
+    building_id: UUID | None
+    place_id: UUID | None
+    # How the stop is finished: a floor QR scan, or the worker's position at a place (no QR).
+    completion: Literal["QR", "LOCATION"]
     latitude: float
     longitude: float
     distance_from_prev_m: float | None
@@ -79,7 +88,7 @@ class RouteOut(BaseModel):
 
 def _to_stop_out(stop: RouteStop) -> RouteStopOut:
     point = stop.service_point
-    assert point.floor is not None  # TODO(task-3): place stops have no floor
+    site = site_of(point)
     return RouteStopOut(
         id=stop.id,
         order_index=stop.order_index,
@@ -87,11 +96,13 @@ def _to_stop_out(stop: RouteStop) -> RouteStopOut:
         status=stop.status.value,
         release_reason=stop.release_reason,
         service_point_id=point.id,
-        floor_id=point.floor_id,
+        floor_id=site.floor_id,
         service_point_name=point.name,
-        floor_label=point.floor.label,
-        building_name=point.floor.building.name,
-        building_id=point.floor.building.id,
+        floor_label=site.floor_label,
+        building_name=site.name,
+        building_id=site.site_id if site.kind == "BUILDING" else None,
+        place_id=site.site_id if site.kind == "PLACE" else None,
+        completion="LOCATION" if site.kind == "PLACE" else "QR",
         latitude=point.latitude,
         longitude=point.longitude,
         distance_from_prev_m=stop.distance_from_prev_m,

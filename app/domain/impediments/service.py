@@ -153,13 +153,17 @@ async def _raise_point_impeded(
     await db.flush()
 
 
-# Everything the manager's list shows: the worker, and the point and building of a STOP report.
+# Everything the manager's list shows: the worker, and the point with its building or place of a
+# STOP report.
 _LIST_OPTIONS = (
     selectinload(Impediment.reported_by_worker),
     selectinload(Impediment.route_stop)
     .selectinload(RouteStop.service_point)
     .selectinload(ServicePoint.floor)
     .selectinload(Floor.building),
+    selectinload(Impediment.route_stop)
+    .selectinload(RouteStop.service_point)
+    .selectinload(ServicePoint.place),
 )
 
 

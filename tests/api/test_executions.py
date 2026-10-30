@@ -9,6 +9,7 @@ from app.domain.audit.models import AuditTrail
 from app.domain.catalog.models import ServiceType
 from app.domain.execution.models import Execution, ExecutionReviewStatus, ExecutionSource
 from app.domain.identity.models import UserRole
+from app.domain.routing.models import RouteStop
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,7 @@ from tests.api.test_checkins import (
     _seed_route,
 )
 from tests.api.test_evidence import _PHOTO_BYTES, _PHOTO_SHA, _upload_photo
+from tests.support.factories import make_place_point
 
 _MANAGER_EMAIL = "gerente@empresa.com"
 
@@ -74,6 +76,43 @@ async def test_list_executions_manager_paginated(
     first = body["items"][0]
     assert first["field_worker_name"] == "João"
     assert first["building_name"] == "Bloco CI"
+
+
+async def test_an_execution_at_a_place_reaches_the_manager_without_a_building(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+    point = await make_place_point(
+        db_session, service_type=None, name="Jardim", place_name="Praça central"
+    )
+    stop = RouteStop(
+        route_id=seeded.route.id,
+        service_point_id=point.id,
+        order_index=9,
+        batch_number=1,
+        service_date=seeded.route.route_date,
+    )
+    db_session.add(stop)
+    await db_session.flush()
+    await _seed_extra_executions(
+        db_session, route_stop_id=stop.id, worker_id=seeded.worker.id, count=1
+    )
+    headers = {"Authorization": f"Bearer {_manager_token(client)}"}
+
+    listed = client.get("/executions", headers=headers).json()
+    item = listed["items"][0]
+    detail = client.get(f"/executions/{item['execution_id']}", headers=headers)
+
+    assert listed["total"] == 1
+    assert (item["building_id"], item["building_name"], item["floor_label"]) == (
+        None,
+        "Praça central",
+        None,
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["building_name"] == "Praça central"
+    assert detail.json()["floor_label"] is None
 
 
 async def test_list_executions_page_size_clamped_to_200(

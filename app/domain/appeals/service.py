@@ -120,7 +120,8 @@ async def appealable_stops(
         .options(
             selectinload(RouteStop.service_point)
             .selectinload(ServicePoint.floor)
-            .selectinload(Floor.building)
+            .selectinload(Floor.building),
+            selectinload(RouteStop.service_point).selectinload(ServicePoint.place),
         )
         .order_by(RouteStop.released_at.desc())
     )
@@ -226,7 +227,8 @@ async def _announce(
     await notify_appeal_filed(db, appeal_id=appeal.id, description=description, push=push)
 
 
-# Everything the lists show: the worker, the reviewer, and the stop's point, floor and building.
+# Everything the lists show: the worker, the reviewer, and the stop's point with its floor and
+# building, or its place.
 _LIST_OPTIONS = (
     selectinload(Appeal.field_worker),
     selectinload(Appeal.reviewer),
@@ -234,6 +236,9 @@ _LIST_OPTIONS = (
     .selectinload(RouteStop.service_point)
     .selectinload(ServicePoint.floor)
     .selectinload(Floor.building),
+    selectinload(Appeal.route_stop)
+    .selectinload(RouteStop.service_point)
+    .selectinload(ServicePoint.place),
 )
 
 

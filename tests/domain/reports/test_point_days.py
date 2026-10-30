@@ -14,7 +14,13 @@ from app.domain.routing.models import ReleaseReason, RouteStop, RouteStopStatus
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_points, make_route, make_service_type, make_worker
+from tests.support.factories import (
+    make_place_point,
+    make_points,
+    make_route,
+    make_service_type,
+    make_worker,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -183,6 +189,31 @@ async def test_filters_narrow_the_rows(db_session: AsyncSession) -> None:
     assert await ids(building_id=floor.building_id) == {jardim.id}
     # A worker's rows are the point-days they held a stop for.
     assert await ids(field_worker_id=ana.id) == {sala_2.id}
+
+
+async def test_a_point_of_a_place_is_counted_without_a_building(db_session: AsyncSession) -> None:
+    service_type, (sala,) = await _typed_points(db_session, ["Sala 1"])
+    jardim = await make_place_point(db_session, service_type=service_type, name="Jardim")
+    jardim.created_at = _LONG_AGO
+    ana = await _worker(db_session, service_type, "Ana")
+    route = await make_route(db_session, worker=ana, day=_TUE, points=[jardim])
+    route.stops[0].status = RouteStopStatus.DONE
+    await db_session.commit()
+    floor = await db_session.get(Floor, sala.floor_id)
+    assert floor is not None
+
+    rows = await point_day_rows(db_session, date_from=_TUE, date_to=_TUE)
+    in_building = await point_day_rows(
+        db_session, date_from=_TUE, date_to=_TUE, building_id=floor.building_id
+    )
+
+    by_point = {row.service_point_id: row for row in rows}
+    assert set(by_point) == {sala.id, jardim.id}
+    assert by_point[jardim.id].building_id is None
+    assert by_point[jardim.id].outcome == "DONE"
+    assert by_point[sala.id].building_id == floor.building_id
+    # A building filter keeps only that building's points.
+    assert {row.service_point_id for row in in_building} == {sala.id}
 
 
 async def test_inactive_point_leaves_the_expected_set_but_keeps_its_history(

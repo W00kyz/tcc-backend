@@ -22,6 +22,7 @@ from app.domain.catalog.models import (
     Building,
     FieldWorker,
     Floor,
+    Place,
     ServicePoint,
 )
 from app.domain.execution.models import (
@@ -65,9 +66,9 @@ class ExecutionListRow:
     field_worker_name: str
     service_point_id: UUID
     service_point_name: str
-    building_id: UUID
+    building_id: UUID | None  # null for an execution at a place, whose name is `building_name`
     building_name: str
-    floor_label: str
+    floor_label: str | None
     checked_in_at: datetime
     checked_out_at: datetime | None
     geo_validation: str | None  # from the CHECK_IN scan; None for an execution without a scan
@@ -138,7 +139,7 @@ def _row_query() -> Select[Any]:
             ServicePoint.id,
             ServicePoint.name,
             Building.id,
-            Building.name,
+            func.coalesce(Building.name, Place.name),
             Floor.label,
             _checkin_geo_subquery().label("checkin_geo"),
             _evidence_count_subquery().label("evidence_count"),
@@ -148,8 +149,10 @@ def _row_query() -> Select[Any]:
         .select_from(Execution)
         .join(RouteStop, Execution.route_stop_id == RouteStop.id)
         .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
-        .join(Floor, ServicePoint.floor_id == Floor.id)
-        .join(Building, Floor.building_id == Building.id)
+        # Outer: a point at an outdoor place has no floor and no building.
+        .outerjoin(Floor, ServicePoint.floor_id == Floor.id)
+        .outerjoin(Building, Floor.building_id == Building.id)
+        .outerjoin(Place, ServicePoint.place_id == Place.id)
         .join(FieldWorker, Execution.field_worker_id == FieldWorker.id)
         # One appeal per stop at most; only the APPEAL execution of the stop comes from it.
         .outerjoin(
@@ -173,6 +176,7 @@ def _id_conditions(f: ExecutionFilters) -> list[ColumnElement[bool]]:
     if f.service_type_id is not None:
         conditions.append(RouteStop.service_type_id == f.service_type_id)
     if f.building_id is not None:
+        # A point at a place has no floor, so a building filter leaves it out.
         conditions.append(Floor.building_id == f.building_id)
     return conditions
 
@@ -200,9 +204,9 @@ def _to_list_row(
     worker_name: str,
     service_point_id: UUID,
     service_point_name: str,
-    building_id: UUID,
+    building_id: UUID | None,
     building_name: str,
-    floor_label: str,
+    floor_label: str | None,
     checkin_geo: GeoValidation | None,
     evidence_count: int,
     route_id: UUID,
@@ -246,7 +250,7 @@ async def list_executions(
         .select_from(Execution)
         .join(RouteStop, Execution.route_stop_id == RouteStop.id)
         .join(ServicePoint, RouteStop.service_point_id == ServicePoint.id)
-        .join(Floor, ServicePoint.floor_id == Floor.id),
+        .outerjoin(Floor, ServicePoint.floor_id == Floor.id),
         filters,
     ).subquery()
     total = int(await db.scalar(select(func.count()).select_from(count_src)) or 0)

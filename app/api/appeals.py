@@ -28,6 +28,7 @@ from app.domain.appeals.service import (
     get_appeal,
     reject_appeal,
 )
+from app.domain.catalog.sites import site_of
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import ReleaseReason, RouteStop
 from app.domain.settings.service import get_settings_row
@@ -43,7 +44,8 @@ class AppealableStopOut(BaseModel):
     service_point_id: UUID
     service_point_name: str
     building_name: str
-    floor_label: str
+    # The place's name stands in `building_name` for an outdoor stop, which has no floor.
+    floor_label: str | None
     released_at: datetime
     release_reason: ReleaseReason
     # The last instant an appeal is accepted (`released_at` + `appeal_window_hours`).
@@ -86,17 +88,17 @@ class AppealOut(BaseModel):
 
 
 def _stop_out(stop: RouteStop, *, window_hours: int) -> AppealableStopOut:
-    """Expects the point, floor and building `appealable_stops` loads."""
+    """Expects the point and its floor, building or place that `appealable_stops` loads."""
     assert stop.released_at is not None
     assert stop.release_reason is not None
     point = stop.service_point
-    assert point.floor is not None  # TODO(task-3): place stops have no floor
+    site = site_of(point)
     return AppealableStopOut(
         route_stop_id=stop.id,
         service_point_id=point.id,
         service_point_name=point.name,
-        building_name=point.floor.building.name,
-        floor_label=point.floor.label,
+        building_name=site.name,
+        floor_label=site.floor_label,
         released_at=stop.released_at,
         release_reason=stop.release_reason,
         deadline=appeal_deadline(stop, window_hours=window_hours),
@@ -109,7 +111,6 @@ def _to_out(appeal: Appeal) -> AppealOut:
     assert stop.released_at is not None
     assert stop.release_reason is not None
     point = stop.service_point
-    assert point.floor is not None  # TODO(task-3): place stops have no floor
     return AppealOut(
         id=appeal.id,
         route_stop_id=appeal.route_stop_id,
@@ -117,7 +118,7 @@ def _to_out(appeal: Appeal) -> AppealOut:
         field_worker_name=appeal.field_worker.full_name,
         service_point_id=point.id,
         service_point_name=point.name,
-        building_name=point.floor.building.name,
+        building_name=site_of(point).name,
         released_at=stop.released_at,
         release_reason=stop.release_reason,
         reason=appeal.reason,

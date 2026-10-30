@@ -21,6 +21,7 @@ from sqlalchemy.orm import contains_eager, selectinload
 
 from app.core.campus_clock import campus_today
 from app.domain.catalog.models import FieldWorker, Floor, ServicePoint, ServiceType
+from app.domain.catalog.sites import SiteView, site_of
 from app.domain.execution.geo import haversine_meters
 from app.domain.impediments.models import Impediment
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
@@ -129,7 +130,7 @@ async def free_points(
 ) -> list[ServicePoint]:
     """The pool (spec §6.1): points whose service type belongs to `company_id` and that no stop
     of `day` holds. An inactive point, a point without a type and one whose type has no company
-    are never in it. Comes back with floor and building loaded, for the batch ordering.
+    are never in it. Comes back with floor and building (or place) loaded, for the batch ordering.
 
         pool = await free_points(db, company_id=company.id, day=today, exclude_point_ids=set())
     """
@@ -149,6 +150,7 @@ async def free_points(
         .options(
             contains_eager(ServicePoint.service_type),
             selectinload(ServicePoint.floor).selectinload(Floor.building),
+            selectinload(ServicePoint.place),
         )
     )
     if exclude_point_ids:
@@ -304,20 +306,20 @@ async def _claim(
     return claimed
 
 
-def _floor_of(point: ServicePoint) -> Floor:
-    assert point.floor is not None  # TODO(task-3): place stops have no floor
-    return point.floor
+def _floor_rank(site: SiteView) -> tuple[bool, str]:
+    """Sorts floors by label inside a site, with the stops that have no floor (a place) last."""
+    return site.floor_label is None, site.floor_label or ""
 
 
 def _nearest_first(points: list[ServicePoint], origin: tuple[float, float]) -> list[ServicePoint]:
-    # Points of one building share its centre, so the ties are broken by building, floor and
+    # Points of one building share its centre, so the ties are broken by site, floor and
     # name — stable, and what spreads a big building over the workers who arrive together.
     return sorted(
         points,
         key=lambda p: (
             haversine_meters(origin[0], origin[1], p.latitude, p.longitude),
-            _floor_of(p).building.name,
-            _floor_of(p).label,
+            site_of(p).name,
+            _floor_rank(site_of(p)),
             p.name,
         ),
     )
@@ -381,11 +383,12 @@ async def _insert_stop(db: AsyncSession, stop: RouteStop) -> bool:
 async def _order_batch(
     stops: list[RouteStop], *, origin: tuple[float, float], osrm: OsrmClient | None
 ) -> None:
-    """Rewrite the batch's `order_index`: buildings in OSRM trip order from the worker (the
-    distance order when OSRM is unavailable), then by floor and name inside a building."""
+    """Rewrite the batch's `order_index`: sites (a building, or an outdoor place on its own) in
+    OSRM trip order from the worker (the distance order when OSRM is unavailable), then by floor
+    and name inside a site."""
     by_building: dict[uuid.UUID, list[RouteStop]] = {}
-    for stop in stops:  # in claim (distance) order — the fallback building order
-        by_building.setdefault(_floor_of(stop.service_point).building_id, []).append(stop)
+    for stop in stops:  # in claim (distance) order — the fallback site order
+        by_building.setdefault(site_of(stop.service_point).site_id, []).append(stop)
     buildings = list(by_building.values())
     first_index = min(stop.order_index for stop in stops)
     ordered = [
@@ -393,7 +396,7 @@ async def _order_batch(
         for position in await _building_order(buildings, origin=origin, osrm=osrm)
         for stop in sorted(
             buildings[position],
-            key=lambda s: (_floor_of(s.service_point).label, s.service_point.name),
+            key=lambda s: (*_floor_rank(site_of(s.service_point)), s.service_point.name),
         )
     ]
     for offset, stop in enumerate(ordered):

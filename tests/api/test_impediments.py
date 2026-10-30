@@ -5,7 +5,7 @@ reassignment and dismissal went with manual planning."""
 
 import uuid
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from app.core.config import Settings
@@ -42,7 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
-from tests.support.factories import make_route
+from tests.support.factories import make_place_point, make_route
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -484,6 +484,26 @@ async def test_list_returns_every_impediment_with_worker_point_and_building(
     # A rest-of-route impediment names no point.
     assert (rows[1]["service_point_name"], rows[1]["building_name"]) == (None, None)
     assert rows[1]["status"] == "RESOLVED"
+
+
+async def test_list_names_the_place_of_an_impeded_place_stop(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    fx = await _seed(db_session)
+    point = await make_place_point(
+        db_session, service_type=None, name="Jardim", place_name="Praça central"
+    )
+    place_route = await make_route(
+        db_session, worker=fx.worker_a, day=_ROUTE_DATE - timedelta(days=1), points=[point]
+    )
+    await _make_impediment(db_session, fx, stop_id=place_route.stops[0].id)
+    token = _login(client, fx.manager.email)
+
+    response = client.get("/impediments", headers=_auth(token))
+
+    assert response.status_code == 200, response.text
+    [row] = response.json()
+    assert (row["service_point_name"], row["building_name"]) == ("Jardim", "Praça central")
 
 
 @pytest.mark.parametrize("wanted", [ImpedimentStatus.PENDING, ImpedimentStatus.RESOLVED])

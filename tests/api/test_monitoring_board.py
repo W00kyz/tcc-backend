@@ -22,7 +22,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.support.factories import make_points, make_route, make_service_type, make_worker
+from tests.support.factories import (
+    make_place_point,
+    make_points,
+    make_route,
+    make_service_type,
+    make_worker,
+)
 from tests.support.object_store import FakeObjectStore
 from tests.support.osrm import FakeOsrmClient
 
@@ -127,6 +133,22 @@ async def test_pool_kpis_per_type(client: TestClient, db_session: AsyncSession) 
         },
     ]
     assert body["released_today"] == 2
+
+
+async def test_a_point_of_a_place_is_in_the_pool(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _manager(db_session)
+    cleaning = await make_service_type(db_session, company_name="Limpa Tudo", type_name="Limpeza")
+    await make_points(db_session, service_type=cleaning, names=["Sala 1"])
+    await make_place_point(db_session, service_type=cleaning, name="Jardim")
+    await db_session.commit()
+
+    pool = _board(client)["pool"]
+
+    assert [(row["service_type_name"], row["total"], row["free"]) for row in pool] == [
+        ("Limpeza", 2, 2)
+    ]
 
 
 async def test_a_switched_off_point_leaves_the_pool_until_reactivated(

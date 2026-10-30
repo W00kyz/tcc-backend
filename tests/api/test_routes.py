@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.support.clock import today_on_campus
-from tests.support.factories import make_check_in, make_route, make_worker
+from tests.support.factories import make_check_in, make_place_point, make_route, make_worker
 
 _PASSWORD = "senha-forte-o-suficiente"
 
@@ -215,6 +215,38 @@ async def test_route_stop_carries_floor_id(client: TestClient, db_session: Async
     stops = client.get("/routes/me", headers=_auth(token)).json()["route"]["stops"]
 
     assert {stop["floor_id"] for stop in stops} == {str(points[0].floor_id)}
+
+
+async def test_a_stop_of_a_place_has_no_floor_and_is_completed_by_location(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    place_point = await make_place_point(
+        db_session, service_type=None, name="Jardim", place_name="Praça central"
+    )
+    await make_route(
+        db_session, worker=workers[0], day=today_on_campus(), points=[points[0], place_point]
+    )
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    floor_stop, place_stop = client.get("/routes/me", headers=_auth(token)).json()["route"]["stops"]
+
+    assert place_stop["completion"] == "LOCATION"
+    assert place_stop["place_id"] == str(place_point.place_id)
+    assert (place_stop["floor_id"], place_stop["floor_label"], place_stop["building_id"]) == (
+        None,
+        None,
+        None,
+    )
+    assert place_stop["building_name"] == "Praça central"
+    assert place_stop["service_point_name"] == "Jardim"
+    # A stop on a floor is unchanged: QR completion, its floor and building, no place.
+    assert floor_stop["completion"] == "QR"
+    assert floor_stop["place_id"] is None
+    assert floor_stop["floor_id"] == str(points[0].floor_id)
+    assert floor_stop["floor_label"] == "Térreo"
+    assert floor_stop["building_name"] == "Bloco CI"
 
 
 async def test_route_stop_done_at_is_checkout_time(
