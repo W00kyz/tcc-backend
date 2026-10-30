@@ -19,6 +19,7 @@ from app.domain.catalog.models import (
 )
 from app.domain.identity.models import User, UserRole
 from app.domain.routing.models import ReleaseReason, RouteStatus, RouteStopStatus
+from app.domain.settings.service import update_settings
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -136,6 +137,33 @@ async def test_routes_me_is_todays_route_with_geometry(
     assert isinstance(route["stops"][1]["leg_geometry"], list)
     assert route["routing_degraded"] is False
     assert route["current_batch"] == 1
+
+
+async def test_routes_me_carries_the_configured_check_radius(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points[:1])
+    await update_settings(db_session, actor_id=manager.id, changes={"check_radius_meters": 65})
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    route = client.get("/routes/me", headers=_auth(token)).json()["route"]
+
+    assert route["check_radius_meters"] == 65
+
+
+async def test_routes_me_check_radius_defaults_to_fifty(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    _manager, worker_user, workers, points = await _seed_actors_and_points(db_session)
+    await make_route(db_session, worker=workers[0], day=today_on_campus(), points=points[:1])
+    await db_session.commit()
+    token = _login(client, worker_user.email)
+
+    route = client.get("/routes/me", headers=_auth(token)).json()["route"]
+
+    assert route["check_radius_meters"] == 50
 
 
 async def test_route_stop_out_carries_batch_and_release_reason(

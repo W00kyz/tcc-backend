@@ -83,6 +83,10 @@ class RouteOut(BaseModel):
     # The latest batch handed out (0 before the first). `stops` carries every batch; the app
     # lists the current batch's stops and counts the done ones.
     current_batch: int
+    # How close the worker must stand to finish a stop by location (`system_settings`): the app
+    # gates "Concluir" on the same radius the server enforces, so it never offers a completion the
+    # server will refuse.
+    check_radius_meters: int
     stops: list[RouteStopOut]
 
 
@@ -115,7 +119,7 @@ def _to_stop_out(stop: RouteStop) -> RouteStopOut:
     )
 
 
-def _to_route_out(route: Route) -> RouteOut:
+def _to_route_out(route: Route, check_radius_meters: int) -> RouteOut:
     return RouteOut(
         id=route.id,
         field_worker_id=route.field_worker_id,
@@ -125,6 +129,7 @@ def _to_route_out(route: Route) -> RouteOut:
         started_at=route.started_at,
         routing_degraded=routing_degraded(route),
         current_batch=max((stop.batch_number for stop in route.stops), default=0),
+        check_radius_meters=check_radius_meters,
         # Route.stops is order_by="RouteStop.order_index" and every service function reloads it
         # in that order — no re-sort needed here.
         stops=[_to_stop_out(stop) for stop in route.stops],
