@@ -1,5 +1,6 @@
 """Checks and the insert that every way of creating a service point shares: `POST
-/service-points` and the room endpoints (`POST /rooms`, `POST /rooms/{id}/services`)."""
+/service-points`, the room endpoints (`POST /rooms`, `POST /rooms/{id}/services`) and the place
+endpoints (`POST /places`, `POST /places/{id}/services`)."""
 
 from uuid import UUID
 
@@ -47,18 +48,32 @@ async def add_audited_point(
     db: AsyncSession,
     actor: User,
     *,
-    floor_id: UUID,
+    floor_id: UUID | None = None,
+    place_id: UUID | None = None,
     name: str,
     description: str,
     service_type: ServiceType,
     location: tuple[float, float],
     room_id: UUID | None = None,
 ) -> ServicePoint:
-    """Inserts the point (flushed, not committed) and writes its `create` audit entry."""
+    """Inserts the point (flushed, not committed) and writes its `create` audit entry. The
+    point sits on a floor (optionally in a room) or in a place, never on both and never nowhere:
+    the database only forbids the mix, so this is where "nowhere" is refused.
+
+        await add_audited_point(db, actor, place_id=place.id, name=..., ...)
+    """
+    if (floor_id is None) == (place_id is None):
+        raise ValueError(
+            f"A service point needs exactly one of floor_id and place_id; got floor_id={floor_id} "
+            f"and place_id={place_id}."
+        )
+    if place_id is not None and room_id is not None:
+        raise ValueError(f'A point of place "{place_id}" cannot be in room "{room_id}".')
     latitude, longitude = location
     point = ServicePoint(
         service_type=service_type,
         floor_id=floor_id,
+        place_id=place_id,
         room_id=room_id,
         name=name,
         description=description,

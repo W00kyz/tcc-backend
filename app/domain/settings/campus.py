@@ -23,6 +23,18 @@ def inside_campus(settings: SystemSettings, lat: float, lng: float) -> bool:
     )
 
 
+def describe_campus(settings: SystemSettings) -> str:
+    """The campus rectangle as text, for the message of a position that falls outside it.
+
+    >>> describe_campus(settings)
+    '[-7.225, -7.205] x [-35.92, -35.898]'
+    """
+    return (
+        f"[{settings.campus_min_lat}, {settings.campus_max_lat}] x "
+        f"[{settings.campus_min_lng}, {settings.campus_max_lng}]"
+    )
+
+
 def inside_campus_clause(
     settings: SystemSettings, lat: InstrumentedAttribute[float], lng: InstrumentedAttribute[float]
 ) -> ColumnElement[bool]:

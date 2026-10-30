@@ -1,4 +1,4 @@
-"""Removing a building, floor, room or service point together with its history (spec
+"""Removing a building, floor, room, place or service point together with its history (spec
 2026-10-20-predios-pontos-dialogs-design.md §3.4, decided by the product owner: removal deletes
 the history). Everything below runs in the caller's transaction; the photo object keys come back
 so the caller deletes the objects from storage only after the commit.
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.object_store import ObjectStore, ObjectStoreError
 from app.domain.appeals.models import Appeal
-from app.domain.catalog.models import Building, Floor, Room, ServicePoint
+from app.domain.catalog.models import Building, Floor, Place, Room, ServicePoint
 from app.domain.execution.models import (
     EvidenceItem,
     EvidenceKind,
@@ -44,6 +44,7 @@ class DeletionImpact:
     photos: int
     appeals: int
     rooms: int = 0
+    places: int = 0
 
 
 async def _ids(db: AsyncSession, query: Select[Any]) -> list[uuid.UUID]:
@@ -58,6 +59,10 @@ def _points_of_rooms(room_ids: Ids) -> Select[Any]:
     return select(ServicePoint.id).where(ServicePoint.room_id.in_(room_ids))
 
 
+def _points_of_places(place_ids: Ids) -> Select[Any]:
+    return select(ServicePoint.id).where(ServicePoint.place_id.in_(place_ids))
+
+
 def _stops_of_points(point_ids: Ids) -> Select[Any]:
     return select(RouteStop.id).where(RouteStop.service_point_id.in_(point_ids))
 
@@ -66,7 +71,9 @@ def _executions_of_stops(stop_ids: Ids) -> Select[Any]:
     return select(Execution.id).where(Execution.route_stop_id.in_(stop_ids))
 
 
-async def _impact(db: AsyncSession, point_ids: Ids, floors: int, rooms: int = 0) -> DeletionImpact:
+async def _impact(
+    db: AsyncSession, point_ids: Ids, floors: int, rooms: int = 0, places: int = 0
+) -> DeletionImpact:
     stop_ids = await _ids(db, _stops_of_points(point_ids))
     execution_ids = await _ids(db, _executions_of_stops(stop_ids))
     routes = await db.scalar(
@@ -86,6 +93,7 @@ async def _impact(db: AsyncSession, point_ids: Ids, floors: int, rooms: int = 0)
         photos=int(photos or 0),
         appeals=int(appeals or 0),
         rooms=rooms,
+        places=places,
     )
 
 
@@ -115,6 +123,12 @@ async def impact_of_room(db: AsyncSession, room_id: uuid.UUID) -> DeletionImpact
     """Example: ``impact = await impact_of_room(db, room.id)``"""
     point_ids = await _ids(db, _points_of_rooms([room_id]))
     return await _impact(db, point_ids, floors=0, rooms=1)
+
+
+async def impact_of_place(db: AsyncSession, place_id: uuid.UUID) -> DeletionImpact:
+    """Example: ``impact = await impact_of_place(db, place.id)``"""
+    point_ids = await _ids(db, _points_of_places([place_id]))
+    return await _impact(db, point_ids, floors=0, places=1)
 
 
 async def _delete_executions(db: AsyncSession, execution_ids: Ids) -> list[str]:
@@ -230,6 +244,17 @@ async def delete_room(db: AsyncSession, room_id: uuid.UUID) -> list[str]:
     """
     photo_keys = await _delete_points(db, await _ids(db, _points_of_rooms([room_id])))
     await db.execute(delete(Room).where(Room.id == room_id))
+    return photo_keys
+
+
+async def delete_place(db: AsyncSession, place_id: uuid.UUID) -> list[str]:
+    """Deletes the place and its points with their history; returns the photo object keys to
+    remove after commit.
+
+    Example: ``keys = await delete_place(db, place.id); await db.commit()``
+    """
+    photo_keys = await _delete_points(db, await _ids(db, _points_of_places([place_id])))
+    await db.execute(delete(Place).where(Place.id == place_id))
     return photo_keys
 
 

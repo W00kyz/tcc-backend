@@ -29,7 +29,9 @@ router = APIRouter(prefix="/service-points", tags=["service-points"])
 
 class ServicePointOut(BaseModel):
     id: UUID
-    floor_id: UUID
+    # Exactly one of floor_id and place_id is set: a point is on a floor or in an outdoor place.
+    floor_id: UUID | None
+    place_id: UUID | None
     name: str
     description: str
     latitude: float
@@ -53,8 +55,9 @@ class ServicePointCreateRequest(BaseModel):
 class ServicePointUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # None leaves them as they are, so a switch-off need not resend a possibly stale copy. A room's
-    # point ignores `name`: it always follows its room (renamed through PATCH /rooms/{id}).
+    # None leaves them as they are, so a switch-off need not resend a possibly stale copy. A
+    # room's or place's point ignores `name`: it follows its parent (renamed through
+    # PATCH /rooms/{id} or PATCH /places/{id}).
     name: str | None = None
     description: str | None = None
     # Optional so a rename does not have to resend it; a point can only change type, never lose it.
@@ -67,6 +70,7 @@ def point_to_out(point: ServicePoint) -> ServicePointOut:
     return ServicePointOut(
         id=point.id,
         floor_id=point.floor_id,
+        place_id=point.place_id,
         name=point.name,
         description=point.description,
         latitude=point.latitude,
@@ -84,6 +88,7 @@ async def list_service_points(
     db: Annotated[AsyncSession, Depends(get_db)],
     floor_id: UUID | None = None,
     building_id: UUID | None = None,
+    place_id: UUID | None = None,
 ) -> list[ServicePointOut]:
     # Registration order, so a renamed point does not jump to the end of the building's list.
     query = (
@@ -93,7 +98,10 @@ async def list_service_points(
     )
     if floor_id is not None:
         query = query.where(ServicePoint.floor_id == floor_id)
+    if place_id is not None:
+        query = query.where(ServicePoint.place_id == place_id)
     if building_id is not None:
+        # Inner join: a point of a place has no floor, so it never belongs to a building.
         query = query.join(Floor, ServicePoint.floor_id == Floor.id).where(
             Floor.building_id == building_id
         )
@@ -150,7 +158,7 @@ async def update_service_point(
         point.service_type = await require_service_type(db, body.service_type_id)
     else:
         await db.refresh(point, ["service_type"])
-    if body.name is not None and point.room_id is None:
+    if body.name is not None and point.room_id is None and point.place_id is None:
         point.name = body.name
     if body.description is not None:
         point.description = body.description

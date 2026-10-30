@@ -26,7 +26,12 @@ from app.domain.impediments.models import Impediment
 from app.domain.routing.models import Route, RouteStatus, RouteStop, RouteStopStatus
 from app.domain.routing.osrm import OsrmClient, OsrmUnavailable
 from app.domain.routing.service import recompute_legs
-from app.domain.settings.campus import inside_campus, is_service_day, workday_over
+from app.domain.settings.campus import (
+    describe_campus,
+    inside_campus,
+    is_service_day,
+    workday_over,
+)
 from app.domain.settings.models import SystemSettings
 
 # The statuses that hold a point for the day — the predicate of the exclusivity index.
@@ -166,9 +171,7 @@ def _ensure_allocatable(
         raise WorkdayOver(f"The workday ended at {settings.workday_end_time} campus time.")
     if not inside_campus(settings, lat, lng):
         raise OutsideCampus(
-            f"Position ({lat}, {lng}) is outside the campus "
-            f"[{settings.campus_min_lat}, {settings.campus_max_lat}] x "
-            f"[{settings.campus_min_lng}, {settings.campus_max_lng}]."
+            f"Position ({lat}, {lng}) is outside the campus {describe_campus(settings)}."
         )
 
 

@@ -20,6 +20,7 @@ from app.api.impediments import router as impediments_router
 from app.api.me import router as me_router
 from app.api.monitoring import router as monitoring_router
 from app.api.notifications import router as notifications_router
+from app.api.places import router as places_router
 from app.api.public import router as public_router
 from app.api.qr_codes import router as qr_codes_router
 from app.api.reports import reports_router
@@ -167,6 +168,7 @@ def create_app(
     app.include_router(buildings_router)
     app.include_router(floors_router)
     app.include_router(rooms_router)
+    app.include_router(places_router)
     app.include_router(service_points_router)
     app.include_router(qr_codes_router)
     app.include_router(settings_router)

@@ -1,4 +1,4 @@
-"""The response shared by every removal-impact endpoint (building, floor, room, service point)."""
+"""The response shared by every removal-impact endpoint (building, floor, room, place, point)."""
 
 from pydantic import BaseModel
 
@@ -13,3 +13,4 @@ class DeletionImpactOut(BaseModel):
     photos: int
     appeals: int
     rooms: int
+    places: int = 0
