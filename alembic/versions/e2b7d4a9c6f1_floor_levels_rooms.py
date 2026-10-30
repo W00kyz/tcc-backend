@@ -10,14 +10,17 @@ Hand-written (project rule — no autogenerate). Spec docs/specs/2026-10-29-anda
 Backfill rules for the existing floors: label "Térreo" -> level 0; a label made only of digits
 -> that number; any other label -> the next free levels above the building's current maximum,
 in registration order (created_at, then id). No unique constraint, so two floors of a building
-may end up on the same level. Every existing point gets a room named after it (a repeated name
-in the same floor gets " (2)", " (3)"...) and every building without any floor gets a Térreo.
+may end up on the same level. Every existing point gets a room named after it, in Python so the
+names can never collide or overflow the column: in registration order, a point takes its own name
+if the floor has not used it yet, else the first free "name (2)", "name (3)"... (the base is cut
+to leave room for the suffix). Every building without any floor gets a Térreo.
 
 Downgrade drops rooms, `room_id`, `active` and `level` in the opposite order. The Térreo floors
 inserted for floor-less buildings stay (their QR-less rows are harmless); that loss of
 information is accepted.
 """
 
+import uuid
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -61,34 +64,45 @@ ranked AS (
 UPDATE floors SET level = ranked.new_level FROM ranked WHERE floors.id = ranked.id
 """
 
-_BACKFILL_ROOMS = """
-INSERT INTO rooms (id, floor_id, name)
-SELECT gen_random_uuid(),
-       floor_id,
-       CASE WHEN n = 1 THEN name ELSE name || ' (' || n || ')' END
-FROM (
-    SELECT floor_id, name,
-           row_number() OVER (PARTITION BY floor_id, name ORDER BY created_at, id) AS n
-    FROM service_points
-) numbered
-"""
+_ROOM_NAME_MAX = 200  # rooms.name is varchar(200)
 
-# Matches each point to the room created for it, using the same numbering as the insert above.
-_LINK_POINTS_TO_ROOMS = """
-UPDATE service_points SET room_id = rooms.id
-FROM (
-    SELECT id,
-           floor_id,
-           CASE WHEN n = 1 THEN name ELSE name || ' (' || n || ')' END AS room_name
-    FROM (
-        SELECT id, floor_id, name,
-               row_number() OVER (PARTITION BY floor_id, name ORDER BY created_at, id) AS n
-        FROM service_points
-    ) numbered
-) named
-JOIN rooms ON rooms.floor_id = named.floor_id AND rooms.name = named.room_name
-WHERE service_points.id = named.id
-"""
+
+def _free_room_name(name: str, taken: set[str]) -> str:
+    """`name` if the floor has not used it, else the first free "name (n)", cut to fit."""
+    candidate = name[:_ROOM_NAME_MAX]
+    number = 1
+    while candidate in taken:
+        number += 1
+        suffix = f" ({number})"
+        candidate = name[: _ROOM_NAME_MAX - len(suffix)] + suffix
+    return candidate
+
+
+def _backfill_rooms() -> None:
+    """One room per existing point, named after it, and the point linked to it."""
+    bind = op.get_bind()
+    points = bind.execute(
+        sa.text("SELECT id, floor_id, name FROM service_points ORDER BY floor_id, created_at, id")
+    ).all()
+    taken: dict[uuid.UUID, set[str]] = {}
+    rooms: list[dict[str, object]] = []
+    links: list[dict[str, object]] = []
+    for point_id, floor_id, name in points:
+        used = taken.setdefault(floor_id, set())
+        room_name = _free_room_name(name, used)
+        used.add(room_name)
+        room_id = uuid.uuid4()
+        rooms.append({"id": room_id, "floor_id": floor_id, "name": room_name})
+        links.append({"room_id": room_id, "point_id": point_id})
+    if not rooms:
+        return
+    bind.execute(
+        sa.text("INSERT INTO rooms (id, floor_id, name) VALUES (:id, :floor_id, :name)"), rooms
+    )
+    bind.execute(
+        sa.text("UPDATE service_points SET room_id = :room_id WHERE id = :point_id"), links
+    )
+
 
 _ADD_MISSING_GROUND_FLOORS = """
 INSERT INTO floors (id, building_id, label, level)
@@ -134,8 +148,7 @@ def upgrade() -> None:
         "service_points",
         sa.Column("active", sa.Boolean(), server_default=sa.text("true"), nullable=False),
     )
-    op.execute(_BACKFILL_ROOMS)
-    op.execute(_LINK_POINTS_TO_ROOMS)
+    _backfill_rooms()
     op.execute(_ADD_MISSING_GROUND_FLOORS)
 
 

@@ -25,6 +25,8 @@ from app.domain.identity.models import User, UserRole
 
 router = APIRouter(prefix="/rooms", tags=["rooms"])
 
+# Stable code of the 409 for a floor out of default room numbers (the dashboard keys on it).
+ROOM_LIMIT_REACHED = "ROOM_LIMIT_REACHED"
 CleaningOutcome = Literal["CREATED", "SKIPPED", "NO_CLEANING_TYPE", "NO_OUTLINE"]
 RoomName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 
@@ -79,7 +81,11 @@ async def _default_name(db: AsyncSession, floor: Floor) -> str:
     except RoomLimitReached as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f'Floor "{floor.label}" has no default room number left; give the room a name. ({exc})',
+            detail={
+                "code": ROOM_LIMIT_REACHED,
+                "detail": f'Floor "{floor.label}" has no default room number left; give the '
+                f"room a name. ({exc})",
+            },
         ) from exc
 
 

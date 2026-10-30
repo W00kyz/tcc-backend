@@ -6,7 +6,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, StringConstraints
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +22,8 @@ from app.domain.identity.models import User, UserRole
 
 router = APIRouter(prefix="/floors", tags=["floors"])
 
+FloorLabel = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+
 
 class FloorOut(BaseModel):
     id: UUID
@@ -33,11 +35,11 @@ class FloorOut(BaseModel):
 class FloorCreateRequest(BaseModel):
     building_id: UUID
     # Omitted, the server picks it: "Térreo" for the first floor, then the next number.
-    label: str | None = None
+    label: FloorLabel | None = None
 
 
 class FloorUpdateRequest(BaseModel):
-    label: str
+    label: FloorLabel
 
 
 def _to_out(floor: Floor) -> FloorOut:
@@ -76,10 +78,14 @@ async def create_floor(
     if building is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Building "{body.building_id}" not found.')
 
-    levels = list(
-        await db.scalars(select(Floor.level).where(Floor.building_id == body.building_id))
+    existing = (
+        await db.execute(
+            select(Floor.level, Floor.label).where(Floor.building_id == body.building_id)
+        )
+    ).all()
+    level, default_label = next_floor(
+        [floor_level for floor_level, _ in existing], {floor_label for _, floor_label in existing}
     )
-    level, default_label = next_floor(levels)
     # A typed label wins over the default; the level is positional either way.
     label = body.label if body.label is not None else default_label
 

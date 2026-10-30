@@ -206,7 +206,8 @@ async def test_the_hundredth_numbered_room_is_a_409_asking_for_a_name(
     response = client.post("/rooms", json={"floor_id": str(setup.ground.id)}, headers=setup.headers)
 
     assert response.status_code == 409
-    assert "give the room a name" in response.json()["detail"]
+    assert response.json()["detail"]["code"] == "ROOM_LIMIT_REACHED"
+    assert "give the room a name" in response.json()["detail"]["detail"]
     named = client.post(
         "/rooms",
         json={"floor_id": str(setup.ground.id), "name": "Sala extra"},

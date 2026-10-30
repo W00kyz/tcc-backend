@@ -48,12 +48,32 @@ def _seed_legacy_catalog(url: str) -> None:
         )
 
 
-def _upgrade_with_legacy_data(url: str) -> None:
+def _upgrade_with_legacy_data(url: str, extra_points: tuple[tuple[str, str], ...] = ()) -> None:
     cfg = alembic_config(url)
     command.upgrade(cfg, ALLOCATION_RESET_REVISION)
     command.upgrade(cfg, _PREVIOUS)
     _seed_legacy_catalog(url)
+    for floor_id, name in extra_points:
+        run_sql(
+            url,
+            "INSERT INTO service_points (id, floor_id, name, description, latitude, longitude) "
+            f"VALUES (gen_random_uuid(), '{floor_id}', '{name}', '', -7.2, -35.9)",
+        )
     command.upgrade(cfg, _REVISION)
+
+
+def _assert_every_point_has_its_own_room(url: str, floor_id: str) -> list[str]:
+    rooms = run_sql(url, f"SELECT name FROM rooms WHERE floor_id = '{floor_id}'")
+    names = [str(name) for (name,) in rooms]
+    assert len(names) == len(set(names))
+    assert all(len(name) <= 200 for name in names)
+    mismatched = run_sql(
+        url,
+        "SELECT count(*) FROM service_points p LEFT JOIN rooms r ON r.id = p.room_id "
+        f"WHERE p.floor_id = '{floor_id}' AND (r.id IS NULL OR r.floor_id <> p.floor_id)",
+    )
+    assert mismatched == [(0,)]
+    return names
 
 
 def test_upgrade_backfills_levels_rooms_and_ground_floors(pre_reset_database_url: str) -> None:
@@ -79,6 +99,32 @@ def test_upgrade_backfills_levels_rooms_and_ground_floors(pre_reset_database_url
     assert unlinked == [(0,)]
     descriptions = run_sql(url, "SELECT description FROM service_points ORDER BY description")
     assert descriptions == [("A",), ("B",), ("C",)]
+
+
+def test_upgrade_numbers_repeated_names_without_colliding_with_real_ones(
+    pre_reset_database_url: str,
+) -> None:
+    url = pre_reset_database_url
+    _upgrade_with_legacy_data(url, ((_F_TWO, "X"), (_F_TWO, "X"), (_F_TWO, "X (2)")))
+
+    names = _assert_every_point_has_its_own_room(url, _F_TWO)
+
+    assert len(names) == 3
+    assert "X" in names
+    assert "X (2)" in names
+
+
+def test_upgrade_keeps_repeated_names_of_200_characters_within_the_column(
+    pre_reset_database_url: str,
+) -> None:
+    url = pre_reset_database_url
+    long_name = "a" * 200
+    _upgrade_with_legacy_data(url, ((_F_TWO, long_name),) * 3)
+
+    names = _assert_every_point_has_its_own_room(url, _F_TWO)
+
+    assert len(names) == 3
+    assert long_name in names
 
 
 def test_downgrade_drops_rooms_and_the_new_columns(pre_reset_database_url: str) -> None:

@@ -249,3 +249,85 @@ async def test_floors_are_listed_by_level(client: TestClient, db_session: AsyncS
     listing = client.get(f"/floors?building_id={building.id}", headers=headers).json()
 
     assert [floor["level"] for floor in listing] == [0, 1, 2]
+
+
+async def test_an_automatic_label_skips_numbers_already_used_as_labels(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add(building)
+    await db_session.commit()
+    db_session.add_all(
+        [
+            Floor(building_id=building.id, label="Térreo", level=0),
+            Floor(building_id=building.id, label="2", level=1),  # level 1 renamed to "2"
+        ]
+    )
+    await db_session.commit()
+
+    responses = [
+        client.post("/floors", json={"building_id": str(building.id)}, headers=headers)
+        for _ in range(2)
+    ]
+
+    assert [r.status_code for r in responses] == [201, 201]
+    assert [(r.json()["level"], r.json()["label"]) for r in responses] == [(3, "3"), (4, "4")]
+
+
+async def test_a_blank_or_oversized_floor_label_is_a_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add(building)
+    await db_session.commit()
+    body = {"building_id": str(building.id)}
+
+    for label in ("", "   ", "a" * 101):
+        response = client.post("/floors", json={**body, "label": label}, headers=headers)
+        assert response.status_code == 422, label
+
+    created = client.post("/floors", json={**body, "label": "  Subsolo  "}, headers=headers)
+    assert created.status_code == 201
+    assert created.json()["label"] == "Subsolo"
+    longest = client.post("/floors", json={**body, "label": "a" * 100}, headers=headers)
+    assert longest.status_code == 201
+
+
+async def test_a_blank_or_oversized_label_on_rename_is_a_422(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add(building)
+    await db_session.commit()
+    floor = Floor(building_id=building.id, label="Térreo", level=0)
+    db_session.add(floor)
+    await db_session.commit()
+
+    for label in ("", "   ", "a" * 101):
+        response = client.patch(f"/floors/{floor.id}", json={"label": label}, headers=headers)
+        assert response.status_code == 422, label
+
+    renamed = client.patch(f"/floors/{floor.id}", json={"label": "  Subsolo "}, headers=headers)
+    assert renamed.status_code == 200
+    assert renamed.json()["label"] == "Subsolo"
+
+
+async def test_removing_the_only_floor_makes_the_next_one_the_ground_floor_again(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    building_id = client.post(
+        "/buildings",
+        json={"name": "Bloco CI", "campus_area": "CCT", "footprint": OUTLINE},
+        headers=headers,
+    ).json()["id"]
+    only = client.get(f"/floors?building_id={building_id}", headers=headers).json()[0]
+    assert client.delete(f"/floors/{only['id']}", headers=headers).status_code == 204
+
+    created = client.post("/floors", json={"building_id": building_id}, headers=headers)
+
+    assert created.status_code == 201
+    assert (created.json()["label"], created.json()["level"]) == ("Térreo", 0)
