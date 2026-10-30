@@ -448,3 +448,53 @@ async def test_a_field_worker_cannot_use_the_room_endpoints(
     ]
 
     assert [response.status_code for response in responses] == [403, 403, 403, 403]
+
+
+async def test_changing_a_room_point_to_a_type_its_room_already_has_is_a_409(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    setup = await _setup(client, db_session)
+    room = _create(client, setup, setup.ground)
+    garden = await _second_type(db_session)
+    await db_session.commit()
+    client.post(
+        f"/rooms/{room['id']}/services",
+        json={"service_type_id": str(garden.id)},
+        headers=setup.headers,
+    )
+    assert setup.cleaning is not None
+    garden_point = next(p for p in await _points(db_session) if p.service_type_id == garden.id)
+
+    response = client.patch(
+        f"/service-points/{garden_point.id}",
+        json={"service_type_id": str(setup.cleaning.id)},
+        headers=setup.headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ROOM_SERVICE_EXISTS"
+    db_session.expire_all()
+    assert len({p.service_type_id for p in await _points(db_session)}) == 2
+
+
+async def test_a_room_point_can_keep_its_type_or_move_to_a_free_one(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    setup = await _setup(client, db_session)
+    _create(client, setup, setup.ground)
+    garden = await _second_type(db_session)
+    await db_session.commit()
+    assert setup.cleaning is not None
+    point = (await _points(db_session))[0]
+    url = f"/service-points/{point.id}"
+
+    same = client.patch(
+        url,
+        json={"service_type_id": str(setup.cleaning.id), "active": False},
+        headers=setup.headers,
+    )
+    free = client.patch(url, json={"service_type_id": str(garden.id)}, headers=setup.headers)
+
+    assert same.status_code == 200, same.text
+    assert free.status_code == 200, free.text
+    assert free.json()["service_type_id"] == str(garden.id)

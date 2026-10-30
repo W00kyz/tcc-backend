@@ -13,7 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deletion_impact import DeletionImpactOut
 from app.api.deps import require_role
-from app.api.point_checks import add_audited_point, require_floor_location, require_service_type
+from app.api.point_checks import (
+    add_audited_point,
+    reject_repeated_service,
+    require_floor_location,
+    require_service_type,
+)
 from app.api.service_points import ServicePointOut, point_to_out
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
@@ -210,7 +215,13 @@ async def add_room_service(
     floor = await db.get(Floor, room.floor_id)
     assert floor is not None  # rooms.floor_id is a foreign key
     service_type = await require_service_type(db, body.service_type_id)
-    await _reject_repeated_service(db, room, body)
+    await reject_repeated_service(
+        db,
+        parent="room",
+        parent_id=room.id,
+        parent_name=room.name,
+        service_type_id=body.service_type_id,
+    )
     location = await require_floor_location(db, floor)
     point = await add_audited_point(
         db,
@@ -224,26 +235,6 @@ async def add_room_service(
     )
     await db.commit()
     return point_to_out(point)
-
-
-async def _reject_repeated_service(db: AsyncSession, room: Room, body: RoomServiceRequest) -> None:
-    """At most one point per (room, service type); no DB constraint, so checked here."""
-    repeated = await db.scalar(
-        select(ServicePoint.id).where(
-            ServicePoint.room_id == room.id,
-            ServicePoint.service_type_id == body.service_type_id,
-        )
-    )
-    if repeated is not None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "code": "ROOM_SERVICE_EXISTS",
-                "detail": f'Room "{room.name}" already has this service; edit or remove its '
-                "point instead.",
-                "service_type_id": str(body.service_type_id),
-            },
-        )
 
 
 @router.get("/{room_id}/deletion-impact", response_model=DeletionImpactOut)

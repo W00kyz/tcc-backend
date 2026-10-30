@@ -2,7 +2,7 @@
 server writes its coordinates (app/domain/catalog/points.py), the API never takes them."""
 
 from dataclasses import asdict
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -13,7 +13,12 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deletion_impact import DeletionImpactOut
 from app.api.deps import require_role
-from app.api.point_checks import add_audited_point, require_floor_location, require_service_type
+from app.api.point_checks import (
+    add_audited_point,
+    reject_repeated_service,
+    require_floor_location,
+    require_service_type,
+)
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
 from app.domain.catalog.deletion import (
@@ -137,6 +142,28 @@ async def create_service_point(
     return point_to_out(point)
 
 
+async def _reject_retype_clash(
+    db: AsyncSession, point: ServicePoint, service_type_id: UUID
+) -> None:
+    """A room or place keeps one point per service type, also when a point is retyped."""
+    if point.service_type_id == service_type_id:
+        return
+    parents: list[tuple[Literal["room", "place"], UUID | None]] = [
+        ("room", point.room_id),
+        ("place", point.place_id),
+    ]
+    for parent, parent_id in parents:
+        if parent_id is not None:
+            await reject_repeated_service(
+                db,
+                parent=parent,
+                parent_id=parent_id,
+                parent_name=point.name,
+                service_type_id=service_type_id,
+                exclude_point_id=point.id,
+            )
+
+
 @router.patch("/{point_id}", response_model=ServicePointOut)
 async def update_service_point(
     point_id: UUID,
@@ -155,7 +182,9 @@ async def update_service_point(
         "active": point.active,
     }
     if body.service_type_id is not None:
-        point.service_type = await require_service_type(db, body.service_type_id)
+        service_type = await require_service_type(db, body.service_type_id)
+        await _reject_retype_clash(db, point, body.service_type_id)
+        point.service_type = service_type
     else:
         await db.refresh(point, ["service_type"])
     if body.name is not None and point.room_id is None and point.place_id is None:

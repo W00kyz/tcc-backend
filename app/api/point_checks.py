@@ -2,9 +2,11 @@
 /service-points`, the room endpoints (`POST /rooms`, `POST /rooms/{id}/services`) and the place
 endpoints (`POST /places`, `POST /places/{id}/services`)."""
 
+from typing import Literal
 from uuid import UUID
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.audit.service import record_audit_trail
@@ -31,6 +33,39 @@ async def require_service_type(db: AsyncSession, service_type_id: UUID) -> Servi
             },
         )
     return service_type
+
+
+async def reject_repeated_service(
+    db: AsyncSession,
+    *,
+    parent: Literal["room", "place"],
+    parent_id: UUID,
+    parent_name: str,
+    service_type_id: UUID,
+    exclude_point_id: UUID | None = None,
+) -> None:
+    """At most one point per (room or place, service type); no DB constraint, so checked here.
+    `exclude_point_id` is the point being retyped, which must not clash with itself.
+
+        await reject_repeated_service(db, parent="room", parent_id=room.id, ...)
+    """
+    column = ServicePoint.room_id if parent == "room" else ServicePoint.place_id
+    query = select(ServicePoint.id).where(
+        column == parent_id, ServicePoint.service_type_id == service_type_id
+    )
+    if exclude_point_id is not None:
+        query = query.where(ServicePoint.id != exclude_point_id)
+    if await db.scalar(query.limit(1)) is None:
+        return
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "code": f"{parent.upper()}_SERVICE_EXISTS",
+            "detail": f'{parent.capitalize()} "{parent_name}" already has this service; edit or '
+            "remove its point instead.",
+            "service_type_id": str(service_type_id),
+        },
+    )
 
 
 async def require_floor_location(db: AsyncSession, floor: Floor) -> tuple[float, float]:

@@ -473,3 +473,50 @@ async def test_every_place_route_needs_a_manager(
 
     assert [response.status_code for response in responses] == [403] * 6
     assert client.get("/places").status_code == 401
+
+
+async def test_changing_a_place_point_to_a_type_its_place_already_has_is_a_409(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    setup = await _setup(client, db_session)
+    garden_id, cleaning_id = setup.garden.id, setup.cleaning.id
+    place = _create(client, setup)
+    client.post(
+        f"/places/{place['id']}/services",
+        json={"service_type_id": str(setup.cleaning.id)},
+        headers=setup.headers,
+    )
+    cleaning_point = next(
+        p for p in await _points(db_session) if p.service_type_id == setup.cleaning.id
+    )
+
+    response = client.patch(
+        f"/service-points/{cleaning_point.id}",
+        json={"service_type_id": str(setup.garden.id)},
+        headers=setup.headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "PLACE_SERVICE_EXISTS"
+    db_session.expire_all()
+    assert {p.service_type_id for p in await _points(db_session)} == {garden_id, cleaning_id}
+
+
+async def test_a_place_point_can_keep_its_type_or_move_to_a_free_one(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    setup = await _setup(client, db_session)
+    _create(client, setup)
+    point = (await _points(db_session))[0]
+    url = f"/service-points/{point.id}"
+
+    same = client.patch(
+        url, json={"service_type_id": str(setup.garden.id), "active": False}, headers=setup.headers
+    )
+    free = client.patch(
+        url, json={"service_type_id": str(setup.cleaning.id)}, headers=setup.headers
+    )
+
+    assert same.status_code == 200, same.text
+    assert free.status_code == 200, free.text
+    assert free.json()["service_type_id"] == str(setup.cleaning.id)

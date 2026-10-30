@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deletion_impact import DeletionImpactOut
 from app.api.deps import require_role
-from app.api.point_checks import add_audited_point, require_service_type
+from app.api.point_checks import add_audited_point, reject_repeated_service, require_service_type
 from app.api.service_points import ServicePointOut, point_to_out
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
@@ -26,9 +26,8 @@ from app.domain.settings.service import get_settings_row
 
 router = APIRouter(prefix="/places", tags=["places"])
 
-# Stable codes of the 4xx the dashboard keys on.
+# Stable code of the 422 the dashboard keys on (PLACE_SERVICE_EXISTS: app/api/point_checks.py).
 OUTSIDE_CAMPUS = "OUTSIDE_CAMPUS"
-PLACE_SERVICE_EXISTS = "PLACE_SERVICE_EXISTS"
 PlaceName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 Latitude = Annotated[float, Field(ge=-90, le=90, allow_inf_nan=False)]
 Longitude = Annotated[float, Field(ge=-180, le=180, allow_inf_nan=False)]
@@ -97,26 +96,6 @@ async def _require_on_campus(db: AsyncSession, latitude: float, longitude: float
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"code": OUTSIDE_CAMPUS, "detail": str(exc)},
         ) from exc
-
-
-async def _reject_repeated_service(db: AsyncSession, place: Place, service_type_id: UUID) -> None:
-    """At most one point per (place, service type); no DB constraint, so checked here."""
-    repeated = await db.scalar(
-        select(ServicePoint.id).where(
-            ServicePoint.place_id == place.id,
-            ServicePoint.service_type_id == service_type_id,
-        )
-    )
-    if repeated is not None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "code": PLACE_SERVICE_EXISTS,
-                "detail": f'Place "{place.name}" already has this service; edit or remove its '
-                "point instead.",
-                "service_type_id": str(service_type_id),
-            },
-        )
 
 
 @router.get("", response_model=list[PlaceOut])
@@ -220,7 +199,13 @@ async def add_place_service(
 ) -> ServicePointOut:
     place = await _require_place(db, place_id)
     service_type = await require_service_type(db, body.service_type_id)
-    await _reject_repeated_service(db, place, body.service_type_id)
+    await reject_repeated_service(
+        db,
+        parent="place",
+        parent_id=place.id,
+        parent_name=place.name,
+        service_type_id=body.service_type_id,
+    )
     point = await add_audited_point(
         db,
         actor,
