@@ -17,6 +17,7 @@ from app.api.field_workers import router as field_workers_router
 from app.api.floors import router as floors_router
 from app.api.health import router as health_router
 from app.api.impediments import router as impediments_router
+from app.api.location_completions import router as location_completions_router
 from app.api.me import router as me_router
 from app.api.monitoring import router as monitoring_router
 from app.api.notifications import router as notifications_router
@@ -159,6 +160,7 @@ def create_app(
     app.include_router(routes_router)
     app.include_router(checkins_router)
     app.include_router(checkouts_router)
+    app.include_router(location_completions_router)
     app.include_router(evidence_router)
     app.include_router(executions_router)
     app.include_router(users_router)
