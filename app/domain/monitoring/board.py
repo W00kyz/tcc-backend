@@ -224,18 +224,22 @@ async def _not_started(db: AsyncSession, today: date) -> list[WorkerRef]:
 
 
 async def _pool_kpis(db: AsyncSession, today: date) -> list[PoolKpi]:
-    """Today's typed points per service type. A served point counts as done even when it is
+    """Today's active typed points per service type. A served point counts as done even when it is
     also back in somebody's batch; so done, in progress and free never overlap."""
     in_a_batch = exists().where(
         RouteStop.service_point_id == ServicePoint.id,
         RouteStop.service_date == today,
         RouteStop.status.in_(LIVE_STOP_STATUSES),
     )
-    points = select(
-        ServicePoint.service_type_id,
-        served_on(today).label("served"),
-        in_a_batch.label("in_a_batch"),
-    ).subquery()
+    points = (
+        select(
+            ServicePoint.service_type_id,
+            served_on(today).label("served"),
+            in_a_batch.label("in_a_batch"),
+        )
+        .where(ServicePoint.active.is_(True))
+        .subquery()
+    )
     stmt = (
         select(
             ServiceType.id,

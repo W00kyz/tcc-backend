@@ -224,12 +224,13 @@ async def _close_past_days(db: AsyncSession, *, today: date, now: datetime) -> N
 
 async def _unserved_per_type(db: AsyncSession, day: date) -> list[tuple[str, str, int]]:
     """(service type, company, points not served on `day`) for every type with any, by type
-    name. Only typed points of a company count — an untyped point is in nobody's pool."""
+    name. Only active typed points of a company count — an untyped or switched-off point is in
+    nobody's pool."""
     rows = await db.execute(
         select(ServiceType.name, ContractorCompany.name, func.count(ServicePoint.id))
         .join(ServiceType, ServicePoint.service_type_id == ServiceType.id)
         .join(ContractorCompany, ServiceType.contractor_company_id == ContractorCompany.id)
-        .where(~served_on(day))
+        .where(ServicePoint.active.is_(True), ~served_on(day))
         .group_by(ServiceType.name, ContractorCompany.name)
         .order_by(ServiceType.name)
     )

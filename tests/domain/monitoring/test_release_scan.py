@@ -447,3 +447,15 @@ async def test_a_fridays_route_left_open_is_closed_even_on_a_saturday(
     assert alerts == []
     assert route_status is RouteStatus.DONE
     _assert_released(stops, ReleaseReason.END_OF_DAY)
+
+
+async def test_a_switched_off_point_is_not_counted_as_unserved(db_session: AsyncSession) -> None:
+    working = await _working(db_session, allocated_minutes_ago=5, now=_FIVE_PM, rooms=3)
+    working.points[0].active = False
+    await db_session.commit()
+
+    alerts = await run_release_scan(db_session, now=_FIVE_PM)
+
+    assert [alert.description for alert in alerts] == [
+        "Expediente encerrado com 2 ponto(s) não atendido(s) hoje: Limpeza (Limpa Tudo): 2."
+    ]

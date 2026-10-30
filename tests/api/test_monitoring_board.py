@@ -129,6 +129,26 @@ async def test_pool_kpis_per_type(client: TestClient, db_session: AsyncSession) 
     assert body["released_today"] == 2
 
 
+async def test_a_switched_off_point_leaves_the_pool_until_reactivated(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _manager(db_session)
+    cleaning = await make_service_type(db_session, company_name="Limpa Tudo", type_name="Limpeza")
+    kept, switched_off = await make_points(
+        db_session, service_type=cleaning, names=["Sala 1", "Sala 2"]
+    )
+    switched_off.active = False
+    await db_session.commit()
+
+    assert [(kpi["total"], kpi["free"]) for kpi in _board(client)["pool"]] == [(1, 1)]
+
+    switched_off.active = True
+    await db_session.commit()
+
+    assert [(kpi["total"], kpi["free"]) for kpi in _board(client)["pool"]] == [(2, 2)]
+    assert kept.active
+
+
 async def test_not_started_lists_approved_workers_without_route(
     client: TestClient, db_session: AsyncSession
 ) -> None:
