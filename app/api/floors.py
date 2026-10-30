@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
-from app.domain.catalog.floors import next_floor_label
+from app.domain.catalog.floors import next_floor
 from app.domain.catalog.models import Building, Floor
 from app.domain.identity.models import User, UserRole
 
@@ -25,6 +25,7 @@ class FloorOut(BaseModel):
     id: UUID
     building_id: UUID
     label: str
+    level: int
 
 
 class FloorCreateRequest(BaseModel):
@@ -38,7 +39,9 @@ class FloorUpdateRequest(BaseModel):
 
 
 def _to_out(floor: Floor) -> FloorOut:
-    return FloorOut(id=floor.id, building_id=floor.building_id, label=floor.label)
+    return FloorOut(
+        id=floor.id, building_id=floor.building_id, label=floor.label, level=floor.level
+    )
 
 
 @router.get("", response_model=list[FloorOut])
@@ -47,9 +50,9 @@ async def list_floors(
     db: Annotated[AsyncSession, Depends(get_db)],
     building_id: UUID | None = None,
 ) -> list[FloorOut]:
-    # Registration order (id breaks ties): without it, Postgres returns an edited row last and
-    # the dashboard's floor tabs reshuffle after a rename.
-    query = select(Floor).order_by(Floor.created_at, Floor.id)
+    # Level first, then registration order (id breaks ties): without an ORDER BY, Postgres
+    # returns an edited row last and the dashboard's floor tabs reshuffle after a rename.
+    query = select(Floor).order_by(Floor.level, Floor.created_at, Floor.id)
     if building_id is not None:
         query = query.where(Floor.building_id == building_id)
     floors = (await db.scalars(query)).all()
@@ -71,14 +74,14 @@ async def create_floor(
     if building is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Building "{body.building_id}" not found.')
 
-    label = body.label
-    if label is None:
-        existing = await db.scalars(
-            select(Floor.label).where(Floor.building_id == body.building_id)
-        )
-        label = next_floor_label(list(existing))
+    levels = list(
+        await db.scalars(select(Floor.level).where(Floor.building_id == body.building_id))
+    )
+    level, default_label = next_floor(levels)
+    # A typed label wins over the default; the level is positional either way.
+    label = body.label if body.label is not None else default_label
 
-    floor = Floor(building_id=body.building_id, label=label)
+    floor = Floor(building_id=body.building_id, label=label, level=level)
     db.add(floor)
     try:
         await db.flush()

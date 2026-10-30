@@ -19,8 +19,9 @@ from app.domain.catalog.deletion import (
     impact_of_building,
     remove_photo_objects,
 )
+from app.domain.catalog.floors import GROUND_FLOOR_LABEL
 from app.domain.catalog.footprint import PolygonFootprint
-from app.domain.catalog.models import Building
+from app.domain.catalog.models import Building, Floor
 from app.domain.catalog.points import place_points_of_building
 from app.domain.identity.models import User, UserRole
 
@@ -88,6 +89,22 @@ async def list_buildings(
     return [_to_out(building) for building in buildings]
 
 
+async def _add_ground_floor(db: AsyncSession, actor: User, building: Building) -> None:
+    """Every building starts with its Térreo, in the same transaction as the building."""
+    floor = Floor(building_id=building.id, label=GROUND_FLOOR_LABEL, level=0)
+    db.add(floor)
+    await db.flush()
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="floor",
+        entity_id=floor.id,
+        action="create",
+        before=None,
+        after={"building_id": str(floor.building_id), "label": floor.label},
+    )
+
+
 @router.post("", response_model=BuildingOut, status_code=status.HTTP_201_CREATED)
 async def create_building(
     body: BuildingCreateRequest,
@@ -102,6 +119,7 @@ async def create_building(
     )
     db.add(building)
     await db.flush()
+    await _add_ground_floor(db, actor, building)
     await record_audit_trail(
         db,
         actor_id=actor.id,

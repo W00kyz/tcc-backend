@@ -1,10 +1,17 @@
 import uuid
 
 from app.core.security import hash_password
-from app.domain.catalog.models import Building
+from app.domain.audit.models import AuditTrail
+from app.domain.catalog.models import Building, Floor
 from app.domain.identity.models import User, UserRole
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+OUTLINE = {
+    "type": "Polygon",
+    "coordinates": [[[-35.909, -7.214], [-35.908, -7.214], [-35.908, -7.215], [-35.909, -7.214]]],
+}
 
 
 def _login(client: TestClient, email: str) -> str:
@@ -131,25 +138,114 @@ async def test_floors_keep_registration_order_after_an_edit(
     assert [floor["id"] for floor in listing.json()] == ids
 
 
-async def test_floors_created_without_a_label_are_numbered(
-    client: TestClient, db_session: AsyncSession
-) -> None:
+async def _manager_headers(client: TestClient, db_session: AsyncSession) -> dict[str, str]:
     manager = User(
         name="Larissa",
         email="larissa@pu.ufcg.edu.br",
         password_hash=hash_password("senha-forte-o-suficiente"),
         role=UserRole.MANAGER,
     )
-    building = Building(name="Bloco CI", campus_area="CCT")
-    db_session.add_all([manager, building])
+    db_session.add(manager)
     await db_session.commit()
-    headers = {"Authorization": f"Bearer {_login(client, manager.email)}"}
+    return {"Authorization": f"Bearer {_login(client, manager.email)}"}
+
+
+async def test_floors_created_without_a_label_are_numbered(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add(building)
+    await db_session.commit()
+
+    floors = [
+        client.post("/floors", json={"building_id": str(building.id)}, headers=headers).json()
+        for _ in range(4)
+    ]
+
+    assert [(f["level"], f["label"]) for f in floors] == [
+        (0, "Térreo"),
+        (1, "1"),
+        (2, "2"),
+        (3, "3"),
+    ]
+
+
+async def test_a_new_building_comes_with_its_ground_floor(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    created = client.post(
+        "/buildings",
+        json={"name": "Bloco CI", "campus_area": "CCT", "footprint": OUTLINE},
+        headers=headers,
+    )
+    building_id = created.json()["id"]
+
+    listing = client.get(f"/floors?building_id={building_id}", headers=headers).json()
+    audits = (
+        await db_session.scalars(
+            select(AuditTrail).where(
+                AuditTrail.entity_type == "floor",
+                AuditTrail.action == "create",
+                AuditTrail.entity_id == uuid.UUID(listing[0]["id"]),
+            )
+        )
+    ).all()
+
+    assert [(f["label"], f["level"]) for f in listing] == [("Térreo", 0)]
+    assert len(audits) == 1
+
+
+async def test_floors_after_the_automatic_ground_floor_are_numbered_from_one(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    building_id = client.post(
+        "/buildings",
+        json={"name": "Bloco CI", "campus_area": "CCT", "footprint": OUTLINE},
+        headers=headers,
+    ).json()["id"]
 
     labels = [
-        client.post("/floors", json={"building_id": str(building.id)}, headers=headers).json()[
-            "label"
-        ]
+        client.post("/floors", json={"building_id": building_id}, headers=headers).json()["label"]
         for _ in range(3)
     ]
 
-    assert labels == ["Térreo", "1", "2"]
+    assert labels == ["1", "2", "3"]
+
+
+async def test_a_manual_label_still_gets_the_next_level(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    headers = await _manager_headers(client, db_session)
+    building_id = client.post(
+        "/buildings",
+        json={"name": "Bloco CI", "campus_area": "CCT", "footprint": OUTLINE},
+        headers=headers,
+    ).json()["id"]
+
+    floor = client.post(
+        "/floors", json={"building_id": building_id, "label": "Subsolo"}, headers=headers
+    ).json()
+
+    assert (floor["label"], floor["level"]) == ("Subsolo", 1)
+
+
+async def test_floors_are_listed_by_level(client: TestClient, db_session: AsyncSession) -> None:
+    headers = await _manager_headers(client, db_session)
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add(building)
+    await db_session.commit()
+    db_session.add_all(
+        [
+            Floor(building_id=building.id, label="2", level=2),
+            Floor(building_id=building.id, label="Térreo", level=0),
+            Floor(building_id=building.id, label="1", level=1),
+        ]
+    )
+    await db_session.commit()
+
+    listing = client.get(f"/floors?building_id={building.id}", headers=headers).json()
+
+    assert [floor["level"] for floor in listing] == [0, 1, 2]
