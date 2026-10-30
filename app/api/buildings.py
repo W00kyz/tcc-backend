@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deletion_impact import DeletionImpactOut
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
@@ -56,17 +57,6 @@ class BuildingFootprintRequest(BaseModel):
     # anything else is a client bug (422), not a value to store or an overflow to surface as
     # a 500.
     osm_way_id: int | None = Field(default=None, gt=0, lt=2**63)
-
-
-class DeletionImpactOut(BaseModel):
-    """What a removal takes with it — shown before the manager confirms."""
-
-    points: int
-    floors: int
-    routes: int
-    executions: int
-    photos: int
-    appeals: int
 
 
 def _to_out(building: Building) -> BuildingOut:

@@ -1,4 +1,4 @@
-"""Removing a building or a service point together with its history (spec
+"""Removing a building, floor, room or service point together with its history (spec
 2026-10-20-predios-pontos-dialogs-design.md §3.4, decided by the product owner: removal deletes
 the history). Everything below runs in the caller's transaction; the photo object keys come back
 so the caller deletes the objects from storage only after the commit.
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.object_store import ObjectStore, ObjectStoreError
 from app.domain.appeals.models import Appeal
-from app.domain.catalog.models import Building, Floor, ServicePoint
+from app.domain.catalog.models import Building, Floor, Room, ServicePoint
 from app.domain.execution.models import (
     EvidenceItem,
     EvidenceKind,
@@ -43,6 +43,7 @@ class DeletionImpact:
     executions: int
     photos: int
     appeals: int
+    rooms: int = 0
 
 
 async def _ids(db: AsyncSession, query: Select[Any]) -> list[uuid.UUID]:
@@ -53,6 +54,10 @@ def _points_of_floors(floor_ids: Ids) -> Select[Any]:
     return select(ServicePoint.id).where(ServicePoint.floor_id.in_(floor_ids))
 
 
+def _points_of_rooms(room_ids: Ids) -> Select[Any]:
+    return select(ServicePoint.id).where(ServicePoint.room_id.in_(room_ids))
+
+
 def _stops_of_points(point_ids: Ids) -> Select[Any]:
     return select(RouteStop.id).where(RouteStop.service_point_id.in_(point_ids))
 
@@ -61,7 +66,7 @@ def _executions_of_stops(stop_ids: Ids) -> Select[Any]:
     return select(Execution.id).where(Execution.route_stop_id.in_(stop_ids))
 
 
-async def _impact(db: AsyncSession, point_ids: Ids, floors: int) -> DeletionImpact:
+async def _impact(db: AsyncSession, point_ids: Ids, floors: int, rooms: int = 0) -> DeletionImpact:
     stop_ids = await _ids(db, _stops_of_points(point_ids))
     execution_ids = await _ids(db, _executions_of_stops(stop_ids))
     routes = await db.scalar(
@@ -80,6 +85,7 @@ async def _impact(db: AsyncSession, point_ids: Ids, floors: int) -> DeletionImpa
         executions=len(execution_ids),
         photos=int(photos or 0),
         appeals=int(appeals or 0),
+        rooms=rooms,
     )
 
 
@@ -91,8 +97,24 @@ async def impact_of_point(db: AsyncSession, point_id: uuid.UUID) -> DeletionImpa
 async def impact_of_building(db: AsyncSession, building_id: uuid.UUID) -> DeletionImpact:
     """Example: ``impact = await impact_of_building(db, building.id)``"""
     floor_ids = await _ids(db, select(Floor.id).where(Floor.building_id == building_id))
+    return await _impact_of_floors(db, floor_ids)
+
+
+async def _impact_of_floors(db: AsyncSession, floor_ids: Ids) -> DeletionImpact:
     point_ids = await _ids(db, _points_of_floors(floor_ids))
-    return await _impact(db, point_ids, floors=len(floor_ids))
+    rooms = await db.scalar(select(func.count()).where(Room.floor_id.in_(floor_ids)))
+    return await _impact(db, point_ids, floors=len(floor_ids), rooms=int(rooms or 0))
+
+
+async def impact_of_floor(db: AsyncSession, floor_id: uuid.UUID) -> DeletionImpact:
+    """Example: ``impact = await impact_of_floor(db, floor.id)``"""
+    return await _impact_of_floors(db, [floor_id])
+
+
+async def impact_of_room(db: AsyncSession, room_id: uuid.UUID) -> DeletionImpact:
+    """Example: ``impact = await impact_of_room(db, room.id)``"""
+    point_ids = await _ids(db, _points_of_rooms([room_id]))
+    return await _impact(db, point_ids, floors=0, rooms=1)
 
 
 async def _delete_executions(db: AsyncSession, execution_ids: Ids) -> list[str]:
@@ -178,20 +200,47 @@ async def delete_point(db: AsyncSession, point_id: uuid.UUID) -> list[str]:
     return await _delete_points(db, [point_id])
 
 
-async def delete_building(db: AsyncSession, building_id: uuid.UUID) -> list[str]:
-    """Deletes the building, its floors, QR codes, points and their history; returns the photo
-    object keys to remove after commit.
-
-    Example: ``keys = await delete_building(db, building.id); await db.commit()``
-    """
-    floor_ids = await _ids(db, select(Floor.id).where(Floor.building_id == building_id))
+async def _delete_floors(db: AsyncSession, floor_ids: Ids) -> list[str]:
+    """Points (with history), rooms, QR codes, then floors: each table before its referent."""
     photo_keys = await _delete_points(db, await _ids(db, _points_of_floors(floor_ids)))
+    await db.execute(delete(Room).where(Room.floor_id.in_(floor_ids)))
     qr_ids = await _ids(db, select(QrCode.id).where(QrCode.floor_id.in_(floor_ids)))
     await db.execute(delete(QrScan).where(QrScan.qr_code_id.in_(qr_ids)))
     # A replaced code points at its replacement: unlink before deleting the floor's codes.
     await db.execute(update(QrCode).where(QrCode.id.in_(qr_ids)).values(replaced_by_id=None))
     await db.execute(delete(QrCode).where(QrCode.id.in_(qr_ids)))
     await db.execute(delete(Floor).where(Floor.id.in_(floor_ids)))
+    return photo_keys
+
+
+async def delete_floor(db: AsyncSession, floor_id: uuid.UUID) -> list[str]:
+    """Deletes the floor, its rooms, QR codes, points and their history; returns the photo
+    object keys to remove after commit.
+
+    Example: ``keys = await delete_floor(db, floor.id); await db.commit()``
+    """
+    return await _delete_floors(db, [floor_id])
+
+
+async def delete_room(db: AsyncSession, room_id: uuid.UUID) -> list[str]:
+    """Deletes the room and its points with their history (the floor and the other rooms stay);
+    returns the photo object keys to remove after commit.
+
+    Example: ``keys = await delete_room(db, room.id); await db.commit()``
+    """
+    photo_keys = await _delete_points(db, await _ids(db, _points_of_rooms([room_id])))
+    await db.execute(delete(Room).where(Room.id == room_id))
+    return photo_keys
+
+
+async def delete_building(db: AsyncSession, building_id: uuid.UUID) -> list[str]:
+    """Deletes the building, its floors, rooms, QR codes, points and their history; returns the
+    photo object keys to remove after commit.
+
+    Example: ``keys = await delete_building(db, building.id); await db.commit()``
+    """
+    floor_ids = await _ids(db, select(Floor.id).where(Floor.building_id == building_id))
+    photo_keys = await _delete_floors(db, floor_ids)
     await db.execute(delete(Building).where(Building.id == building_id))
     return photo_keys
 

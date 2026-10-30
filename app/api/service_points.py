@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.api.deletion_impact import DeletionImpactOut
 from app.api.deps import require_role
 from app.api.point_checks import add_audited_point, require_floor_location, require_service_type
 from app.db.session import get_db
@@ -58,17 +59,6 @@ class ServicePointUpdateRequest(BaseModel):
     service_type_id: UUID | None = None
     # None leaves it as is; False takes the point out of new allocations and the expected set.
     active: bool | None = None
-
-
-class DeletionImpactOut(BaseModel):
-    """What a removal takes with it — shown before the manager confirms."""
-
-    points: int
-    floors: int
-    routes: int
-    executions: int
-    photos: int
-    appeals: int
 
 
 def point_to_out(point: ServicePoint) -> ServicePointOut:

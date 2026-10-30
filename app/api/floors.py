@@ -1,19 +1,21 @@
-"""Floor CRUD for managers/admins (RF06 prerequisite). No hard-delete endpoint —
-floors are referenced by service points and QR codes, so removing one outright
-would orphan history; create/list/edit is all this task needs."""
+"""Floor CRUD for managers/admins (RF06 prerequisite). Removing a floor takes its rooms, QR
+codes, points and their history with it (app/domain/catalog/deletion.py)."""
 
+from dataclasses import asdict
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deletion_impact import DeletionImpactOut
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
+from app.domain.catalog.deletion import delete_floor, impact_of_floor, remove_photo_objects
 from app.domain.catalog.floors import next_floor
 from app.domain.catalog.models import Building, Floor
 from app.domain.identity.models import User, UserRole
@@ -134,3 +136,48 @@ async def update_floor(
             f'Floor "{body.label}" already exists for this building.',
         ) from exc
     return _to_out(floor)
+
+
+async def _load_floor(db: AsyncSession, floor_id: UUID) -> Floor:
+    floor = await db.get(Floor, floor_id)
+    if floor is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f'Floor "{floor_id}" not found.')
+    return floor
+
+
+@router.get("/{floor_id}/deletion-impact", response_model=DeletionImpactOut)
+async def floor_deletion_impact(
+    floor_id: UUID,
+    _actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> DeletionImpactOut:
+    await _load_floor(db, floor_id)
+    impact = await impact_of_floor(db, floor_id)
+    return DeletionImpactOut(**asdict(impact))
+
+
+@router.delete("/{floor_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_floor_endpoint(
+    floor_id: UUID,
+    request: Request,
+    actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    """Removes the floor with its rooms, QR codes, points and their history (spec
+    2026-10-29-andares-salas-design.md §3, same rule as the building)."""
+    floor = await _load_floor(db, floor_id)
+    impact = await impact_of_floor(db, floor_id)
+    before = {"label": floor.label, **asdict(impact)}
+    photo_keys = await delete_floor(db, floor_id)
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="floor",
+        entity_id=floor_id,
+        action="delete",
+        before=before,
+        after=None,
+    )
+    await db.commit()
+    await remove_photo_objects(request.app.state.object_store, photo_keys)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

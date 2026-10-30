@@ -7,7 +7,8 @@ from typing import cast
 
 from app.core.config import Settings
 from app.domain.appeals.models import Appeal
-from app.domain.catalog.models import Building, Floor, ServicePoint
+from app.domain.audit.models import AuditTrail
+from app.domain.catalog.models import Building, Floor, Room, ServicePoint
 from app.domain.execution.models import EvidenceItem, Execution
 from app.domain.identity.models import UserRole
 from app.domain.qr.models import QrCode
@@ -74,6 +75,7 @@ async def test_the_impact_counts_what_goes_with_a_point(
         "executions": 1,
         "photos": 1,
         "appeals": 0,
+        "rooms": 0,
     }
 
 
@@ -134,6 +136,7 @@ async def test_deleting_a_building_removes_floors_qr_codes_points_and_routes(
         "executions": 1,
         "photos": 1,
         "appeals": 0,
+        "rooms": 0,
     }
     assert response.status_code == 204, response.text
     db_session.expire_all()
@@ -220,8 +223,230 @@ async def test_deleting_a_building_with_an_accepted_appeal_takes_its_execution_t
         "executions": 1,
         "photos": 0,
         "appeals": 1,
+        "rooms": 0,
     }
     assert response.status_code == 204, response.text
     db_session.expire_all()
     for model in (Building, ServicePoint, RouteStop, Execution, Appeal):
         assert await _count(db_session, model) == 0, model.__name__
+
+
+async def _two_rooms_on_the_floor(
+    db_session: AsyncSession, seeded: SeededRoute
+) -> tuple[Room, Room]:
+    """The seeded points become room "101" (Sala A) and room "102" (Sala B) of the floor."""
+    rooms = (Room(floor_id=seeded.floor.id, name="101"), Room(floor_id=seeded.floor.id, name="102"))
+    db_session.add_all(rooms)
+    await db_session.flush()
+    for point, room in zip(seeded.points, rooms, strict=True):
+        point.room_id = room.id
+    await db_session.commit()
+    return rooms
+
+
+async def _sibling_floor(db_session: AsyncSession, seeded: SeededRoute) -> tuple[Floor, Room]:
+    """A second floor of the same building with one room and one point, to prove it survives."""
+    floor = Floor(building_id=seeded.floor.building_id, label="1º andar", level=1)
+    db_session.add(floor)
+    await db_session.flush()
+    room = Room(floor_id=floor.id, name="201")
+    db_session.add(room)
+    await db_session.flush()
+    db_session.add(
+        ServicePoint(
+            floor_id=floor.id,
+            room_id=room.id,
+            name="201",
+            description="",
+            latitude=-7.2,
+            longitude=-35.9,
+        )
+    )
+    await db_session.commit()
+    return floor, room
+
+
+async def test_the_impact_of_a_floor_counts_its_rooms_and_points_without_deleting(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    await _two_rooms_on_the_floor(db_session, seeded)
+    floor_id = seeded.floor.id
+    await _executed_first_stop(client, db_session, seeded)
+
+    response = client.get(f"/floors/{floor_id}/deletion-impact", headers=_manager_auth(client))
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "points": 2,
+        "floors": 1,
+        "routes": 1,
+        "executions": 1,
+        "photos": 1,
+        "appeals": 0,
+        "rooms": 2,
+    }
+    assert await _count(db_session, Floor) == 1
+    assert await _count(db_session, Room) == 2
+    assert await _count(db_session, ServicePoint) == 2
+
+
+async def test_deleting_a_floor_removes_its_rooms_points_and_history_but_not_its_sibling(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    await _two_rooms_on_the_floor(db_session, seeded)
+    sibling, sibling_room = await _sibling_floor(db_session, seeded)
+    floor_id, sibling_id, sibling_room_id = seeded.floor.id, sibling.id, sibling_room.id
+    await _executed_first_stop(client, db_session, seeded)
+    assert len(_store(client).objects) == 1
+
+    response = client.delete(f"/floors/{floor_id}", headers=_manager_auth(client))
+
+    assert response.status_code == 204, response.text
+    db_session.expire_all()
+    assert await db_session.get(Floor, floor_id) is None
+    assert await db_session.get(Floor, sibling_id) is not None
+    assert await db_session.get(Room, sibling_room_id) is not None
+    for model in (QrCode, Route, RouteStop, Execution, EvidenceItem):
+        assert await _count(db_session, model) == 0, model.__name__
+    assert await _count(db_session, Room) == 1
+    assert await _count(db_session, ServicePoint) == 1
+    assert _store(client).objects == {}
+    audit = (
+        await db_session.scalars(select(AuditTrail).where(AuditTrail.entity_type == "floor"))
+    ).one()
+    assert audit.action == "delete"
+    assert audit.before_data is not None
+    assert audit.before_data["label"] == "Térreo"
+    assert audit.before_data["rooms"] == 2
+
+
+async def test_deleting_a_floor_also_removes_its_points_that_belong_to_no_room(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+    floor_id = seeded.floor.id
+
+    response = client.delete(f"/floors/{floor_id}", headers=_manager_auth(client))
+
+    assert response.status_code == 204, response.text
+    db_session.expire_all()
+    assert await _count(db_session, ServicePoint) == 0
+    assert await _count(db_session, Floor) == 0
+
+
+async def test_deleting_a_floor_unlinks_a_replaced_qr_code_from_its_replacement(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings)
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+    floor_id = seeded.floor.id
+    old = QrCode(
+        floor_id=floor_id,
+        public_code="old",
+        secret=b"s",
+        version=0,
+        replaced_by_id=seeded.qr_code.id,
+    )
+    db_session.add(old)
+    await db_session.commit()
+
+    response = client.delete(f"/floors/{floor_id}", headers=_manager_auth(client))
+
+    assert response.status_code == 204, response.text
+    db_session.expire_all()
+    assert await _count(db_session, QrCode) == 0
+
+
+async def test_deleting_a_building_also_removes_the_rooms_of_its_floors(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+    await _two_rooms_on_the_floor(db_session, seeded)
+    await _sibling_floor(db_session, seeded)
+    building_id = seeded.floor.building_id
+    auth = _manager_auth(client)
+
+    impact = client.get(f"/buildings/{building_id}/deletion-impact", headers=auth)
+    response = client.delete(f"/buildings/{building_id}", headers=auth)
+
+    assert impact.json()["rooms"] == 3
+    assert response.status_code == 204, response.text
+    db_session.expire_all()
+    for model in (Building, Floor, Room, ServicePoint):
+        assert await _count(db_session, model) == 0, model.__name__
+
+
+async def test_the_impact_of_a_room_counts_only_its_own_points(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    room_a, _room_b = await _two_rooms_on_the_floor(db_session, seeded)
+    room_a_id = room_a.id
+    await _executed_first_stop(client, db_session, seeded)
+
+    response = client.get(f"/rooms/{room_a_id}/deletion-impact", headers=_manager_auth(client))
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "points": 1,
+        "floors": 0,
+        "routes": 1,
+        "executions": 1,
+        "photos": 1,
+        "appeals": 0,
+        "rooms": 1,
+    }
+    assert await _count(db_session, Room) == 2
+
+
+async def test_deleting_a_room_removes_only_its_points_and_history(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    room_a, room_b = await _two_rooms_on_the_floor(db_session, seeded)
+    room_a_id, room_b_id = room_a.id, room_b.id
+    kept_point, route_id = seeded.points[1].id, seeded.route.id
+    await _executed_first_stop(client, db_session, seeded)
+
+    response = client.delete(f"/rooms/{room_a_id}", headers=_manager_auth(client))
+
+    assert response.status_code == 204, response.text
+    db_session.expire_all()
+    assert await db_session.get(Room, room_a_id) is None
+    assert await db_session.get(Room, room_b_id) is not None
+    assert await db_session.get(ServicePoint, kept_point) is not None
+    assert await db_session.get(Route, route_id) is not None
+    assert await _count(db_session, ServicePoint) == 1
+    assert await _count(db_session, Execution) == 0
+    assert await _count(db_session, Floor) == 1
+    assert _store(client).objects == {}
+    audit = (
+        await db_session.scalars(select(AuditTrail).where(AuditTrail.entity_type == "room"))
+    ).one()
+    assert audit.action == "delete"
+    assert audit.before_data is not None
+    assert audit.before_data["name"] == "101"
+    assert audit.before_data["rooms"] == 1
+
+
+async def test_floor_and_room_removal_answer_404_and_403(
+    client: TestClient, db_session: AsyncSession, test_settings: Settings
+) -> None:
+    seeded = await _seed_route(db_session, test_settings, point_specs=_TWO_ROOMS)
+    room_a, _room_b = await _two_rooms_on_the_floor(db_session, seeded)
+    room_a_id, floor_id = room_a.id, seeded.floor.id
+    await _add_user(db_session, _MANAGER_EMAIL, UserRole.MANAGER)
+    auth = _manager_auth(client)
+    unknown = "00000000-0000-0000-0000-000000000000"
+
+    for path in (f"/floors/{unknown}", f"/rooms/{unknown}"):
+        assert client.delete(path, headers=auth).status_code == 404
+        assert client.get(f"{path}/deletion-impact", headers=auth).status_code == 404
+    worker = {"Authorization": f"Bearer {_login(client)}"}
+    assert client.delete(f"/floors/{floor_id}", headers=worker).status_code == 403
+    assert client.delete(f"/rooms/{room_a_id}", headers=worker).status_code == 403
+    assert client.get(f"/rooms/{room_a_id}/deletion-impact", headers=worker).status_code == 403

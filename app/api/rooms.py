@@ -1,20 +1,23 @@
 """Room CRUD for managers/admins (spec 2026-10-29-andares-salas §4 and §5). A new room gets a
 default cleaning point; other services are added one point per (room, service type)."""
 
+from dataclasses import asdict
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, StringConstraints
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deletion_impact import DeletionImpactOut
 from app.api.deps import require_role
 from app.api.point_checks import add_audited_point, require_floor_location, require_service_type
 from app.api.service_points import ServicePointOut, point_to_out
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
+from app.domain.catalog.deletion import delete_room, impact_of_room, remove_photo_objects
 from app.domain.catalog.models import Floor, Room, ServicePoint
 from app.domain.catalog.points import floor_location
 from app.domain.catalog.rooms import RoomLimitReached, find_cleaning_type, next_room_name
@@ -235,3 +238,41 @@ async def _reject_repeated_service(db: AsyncSession, room: Room, body: RoomServi
                 "service_type_id": str(body.service_type_id),
             },
         )
+
+
+@router.get("/{room_id}/deletion-impact", response_model=DeletionImpactOut)
+async def room_deletion_impact(
+    room_id: UUID,
+    _actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> DeletionImpactOut:
+    await _require_room(db, room_id)
+    impact = await impact_of_room(db, room_id)
+    return DeletionImpactOut(**asdict(impact))
+
+
+@router.delete("/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_room_endpoint(
+    room_id: UUID,
+    request: Request,
+    actor: Annotated[User, Depends(require_role(UserRole.MANAGER, UserRole.ADMIN))],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    """Removes the room with its points and their history; the floor and the other rooms stay
+    (spec 2026-10-29-andares-salas-design.md §4 "Remover sala")."""
+    room = await _require_room(db, room_id)
+    impact = await impact_of_room(db, room_id)
+    before = {"name": room.name, **asdict(impact)}
+    photo_keys = await delete_room(db, room_id)
+    await record_audit_trail(
+        db,
+        actor_id=actor.id,
+        entity_type="room",
+        entity_id=room_id,
+        action="delete",
+        before=before,
+        after=None,
+    )
+    await db.commit()
+    await remove_photo_objects(request.app.state.object_store, photo_keys)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
