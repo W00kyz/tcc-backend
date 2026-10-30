@@ -129,3 +129,27 @@ async def test_floors_keep_registration_order_after_an_edit(
     listing = client.get(f"/floors?building_id={building.id}", headers=auth)
 
     assert [floor["id"] for floor in listing.json()] == ids
+
+
+async def test_floors_created_without_a_label_are_numbered(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    manager = User(
+        name="Larissa",
+        email="larissa@pu.ufcg.edu.br",
+        password_hash=hash_password("senha-forte-o-suficiente"),
+        role=UserRole.MANAGER,
+    )
+    building = Building(name="Bloco CI", campus_area="CCT")
+    db_session.add_all([manager, building])
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {_login(client, manager.email)}"}
+
+    labels = [
+        client.post("/floors", json={"building_id": str(building.id)}, headers=headers).json()[
+            "label"
+        ]
+        for _ in range(3)
+    ]
+
+    assert labels == ["Térreo", "1", "2"]

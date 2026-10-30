@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import require_role
 from app.db.session import get_db
 from app.domain.audit.service import record_audit_trail
+from app.domain.catalog.floors import next_floor_label
 from app.domain.catalog.models import Building, Floor
 from app.domain.identity.models import User, UserRole
 
@@ -28,7 +29,8 @@ class FloorOut(BaseModel):
 
 class FloorCreateRequest(BaseModel):
     building_id: UUID
-    label: str
+    # Omitted, the server picks it: "Térreo" for the first floor, then the next number.
+    label: str | None = None
 
 
 class FloorUpdateRequest(BaseModel):
@@ -69,14 +71,21 @@ async def create_floor(
     if building is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f'Building "{body.building_id}" not found.')
 
-    floor = Floor(building_id=body.building_id, label=body.label)
+    label = body.label
+    if label is None:
+        existing = await db.scalars(
+            select(Floor.label).where(Floor.building_id == body.building_id)
+        )
+        label = next_floor_label(list(existing))
+
+    floor = Floor(building_id=body.building_id, label=label)
     db.add(floor)
     try:
         await db.flush()
     except IntegrityError as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f'Floor "{body.label}" already exists for this building.',
+            f'Floor "{label}" already exists for this building.',
         ) from exc
     await record_audit_trail(
         db,
