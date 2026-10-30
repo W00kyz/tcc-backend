@@ -3,6 +3,7 @@ from app.domain.catalog.models import (
     Building,
     ContractorCompany,
     Floor,
+    Place,
     Room,
     ServicePoint,
     ServiceType,
@@ -76,3 +77,31 @@ async def test_floor_level_and_point_activation_default_and_rooms_are_unique_per
     with pytest.raises(IntegrityError):
         await db_session.flush()
     await db_session.rollback()
+
+
+async def test_place_names_are_unique(db_session: AsyncSession) -> None:
+    db_session.add(Place(name="Praça central", latitude=-7.2195, longitude=-35.9105))
+    await db_session.flush()
+
+    db_session.add(Place(name="Praça central", latitude=-7.22, longitude=-35.91))
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
+async def test_a_point_may_sit_in_a_place_instead_of_a_floor(db_session: AsyncSession) -> None:
+    place = Place(name="Estacionamento", latitude=-7.2195, longitude=-35.9105)
+    db_session.add(place)
+    await db_session.flush()
+    point = ServicePoint(
+        place_id=place.id,
+        name="Estacionamento",
+        description="",
+        latitude=-7.2195,
+        longitude=-35.9105,
+    )
+    db_session.add(point)
+    await db_session.commit()
+
+    assert point.floor_id is None
+    assert point.place_id == place.id

@@ -90,6 +90,7 @@ def _stop_out(stop: RouteStop, *, window_hours: int) -> AppealableStopOut:
     assert stop.released_at is not None
     assert stop.release_reason is not None
     point = stop.service_point
+    assert point.floor is not None  # TODO(task-3): place stops have no floor
     return AppealableStopOut(
         route_stop_id=stop.id,
         service_point_id=point.id,
@@ -108,6 +109,7 @@ def _to_out(appeal: Appeal) -> AppealOut:
     assert stop.released_at is not None
     assert stop.release_reason is not None
     point = stop.service_point
+    assert point.floor is not None  # TODO(task-3): place stops have no floor
     return AppealOut(
         id=appeal.id,
         route_stop_id=appeal.route_stop_id,

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     Enum,
     Float,
@@ -132,16 +133,42 @@ class Room(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     floor: Mapped["Floor"] = relationship()
 
 
+class Place(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """An outdoor place of the campus (spec 2026-10-30-locais-externos §3): a service point can
+    sit here instead of on a floor of a building. Its coordinates are where the point is."""
+
+    __tablename__ = "places"
+
+    name: Mapped[str] = mapped_column(String(200), unique=True)
+    latitude: Mapped[float] = mapped_column(Float)
+    longitude: Mapped[float] = mapped_column(Float)
+
+
 class ServicePoint(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """latitude/longitude are plain floats here — see "Decisões de escopo desta etapa" item 3
     for why the PostGIS geography column waits for RF19/RF32."""
 
     __tablename__ = "service_points"
+    # A point is either in a place (outdoors) or on a floor (and optionally in a room), never both.
+    # A point with neither is rejected by the API, not by the database: migrated rows predate it.
+    __table_args__ = (
+        CheckConstraint(
+            "place_id IS NULL OR (room_id IS NULL AND floor_id IS NULL)",
+            name="service_points_one_site",
+        ),
+    )
 
-    floor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("floors.id"))
+    # Null when the point sits in a place instead of on a floor (see `place_id`).
+    floor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("floors.id"), nullable=True
+    )
     # Read-only lookup for RouteStopOut (Etapa 4): floor label + building name via one
     # selectinload chain, no back_populates — no call site needs Floor.service_points.
-    floor: Mapped["Floor"] = relationship()
+    floor: Mapped["Floor | None"] = relationship()
+    place_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("places.id"), nullable=True
+    )
+    place: Mapped["Place | None"] = relationship()
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(String(500))
     latitude: Mapped[float] = mapped_column(Float)

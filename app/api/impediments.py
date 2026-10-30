@@ -83,6 +83,8 @@ def _raise_for_domain_error(exc: Exception) -> NoReturn:
 def _to_out(impediment: Impediment) -> ImpedimentOut:
     """Expects the relationships `find_impediments`/`get_impediment` load."""
     point = impediment.route_stop.service_point if impediment.route_stop is not None else None
+    floor = point.floor if point is not None else None
+    assert point is None or floor is not None  # TODO(task-3): place stops have no floor
     return ImpedimentOut(
         id=impediment.id,
         route_id=impediment.route_id,
@@ -96,7 +98,7 @@ def _to_out(impediment: Impediment) -> ImpedimentOut:
         field_worker_id=impediment.reported_by,
         field_worker_name=impediment.reported_by_worker.full_name,
         service_point_name=point.name if point is not None else None,
-        building_name=point.floor.building.name if point is not None else None,
+        building_name=floor.building.name if floor is not None else None,
         resolved_at=impediment.resolved_at,
     )
 

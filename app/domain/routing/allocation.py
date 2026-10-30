@@ -301,6 +301,11 @@ async def _claim(
     return claimed
 
 
+def _floor_of(point: ServicePoint) -> Floor:
+    assert point.floor is not None  # TODO(task-3): place stops have no floor
+    return point.floor
+
+
 def _nearest_first(points: list[ServicePoint], origin: tuple[float, float]) -> list[ServicePoint]:
     # Points of one building share its centre, so the ties are broken by building, floor and
     # name — stable, and what spreads a big building over the workers who arrive together.
@@ -308,8 +313,8 @@ def _nearest_first(points: list[ServicePoint], origin: tuple[float, float]) -> l
         points,
         key=lambda p: (
             haversine_meters(origin[0], origin[1], p.latitude, p.longitude),
-            p.floor.building.name,
-            p.floor.label,
+            _floor_of(p).building.name,
+            _floor_of(p).label,
             p.name,
         ),
     )
@@ -377,14 +382,15 @@ async def _order_batch(
     distance order when OSRM is unavailable), then by floor and name inside a building."""
     by_building: dict[uuid.UUID, list[RouteStop]] = {}
     for stop in stops:  # in claim (distance) order — the fallback building order
-        by_building.setdefault(stop.service_point.floor.building_id, []).append(stop)
+        by_building.setdefault(_floor_of(stop.service_point).building_id, []).append(stop)
     buildings = list(by_building.values())
     first_index = min(stop.order_index for stop in stops)
     ordered = [
         stop
         for position in await _building_order(buildings, origin=origin, osrm=osrm)
         for stop in sorted(
-            buildings[position], key=lambda s: (s.service_point.floor.label, s.service_point.name)
+            buildings[position],
+            key=lambda s: (_floor_of(s.service_point).label, s.service_point.name),
         )
     ]
     for offset, stop in enumerate(ordered):

@@ -79,6 +79,7 @@ class RouteOut(BaseModel):
 
 def _to_stop_out(stop: RouteStop) -> RouteStopOut:
     point = stop.service_point
+    assert point.floor is not None  # TODO(task-3): place stops have no floor
     return RouteStopOut(
         id=stop.id,
         order_index=stop.order_index,
