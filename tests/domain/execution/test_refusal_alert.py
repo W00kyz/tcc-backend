@@ -37,13 +37,14 @@ class _Seed:
 
 
 async def _seed(db: AsyncSession) -> _Seed:
-    service_type = await make_service_type(db)
+    service_type = await make_service_type(db, type_name="Jardinagem")
     assert service_type.contractor_company is not None
     worker = await make_worker(db, company=service_type.contractor_company)
     point = await make_place_point(
         db, service_type=service_type, name="Jardim", place_name="Praça central"
     )
     route = await make_route(db, worker=worker, day=today_on_campus(), points=[point])
+    route.stops[0].service_type_id = service_type.id
     await db.commit()
     return _Seed(worker=worker, route=route, stop=route.stops[0])
 
@@ -101,7 +102,7 @@ async def test_a_far_refusal_opens_a_warning_alert_and_tells_the_managers(
     assert alert.route_id == seed.route.id
     assert alert.dedup_key == f"COMPLETION_REFUSED:{seed.stop.id}:2026-10-30"
     assert alert.description == (
-        f"{seed.worker.full_name} tentou concluir Jardim (Praça central) a 120 m do local "
+        f"{seed.worker.full_name} tentou concluir Jardinagem (Praça central) a 120 m do local "
         "(limite 50 m)."
     )
     notification = await db_session.scalar(select(Notification))
@@ -122,7 +123,7 @@ async def test_without_a_position_the_wording_says_no_active_location(
 
     assert alert is not None
     assert alert.description == (
-        f"{seed.worker.full_name} tentou concluir Jardim (Praça central) sem localização ativa."
+        f"{seed.worker.full_name} tentou concluir Jardinagem (Praça central) sem localização ativa."
     )
 
 
@@ -178,3 +179,16 @@ async def test_a_disabled_rule_records_nothing(db_session: AsyncSession) -> None
     assert alert is None
     assert await _count(db_session, Alert) == 0
     assert await _count(db_session, Notification) == 0
+
+
+async def test_a_stop_with_no_service_type_falls_back_to_the_point_name(
+    db_session: AsyncSession,
+) -> None:
+    seed = await _seed(db_session)
+    seed.stop.service_type_id = None
+    await db_session.flush()
+
+    alert = await _refuse(db_session, seed)
+
+    assert alert is not None
+    assert "tentou concluir Jardim (Praça central)" in alert.description

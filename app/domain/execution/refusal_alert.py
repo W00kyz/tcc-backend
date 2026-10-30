@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.domain.catalog.models import FieldWorker, ServicePoint
+from app.domain.catalog.models import FieldWorker, ServicePoint, ServiceType
 from app.domain.catalog.sites import site_of
 from app.domain.monitoring.alerts_service import alert_rule_enabled
 from app.domain.monitoring.models import Alert, AlertKind, AlertSeverity
@@ -88,13 +88,16 @@ async def _describe(
 
 
 async def _place_label(db: AsyncSession, stop: RouteStop) -> str:
-    """The point and the place it sits in: "Jardim (Praça central)"."""
+    """What was being done and where: "Jardinagem (Praça central)". A place's points are named
+    after the place, so the first part is the stop's service type, not the point."""
     point = await db.scalar(
         select(ServicePoint)
         .where(ServicePoint.id == stop.service_point_id)
         .options(selectinload(ServicePoint.place))
     )
     assert point is not None  # the foreign key guarantees it
+    service_type = await db.get(ServiceType, stop.service_type_id) if stop.service_type_id else None
+    what = service_type.name if service_type is not None else point.name
     if point.place is None:
-        return point.name
-    return f"{point.name} ({site_of(point).name})"
+        return what
+    return f"{what} ({site_of(point).name})"
