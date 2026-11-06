@@ -885,6 +885,50 @@ async def test_paused_route_resumes_regardless_of_the_start_guard(
     assert result.route.status is RouteStatus.IN_PROGRESS
 
 
+async def test_existing_route_without_started_at_is_refused_before_the_workday(
+    db_session: AsyncSession,
+) -> None:
+    """Only a route that already started escapes the start guard: a row of today that never
+    got its first batch (`started_at` is None) is still a first start."""
+    worker, settings = await _one_point_world(db_session)
+    route = Route(field_worker_id=worker.id, route_date=_TODAY, status=RouteStatus.IN_PROGRESS)
+    db_session.add(route)
+    await db_session.flush()
+
+    with pytest.raises(WorkdayNotStarted):
+        await _start(db_session, worker, settings, now=_BEFORE_START)
+
+    assert await _route_count(db_session) == 1
+    assert route.started_at is None
+    assert await db_session.scalar(select(func.count()).select_from(RouteStop)) == 0
+
+
+async def test_done_route_reopens_before_the_workday_is_not_refused(
+    db_session: AsyncSession,
+) -> None:
+    """The start guard only blocks the first start of the day: a route already started (here
+    DONE for an empty pool) reopens when a point is back, whatever the hour."""
+    worker, settings = await _one_point_world(db_session)
+    route = Route(
+        field_worker_id=worker.id,
+        route_date=_TODAY,
+        status=RouteStatus.DONE,
+        started_at=_NOW,
+        last_allocated_at=_NOW,
+    )
+    db_session.add(route)
+    await db_session.flush()
+
+    result = await _start(db_session, worker, settings, now=_SIX_AM)
+
+    assert isinstance(result, AllocationResult)
+    assert result.route.id == route.id
+    assert result.pool_empty is False
+    assert result.route.status is RouteStatus.IN_PROGRESS
+    assert _names(result.route.stops) == ["A1"]
+    assert result.route.started_at == _NOW
+
+
 async def test_end_of_workday_is_17(db_session: AsyncSession) -> None:
     worker, settings = await _one_point_world(db_session)
 
