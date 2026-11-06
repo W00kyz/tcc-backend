@@ -31,6 +31,7 @@ from app.domain.settings.campus import (
     describe_campus,
     inside_campus,
     is_service_day,
+    workday_not_started,
     workday_over,
 )
 from app.domain.settings.models import SystemSettings
@@ -48,6 +49,11 @@ class AllocationRefused(Exception):
 
 class NotAServiceDay(AllocationRefused):
     """The campus day is not one of the service weekdays."""
+
+
+class WorkdayNotStarted(AllocationRefused):
+    """The campus wall clock has not reached the start of the workday, so today's route cannot
+    be started yet. Only the first start of the day is refused; a route already started resumes."""
 
 
 class WorkdayOver(AllocationRefused):
@@ -91,6 +97,13 @@ async def start_or_resume(
                                        settings=s, osrm=osrm)
     """
     _ensure_allocatable(settings, today=today, now=now, lat=lat, lng=lng)
+    if workday_not_started(settings, now) and not await _day_route_started(
+        db, worker=worker, today=today
+    ):
+        raise WorkdayNotStarted(
+            f"The workday starts at {settings.workday_start_time} campus time; "
+            "today's route cannot be started yet."
+        )
     route = await _lock_day_route(db, worker=worker, today=today)
     if route.started_at is None:
         route.started_at = now
@@ -175,6 +188,17 @@ def _ensure_allocatable(
         raise OutsideCampus(
             f"Position ({lat}, {lng}) is outside the campus {describe_campus(settings)}."
         )
+
+
+async def _day_route_started(db: AsyncSession, *, worker: FieldWorker, today: date) -> bool:
+    """Whether the worker's route of `today` was already started. A plain read: it creates no
+    row, so a refusal on it leaves the database untouched."""
+    started_at = await db.scalar(
+        select(Route.started_at).where(
+            Route.field_worker_id == worker.id, Route.route_date == today
+        )
+    )
+    return started_at is not None
 
 
 async def _lock_day_route(db: AsyncSession, *, worker: FieldWorker, today: date) -> Route:

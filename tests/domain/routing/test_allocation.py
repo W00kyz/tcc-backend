@@ -27,6 +27,7 @@ from app.domain.routing.allocation import (
     AllocationResult,
     NotAServiceDay,
     OutsideCampus,
+    WorkdayNotStarted,
     WorkdayOver,
     free_points,
     next_batch,
@@ -53,6 +54,12 @@ _NOW = datetime(2026, 10, 20, 13, 0, tzinfo=UTC)
 _TODAY = campus_today(_NOW)
 _SATURDAY_NOW = datetime(2026, 10, 24, 13, 0, tzinfo=UTC)
 _FIVE_PM = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+# Campus is UTC-3: 06:59 / 07:00 / 06:00 local on Tuesday, 06:00 local on Saturday, 16:59 local.
+_BEFORE_START = datetime(2026, 10, 20, 9, 59, tzinfo=UTC)
+_AT_START = datetime(2026, 10, 20, 10, 0, tzinfo=UTC)
+_SIX_AM = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+_SATURDAY_SIX_AM = datetime(2026, 10, 24, 9, 0, tzinfo=UTC)
+_BEFORE_END = datetime(2026, 10, 20, 19, 59, tzinfo=UTC)
 # Where the worker taps "Iniciar rota", inside the campus rectangle.
 _ORIGIN = (-7.2150, -35.9100)
 
@@ -836,3 +843,54 @@ async def test_outside_campus_refused(db_session: AsyncSession) -> None:
         await _start(db_session, worker, settings, at=(-7.2300, -35.9100))
 
     assert await _route_count(db_session) == 0
+
+
+async def test_first_start_before_the_workday_refused(db_session: AsyncSession) -> None:
+    worker, settings = await _one_point_world(db_session)
+
+    with pytest.raises(WorkdayNotStarted):
+        await _start(db_session, worker, settings, now=_BEFORE_START)
+
+    assert await _route_count(db_session) == 0
+
+
+async def test_first_start_exactly_at_the_start_is_allowed(db_session: AsyncSession) -> None:
+    worker, settings = await _one_point_world(db_session)
+
+    result = await _start(db_session, worker, settings, now=_AT_START)
+
+    assert result.route.started_at == _AT_START
+
+
+async def test_weekend_before_the_start_is_not_a_service_day(db_session: AsyncSession) -> None:
+    worker, settings = await _one_point_world(db_session)
+
+    with pytest.raises(NotAServiceDay):
+        await _start(db_session, worker, settings, now=_SATURDAY_SIX_AM)
+
+    assert await _route_count(db_session) == 0
+
+
+async def test_paused_route_resumes_regardless_of_the_start_guard(
+    db_session: AsyncSession,
+) -> None:
+    worker, settings = await _one_point_world(db_session)
+    started = await _start(db_session, worker, settings)
+    started.route.status = RouteStatus.PAUSED
+    await db_session.flush()
+
+    result = await _start(db_session, worker, settings, now=_SIX_AM)
+
+    assert result.route.id == started.route.id
+    assert result.route.status is RouteStatus.IN_PROGRESS
+
+
+async def test_end_of_workday_is_17(db_session: AsyncSession) -> None:
+    worker, settings = await _one_point_world(db_session)
+
+    with pytest.raises(WorkdayOver):
+        await _start(db_session, worker, settings, now=_FIVE_PM)
+    assert await _route_count(db_session) == 0
+
+    result = await _start(db_session, worker, settings, now=_BEFORE_END)
+    assert result.route.started_at == _BEFORE_END

@@ -46,6 +46,7 @@ _PASSWORD = "senha-forte-o-suficiente"
 _NOW = datetime(2026, 10, 20, 13, 0, tzinfo=UTC)
 _SATURDAY = datetime(2026, 10, 24, 13, 0, tzinfo=UTC)
 _FIVE_PM = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
+_BEFORE_START = datetime(2026, 10, 20, 9, 59, tzinfo=UTC)  # 06:59 on campus
 _NEXT_MORNING = datetime(2026, 10, 21, 13, 0, tzinfo=UTC)
 _ON_CAMPUS = {"latitude": -7.2150, "longitude": -35.9100}
 _OFF_CAMPUS = {"latitude": -7.2300, "longitude": -35.9100}
@@ -158,6 +159,7 @@ async def test_start_returns_the_first_batch(client: TestClient, db_session: Asy
     [
         (_SATURDAY, _ON_CAMPUS, "NOT_A_SERVICE_DAY"),
         (_FIVE_PM, _ON_CAMPUS, "WORKDAY_OVER"),
+        (_BEFORE_START, _ON_CAMPUS, "WORKDAY_NOT_STARTED"),
         (_NOW, _OFF_CAMPUS, "OUTSIDE_CAMPUS"),
     ],
 )
@@ -176,6 +178,19 @@ async def test_start_refusals_leave_no_route(
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == code
     assert response.json()["detail"]["detail"]
+    assert await db_session.scalar(select(Route.id)) is None
+
+
+async def test_start_before_the_workday_returns_409_workday_not_started(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    seeded = await _seed(db_session, client)
+    _freeze(client, _BEFORE_START)
+
+    response = _post(client, seeded.token, "/routes/start")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "WORKDAY_NOT_STARTED"
     assert await db_session.scalar(select(Route.id)) is None
 
 

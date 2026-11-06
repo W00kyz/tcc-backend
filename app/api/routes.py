@@ -32,6 +32,7 @@ from app.domain.routing.allocation import (
     NotAServiceDay,
     OutsideCampus,
     RouteAlreadyDone,
+    WorkdayNotStarted,
     WorkdayOver,
     next_batch,
     start_or_resume,
@@ -49,6 +50,7 @@ _Db = Annotated[AsyncSession, Depends(get_db)]
 
 _REFUSAL_CODES: dict[type[AllocationRefused], str] = {
     NotAServiceDay: "NOT_A_SERVICE_DAY",
+    WorkdayNotStarted: "WORKDAY_NOT_STARTED",
     WorkdayOver: "WORKDAY_OVER",
     OutsideCampus: "OUTSIDE_CAMPUS",
     RouteAlreadyDone: "ROUTE_DONE",

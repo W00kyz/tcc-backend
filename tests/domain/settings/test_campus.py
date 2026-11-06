@@ -4,7 +4,13 @@ of the workday in campus local time (spec 2026-10-20-alocacao-automatica §5.5).
 from datetime import UTC, date, datetime, time
 
 import pytest
-from app.domain.settings.campus import inside_campus, is_service_day, workday_over
+from app.domain.settings.campus import (
+    inside_campus,
+    is_service_day,
+    start_opens_at,
+    workday_not_started,
+    workday_over,
+)
 from app.domain.settings.models import SystemSettings
 
 
@@ -61,3 +67,22 @@ def test_workday_ends_at_the_campus_local_end_time() -> None:
     assert workday_over(settings, datetime(2026, 10, 20, 20, 0, tzinfo=UTC)) is True
     # 17:30 UTC is 14:30 on campus — a UTC comparison would already call the day over.
     assert workday_over(settings, datetime(2026, 10, 20, 17, 30, tzinfo=UTC)) is False
+
+
+def test_workday_not_started_before_the_local_start() -> None:
+    settings = _settings()
+
+    # 06:59 on campus is 09:59 UTC; 07:00 on campus is 10:00 UTC.
+    assert workday_not_started(settings, datetime(2026, 10, 20, 9, 59, tzinfo=UTC)) is True
+    assert workday_not_started(settings, datetime(2026, 10, 20, 10, 0, tzinfo=UTC)) is False
+
+
+def test_start_opens_at_is_the_utc_instant_of_todays_opening() -> None:
+    settings = _settings()
+    opening = datetime(2026, 10, 20, 10, 0, tzinfo=UTC)  # 07:00 on campus
+
+    assert start_opens_at(settings, datetime(2026, 10, 20, 9, 55, tzinfo=UTC)) == opening  # 06:55
+    assert start_opens_at(settings, datetime(2026, 10, 20, 10, 0, tzinfo=UTC)) is None  # 07:00
+    assert start_opens_at(settings, datetime(2026, 10, 20, 15, 0, tzinfo=UTC)) is None  # 12:00
+    # Saturday 06:00 on campus: not a service day, so there is no opening to wait for.
+    assert start_opens_at(settings, datetime(2026, 10, 24, 9, 0, tzinfo=UTC)) is None
