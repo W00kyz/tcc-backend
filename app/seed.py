@@ -7,8 +7,10 @@ fixture, not a migration — never run it against production data.
 """
 
 import asyncio
+from dataclasses import dataclass
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.security import hash_password
@@ -28,7 +30,8 @@ from app.domain.identity.models import User, UserRole
 from app.domain.qr.crypto import derive_public_key_hex, sign_qr_payload
 from app.domain.qr.models import QrCode
 
-_ADMIN_EMAIL = "admin@pu.ufcg.edu.br"
+ADMIN_EMAIL = "admin@pu.ufcg.edu.br"
+SEED_PASSWORD = "trocar-esta-senha"
 
 _BLOCO_CI_OUTLINE = {
     "type": "Polygon",
@@ -44,10 +47,75 @@ _BLOCO_CI_OUTLINE = {
 }
 
 
-def _print_logins(qr_private_key_hex: str) -> None:
-    print(f"Admin login: {_ADMIN_EMAIL} / trocar-esta-senha")
-    print("Manager login: larissa@pu.ufcg.edu.br / trocar-esta-senha")
-    print("Field worker login: joao@empresa.com / trocar-esta-senha")
+@dataclass(frozen=True)
+class BaseActors:
+    """What both seeds create first: the three logins, the company, its service type and the
+    approved field worker."""
+
+    admin: User
+    manager: User
+    worker_user: User
+    company: ContractorCompany
+    service_type: ServiceType
+    worker: FieldWorker
+
+
+async def create_base_actors(db: AsyncSession) -> BaseActors:
+    """Adds (and flushes, never commits) the users, company, "Limpeza" service type and the
+    APPROVED field worker shared by `app.seed` and `app.seed_test`.
+
+        actors = await create_base_actors(db)
+    """
+    admin = User(
+        name="Admin PU",
+        email=ADMIN_EMAIL,
+        password_hash=hash_password(SEED_PASSWORD),
+        role=UserRole.ADMIN,
+    )
+    manager = User(
+        name="Larissa Almeida",
+        email="larissa@pu.ufcg.edu.br",
+        password_hash=hash_password(SEED_PASSWORD),
+        role=UserRole.MANAGER,
+    )
+    worker_user = User(
+        name="João da Silva",
+        email="joao@empresa.com",
+        password_hash=hash_password(SEED_PASSWORD),
+        role=UserRole.FIELD_WORKER,
+    )
+    company = ContractorCompany(name="Limpa Tudo Terceirizados Ltda", cnpj="12345678000199")
+    db.add_all([admin, manager, worker_user, company])
+    await db.flush()
+
+    service_type = ServiceType(
+        name="Limpeza",
+        average_duration_minutes=30,
+        contractor_company_id=company.id,
+        requires_evidence=True,
+    )
+    db.add(service_type)
+    await db.flush()
+
+    worker = FieldWorker(
+        full_name="João da Silva",
+        contractor_company_id=company.id,
+        user_id=worker_user.id,
+        status=FieldWorkerStatus.APPROVED,
+    )
+    db.add(worker)
+    await db.flush()
+    return BaseActors(admin, manager, worker_user, company, service_type, worker)
+
+
+def print_logins(qr_private_key_hex: str) -> None:
+    """Prints the seeded logins and the QR public key the app needs.
+
+    print_logins(settings.qr_signing_private_key_hex)
+    """
+    print(f"Admin login: {ADMIN_EMAIL} / {SEED_PASSWORD}")
+    print(f"Manager login: larissa@pu.ufcg.edu.br / {SEED_PASSWORD}")
+    print(f"Field worker login: joao@empresa.com / {SEED_PASSWORD}")
     # The app verifies QR signatures offline with this key (RNF13) — pass it to `flutter run`.
     print(f"QR_PUBLIC_KEY_HEX (app): {derive_public_key_hex(qr_private_key_hex)}")
 
@@ -58,31 +126,13 @@ async def seed() -> None:
     session_factory = build_session_factory(engine)
 
     async with session_factory() as db:
-        already_seeded = await db.scalar(select(User).where(User.email == _ADMIN_EMAIL))
+        already_seeded = await db.scalar(select(User).where(User.email == ADMIN_EMAIL))
         if already_seeded is not None:
             print("Database already seeded; nothing to do.")
-            _print_logins(settings.qr_signing_private_key_hex)
+            print_logins(settings.qr_signing_private_key_hex)
             await engine.dispose()
             return
-        admin = User(
-            name="Admin PU",
-            email=_ADMIN_EMAIL,
-            password_hash=hash_password("trocar-esta-senha"),
-            role=UserRole.ADMIN,
-        )
-        manager = User(
-            name="Larissa Almeida",
-            email="larissa@pu.ufcg.edu.br",
-            password_hash=hash_password("trocar-esta-senha"),
-            role=UserRole.MANAGER,
-        )
-        worker_user = User(
-            name="João da Silva",
-            email="joao@empresa.com",
-            password_hash=hash_password("trocar-esta-senha"),
-            role=UserRole.FIELD_WORKER,
-        )
-        company = ContractorCompany(name="Limpa Tudo Terceirizados Ltda", cnpj="12345678000199")
+        actors = await create_base_actors(db)
         building = Building(
             name="Bloco CI",
             campus_area="Centro de Ciências e Tecnologia",
@@ -90,16 +140,7 @@ async def seed() -> None:
             footprint=_BLOCO_CI_OUTLINE,
             footprint_source="drawn",
         )
-        db.add_all([admin, manager, worker_user, company, building])
-        await db.flush()
-
-        service_type = ServiceType(
-            name="Limpeza",
-            average_duration_minutes=30,
-            contractor_company_id=company.id,
-            requires_evidence=True,
-        )
-        db.add(service_type)
+        db.add(building)
         await db.flush()
 
         floor = Floor(building_id=building.id, label="Térreo", level=0)
@@ -117,15 +158,9 @@ async def seed() -> None:
             description="Sala de aula",
             latitude=-7.2195,
             longitude=-35.9105,
-            service_type_id=service_type.id,
+            service_type_id=actors.service_type.id,
         )
-        worker = FieldWorker(
-            full_name="João da Silva",
-            contractor_company_id=company.id,
-            user_id=worker_user.id,
-            status=FieldWorkerStatus.APPROVED,
-        )
-        db.add_all([point, worker])
+        db.add(point)
         await db.flush()
 
         qr_payload = sign_qr_payload(
@@ -137,7 +172,7 @@ async def seed() -> None:
         await db.commit()
 
         print(f"Printed QR (full payload): {qr_code.public_code}")
-        _print_logins(settings.qr_signing_private_key_hex)
+        print_logins(settings.qr_signing_private_key_hex)
 
     await engine.dispose()
 
