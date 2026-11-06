@@ -103,6 +103,7 @@ async def test_get_settings_includes_allocation_defaults(
     assert body["outside_campus_release_minutes"] == 10
     assert body["location_silence_warning_minutes"] == 30
     assert body["location_silence_release_minutes"] == 45
+    assert body["workday_start_time"] == "07:00:00"
     assert body["workday_end_time"] == "17:00:00"
     assert body["service_weekdays"] == [0, 1, 2, 3, 4]
     assert body["appeal_window_hours"] == 48
@@ -140,6 +141,56 @@ async def test_put_settings_updates_allocation_fields_and_audits_them_as_json(
     assert audit.after_data["workday_end_time"] == "16:30:00"
     assert audit.before_data is not None
     assert audit.before_data["service_weekdays"] == [0, 1, 2, 3, 4]
+
+
+async def test_put_settings_accepts_workday_start_time(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "admin@empresa.com", UserRole.ADMIN)
+    token = _login(client, "admin@empresa.com")
+
+    response = client.put(
+        "/settings", json={"workday_start_time": "06:30:00"}, headers=_auth(token)
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["workday_start_time"] == "06:30:00"
+    assert client.get("/settings", headers=_auth(token)).json()["workday_start_time"] == "06:30:00"
+    audit = await db_session.scalar(
+        select(AuditTrail).where(AuditTrail.action == "update_settings")
+    )
+    assert audit is not None
+    assert audit.before_data is not None
+    assert audit.before_data["workday_start_time"] == "07:00:00"
+    assert audit.after_data is not None
+    assert audit.after_data["workday_start_time"] == "06:30:00"
+
+
+async def test_put_settings_rejects_an_empty_workday_window(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    await _add_user(db_session, "admin@empresa.com", UserRole.ADMIN)
+    token = _login(client, "admin@empresa.com")
+
+    # The row is 07:00-17:00. Each body leaves start >= end once merged with it.
+    bad_bodies: list[dict[str, object]] = [
+        {"workday_start_time": "17:00:00", "workday_end_time": "17:00:00"},
+        {"workday_start_time": "18:00:00"},
+        {"workday_end_time": "07:00:00"},
+        {"workday_end_time": "06:00:00"},
+    ]
+    for body in bad_bodies:
+        response = client.put("/settings", json=body, headers=_auth(token))
+        assert response.status_code == 422, body
+        assert response.json()["detail"]["code"] == "INVALID_WORKDAY_WINDOW", body
+
+    unchanged = client.get("/settings", headers=_auth(token)).json()
+    assert (unchanged["workday_start_time"], unchanged["workday_end_time"]) == (
+        "07:00:00",
+        "17:00:00",
+    )
+    audits = await db_session.scalar(select(func.count()).select_from(AuditTrail))
+    assert audits == 0
 
 
 async def test_put_settings_updates_etapa_9_fields_and_audits(

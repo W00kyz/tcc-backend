@@ -16,6 +16,7 @@ def _settings() -> SystemSettings:
         campus_min_lng=-35.9200,
         campus_max_lng=-35.8980,
         service_weekdays=[0, 1, 2, 3, 4],
+        workday_start_time=time(7, 0),
         workday_end_time=time(17, 0),
     )
 

@@ -41,7 +41,9 @@ class SystemSettings(Base):
     outside_campus_release_minutes: Mapped[int] = mapped_column(Integer, default=10)
     location_silence_warning_minutes: Mapped[int] = mapped_column(Integer, default=30)
     location_silence_release_minutes: Mapped[int] = mapped_column(Integer, default=45)
-    # Campus local time (America/Fortaleza, app/core/campus_clock.py), not UTC.
+    # Campus local time (America/Fortaleza, app/core/campus_clock.py), not UTC. The workday is
+    # [workday_start_time, workday_end_time); the admin keeps start < end (PUT /settings).
+    workday_start_time: Mapped[time] = mapped_column(Time, default=time(7, 0))
     workday_end_time: Mapped[time] = mapped_column(Time, default=time(17, 0))
     # `date.weekday()` numbers, Monday=0. No holiday calendar (owner: weekdays only).
     service_weekdays: Mapped[list[int]] = mapped_column(

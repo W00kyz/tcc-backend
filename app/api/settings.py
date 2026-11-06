@@ -8,7 +8,7 @@ from datetime import datetime, time
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +45,7 @@ class SettingsOut(BaseModel):
     outside_campus_release_minutes: int
     location_silence_warning_minutes: int
     location_silence_release_minutes: int
+    workday_start_time: time  # campus local time
     workday_end_time: time  # campus local time
     service_weekdays: list[int]  # Monday=0 ... Sunday=6
     appeal_window_hours: int
@@ -71,6 +72,7 @@ class SettingsUpdate(BaseModel):
     outside_campus_release_minutes: _Minutes | None = None
     location_silence_warning_minutes: _Minutes | None = None
     location_silence_release_minutes: _Minutes | None = None
+    workday_start_time: time | None = None
     workday_end_time: time | None = None
     service_weekdays: list[_Weekday] | None = Field(default=None, min_length=1, max_length=7)
     appeal_window_hours: int | None = Field(default=None, ge=1, le=720)
@@ -90,6 +92,27 @@ def _settings_snapshot(row: SystemSettings) -> dict[str, object]:
     return _to_settings_out(row).model_dump(mode="json", exclude={"updated_at"})
 
 
+def _reject_empty_workday_window(row: SystemSettings, changes: dict[str, object]) -> None:
+    """422 when the workday would open at or after it closes, judged on the row merged with the
+    requested changes (a PUT with only one of the two times still has to fit the other).
+
+        _reject_empty_workday_window(row, {"workday_start_time": time(18, 0)})  # end is 17:00
+    """
+    start = changes.get("workday_start_time", row.workday_start_time)
+    end = changes.get("workday_end_time", row.workday_end_time)
+    if isinstance(start, time) and isinstance(end, time) and start >= end:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "INVALID_WORKDAY_WINDOW",
+                "detail": (
+                    f"workday_start_time {start.isoformat()} must be before "
+                    f"workday_end_time {end.isoformat()}."
+                ),
+            },
+        )
+
+
 @router.get("", response_model=SettingsOut)
 async def get_settings_endpoint(_actor: _Reader, db: _Db) -> SettingsOut:
     return _to_settings_out(await get_settings_row(db))
@@ -97,8 +120,11 @@ async def get_settings_endpoint(_actor: _Reader, db: _Db) -> SettingsOut:
 
 @router.put("", response_model=SettingsOut)
 async def put_settings_endpoint(body: SettingsUpdate, actor: _Admin, db: _Db) -> SettingsOut:
-    before = _settings_snapshot(await get_settings_row(db))
-    row = await update_settings(db, actor_id=actor.id, changes=body.model_dump(exclude_none=True))
+    current = await get_settings_row(db)
+    changes = body.model_dump(exclude_none=True)
+    _reject_empty_workday_window(current, changes)
+    before = _settings_snapshot(current)
+    row = await update_settings(db, actor_id=actor.id, changes=changes)
     await record_audit_trail(
         db,
         actor_id=actor.id,
