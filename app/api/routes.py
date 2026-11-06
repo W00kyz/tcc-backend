@@ -40,7 +40,7 @@ from app.domain.routing.allocation import (
 from app.domain.routing.approach import next_stop_approach
 from app.domain.routing.models import Route, RouteStatus
 from app.domain.routing.osrm import OsrmLeg, OsrmUnavailable
-from app.domain.settings.campus import is_service_day
+from app.domain.settings.campus import is_service_day, start_opens_at, workday_over
 from app.domain.settings.service import get_settings_row
 
 router = APIRouter(prefix="/routes", tags=["routes"])
@@ -76,8 +76,16 @@ class AllocationOut(BaseModel):
 
 class MyDayOut(BaseModel):
     """The worker's day for the app: today's route, if any, and the location-silence limits it
-    warns the worker about (spec §7.3)."""
+    warns the worker about (spec §7.3). `server_time` is the server clock, so the app counts down to
+    `start_opens_at` without trusting the device clock; `workday_over` is true only on a service
+    day after the workday ended.
 
+    Example: ``{"server_time": "2026-10-20T09:56:00Z", "start_opens_at": "2026-10-20T10:00:00Z",
+    "workday_over": false, ...}``"""
+
+    server_time: datetime
+    start_opens_at: datetime | None
+    workday_over: bool
     service_day: bool
     route: RouteOut | None
     position_report_interval_seconds: int
@@ -131,7 +139,7 @@ async def list_routes(
 
 
 @router.get("/me", response_model=MyDayOut)
-async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday) -> MyDayOut:
+async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday, now: Now) -> MyDayOut:
     """RF27 "rota do dia": the signed-in worker's route of today (or none yet). Same `RouteOut`
     shape the manager endpoints return, so mobile and the dashboard render a route identically."""
     settings = await get_settings_row(db)
@@ -140,8 +148,12 @@ async def my_day(worker: ApprovedWorker, db: _Db, today: CampusToday) -> MyDayOu
         .where(Route.field_worker_id == worker.id, Route.route_date == today)
         .options(*_ROUTE_LOADERS)
     )
+    service_day = is_service_day(settings, today)
     return MyDayOut(
-        service_day=is_service_day(settings, today),
+        server_time=now,
+        start_opens_at=start_opens_at(settings, now),
+        workday_over=service_day and workday_over(settings, now),
+        service_day=service_day,
         route=_to_route_out(route, settings.check_radius_meters) if route is not None else None,
         position_report_interval_seconds=settings.position_report_interval_seconds,
         location_silence_warning_minutes=settings.location_silence_warning_minutes,

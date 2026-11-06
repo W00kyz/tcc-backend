@@ -370,6 +370,9 @@ async def test_my_day_without_a_route(client: TestClient, db_session: AsyncSessi
     seeded = await _seed(db_session, client)
 
     assert _my_day(client, seeded.token) == {
+        "server_time": "2026-10-20T13:00:00Z",
+        "start_opens_at": None,
+        "workday_over": False,
         "service_day": True,
         "route": None,
         "position_report_interval_seconds": 60,

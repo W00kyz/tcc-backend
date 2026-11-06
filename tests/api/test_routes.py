@@ -6,7 +6,7 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
-from app.api.deps import get_campus_today
+from app.api.deps import get_campus_today, get_now
 from app.core.security import hash_password
 from app.domain.catalog.models import (
     Building,
@@ -110,6 +110,61 @@ async def test_field_worker_sees_only_their_own_route(
     assert route["id"] == str(own.id)
     assert len(route["stops"]) == 1
     assert route["field_worker_name"] == "João da Silva"
+
+
+def _freeze(client: TestClient, now: datetime) -> None:
+    cast(FastAPI, client.app).dependency_overrides[get_now] = lambda: now
+
+
+async def _my_day_at(
+    client: TestClient, db_session: AsyncSession, now: datetime
+) -> dict[str, object]:
+    """`GET /routes/me` as the seeded worker, with the server clock pinned at `now`."""
+    _manager, worker_user, _workers, _points = await _seed_actors_and_points(db_session)
+    token = _login(client, worker_user.email)
+    _freeze(client, now)
+    response = client.get("/routes/me", headers=_auth(token))
+    assert response.status_code == 200
+    return cast(dict[str, object], response.json())
+
+
+async def test_my_day_before_opening_reports_the_opening_instant(
+    client: TestClient, db_session: AsyncSession
+) -> None:
+    now = datetime(2026, 10, 20, 9, 56, tzinfo=UTC)  # Tuesday 06:56 on campus
+
+    body = await _my_day_at(client, db_session, now)
+
+    assert body["start_opens_at"] == "2026-10-20T10:00:00Z"
+    assert body["workday_over"] is False
+    assert body["server_time"] == "2026-10-20T09:56:00Z"
+
+
+async def test_my_day_during_the_workday(client: TestClient, db_session: AsyncSession) -> None:
+    body = await _my_day_at(client, db_session, datetime(2026, 10, 20, 13, 0, tzinfo=UTC))
+
+    assert body["start_opens_at"] is None
+    assert body["workday_over"] is False
+
+
+async def test_my_day_after_the_workday(client: TestClient, db_session: AsyncSession) -> None:
+    body = await _my_day_at(client, db_session, datetime(2026, 10, 20, 20, 0, tzinfo=UTC))
+
+    assert body["workday_over"] is True
+    assert body["start_opens_at"] is None
+
+
+async def test_my_day_on_a_non_service_day(client: TestClient, db_session: AsyncSession) -> None:
+    # Saturday 06:56 and Saturday 18:00 on campus: neither an opening nor a closing applies.
+    early = await _my_day_at(client, db_session, datetime(2026, 10, 24, 9, 56, tzinfo=UTC))
+    assert early["service_day"] is False
+    assert early["start_opens_at"] is None
+    assert early["workday_over"] is False
+
+    _freeze(client, datetime(2026, 10, 24, 21, 0, tzinfo=UTC))
+    token = _login(client, "joao@empresa.com")
+    late = client.get("/routes/me", headers=_auth(token)).json()
+    assert late["workday_over"] is False
 
 
 async def test_routes_me_is_todays_route_with_geometry(
