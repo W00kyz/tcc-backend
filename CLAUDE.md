@@ -44,9 +44,7 @@ Camadas, de fora para dentro. Regra de negócio nunca mora num roteador.
   seguintes injetam configuração sem efeito colateral de import.
 - Regra de horário: o primeiro início de rota do dia só vale de seg–sex, 07:00–17:00
   (`workday_start_time`, `workday_end_time`, `service_weekdays` em `system_settings`; 409
-  `WORKDAY_NOT_STARTED`/`WORKDAY_OVER`). O banco de testes manual (`python -m app.seed_test`)
-  a anula só pela própria linha de configuração (`00:00:00`–`23:59:59`, todos os dias); não
-  há flag de "modo teste" no código, nem deve haver.
+  `WORKDAY_NOT_STARTED`/`WORKDAY_OVER`).
 
 ## Versões
 

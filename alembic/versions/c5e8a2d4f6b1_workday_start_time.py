@@ -9,8 +9,7 @@ docs/specs/2026-11-05-banco-de-testes-horario-expediente-design.md §2: the work
 opening time, `system_settings.workday_start_time`, 07:00 by default (campus local time).
 
 INTENTIONAL: `workday_end_time` is not touched. Its 17:00 default is already the real database's
-closing time, and an end the admin edited must survive; the throwaway test database overwrites the
-whole settings row in its own seed.
+closing time, and an end the admin edited must survive.
 """
 
 from collections.abc import Sequence
